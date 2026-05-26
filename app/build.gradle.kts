@@ -40,6 +40,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.bundles.lifecycle)
+    implementation(libs.activity.ktx)
     implementation(libs.bundles.camerax)
     implementation(libs.onnxruntime.android)
     implementation(libs.coroutines.android)
