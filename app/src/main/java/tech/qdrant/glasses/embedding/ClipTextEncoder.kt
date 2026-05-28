@@ -6,6 +6,7 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import org.json.JSONObject
 import java.nio.LongBuffer
+import tech.qdrant.glasses.embedding.extractAsset
 
 class ClipTextEncoder(context: Context) : AutoCloseable {
 
@@ -21,8 +22,8 @@ class ClipTextEncoder(context: Context) : AutoCloseable {
     }
 
     init {
-        val modelBytes = context.assets.open("clip-text-int8.onnx").readBytes()
-        session = env.createSession(modelBytes)
+        val modelFile = extractAsset(context, "clip-text-int8.onnx")
+        session = env.createSession(modelFile.absolutePath)
 
         val root = JSONObject(context.assets.open("clip-tokenizer.json").bufferedReader().readText())
         val model = root.getJSONObject("model")

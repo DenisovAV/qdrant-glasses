@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.storage
 
 import android.content.Context
+import android.util.Log
 import tech.qdrant.edge.CountRequest
 import tech.qdrant.edge.Distance
 import tech.qdrant.edge.EdgeConfig
@@ -26,8 +27,8 @@ data class MemoryFrame(
 class VisionMemoryStore(context: Context) : AutoCloseable {
 
     companion object {
+        private const val TAG = "VisionMemory"
         private const val VECTOR_DIM = 512UL
-        // Empty string = the single unnamed vector field convention in Qdrant Edge
         private const val VECTOR_FIELD = ""
     }
 
@@ -35,6 +36,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
 
     init {
         val shardDir = File(context.filesDir, "qdrant_shard").also { it.mkdirs() }.absolutePath
+        Log.i(TAG, "init: opening shard at $shardDir")
         val config = EdgeConfig(
             vectorData = mapOf(
                 VECTOR_FIELD to VectorDataConfig(
@@ -48,11 +50,11 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
             sparseVectorData = emptyMap()
         )
         shard = EdgeShard.load(shardDir, config)
+        Log.i(TAG, "init: shard opened, existing points=${shard.count(CountRequest(filter = null, exact = false))}")
     }
 
     fun store(imagePath: String, vector: FloatArray, timestampMs: Long): String {
         val id = UUID.randomUUID().toString()
-        // Escape backslashes in path for JSON safety on Windows paths; fine on Android
         val payload = """{"image_path":"${imagePath.replace("\\", "\\\\")}","timestamp_ms":$timestampMs}"""
         shard.update(
             UpdateOperation.upsertPoints(
@@ -65,10 +67,13 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 )
             )
         )
+        shard.flush()
+        Log.d(TAG, "store: id=$id path=${imagePath.substringAfterLast('/')}")
         return id
     }
 
     fun search(queryVector: FloatArray, topK: Int = 3): List<MemoryFrame> {
+        Log.d(TAG, "search: topK=$topK")
         val results = shard.search(
             SearchRequest(
                 query = Query.Nearest(vector = queryVector.toList(), using = null),
@@ -81,6 +86,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 scoreThreshold = null
             )
         )
+        Log.i(TAG, "search: found ${results.size} results")
         return results.map { point ->
             val payload = point.payload ?: "{}"
             MemoryFrame(
@@ -93,9 +99,12 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     }
 
     fun count(): Long =
-        shard.count(CountRequest(filter = null, exact = false)).toLong()
+        shard.count(CountRequest(filter = null, exact = true)).toLong()
 
-    override fun close() = shard.close()
+    override fun close() {
+        Log.i(TAG, "close: total points=${count()}")
+        shard.close()
+    }
 
     private fun extractString(json: String, key: String): String =
         Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1) ?: ""

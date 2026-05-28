@@ -1,6 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000" />
+    android:orientation="horizontal"
+    android:background="#000000"
+    android:clickable="true"
+    android:focusable="true">
+
+    <!-- Left eye: 640x480 -->
+    <FrameLayout
+        android:id="@+id/eye_left"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1" />
+
+    <!-- Right eye: 640x480 -->
+    <FrameLayout
+        android:id="@+id/eye_right"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1" />
+
+</LinearLayout>

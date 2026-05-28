@@ -2,11 +2,16 @@ package tech.qdrant.glasses
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import tech.qdrant.glasses.embedding.ClipTextEncoder
 import tech.qdrant.glasses.embedding.ClipVisionEncoder
@@ -16,70 +21,172 @@ import java.io.File
 import java.io.FileOutputStream
 
 sealed class AppState {
+    object Loading : AppState()
     object Idle : AppState()
-    data class Recording(val frameCount: Long, val elapsedSeconds: Long) : AppState()
-    object Listening : AppState()
+    data class Recording(val saved: Long, val indexed: Long, val elapsedSeconds: Long) : AppState()
+    data class Listening(val partial: String = "") : AppState()
+    data class Processing(val query: String) : AppState()
     data class Results(val query: String, val frames: List<MemoryFrame>) : AppState()
 }
 
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val visionEncoder = ClipVisionEncoder(app)
-    private val textEncoder   = ClipTextEncoder(app)
-    val memoryStore           = VisionMemoryStore(app)
+    companion object { private const val TAG = "GlassesVM" }
 
-    private val _state = MutableStateFlow<AppState>(AppState.Idle)
+    private var visionEncoder: ClipVisionEncoder? = null
+    private var textEncoder: ClipTextEncoder? = null
+    private var store: VisionMemoryStore? = null
+
+    private val _state = MutableStateFlow<AppState>(AppState.Loading)
     val state: StateFlow<AppState> = _state
 
     private val imagesDir = File(app.filesDir, "images").also { it.mkdirs() }
     private var recordingStartMs = 0L
+    private var timerJob: Job? = null
+    private var savedCount = 0L
+    private var encodeQueue = Channel<Pair<File, Bitmap>>(Channel.UNLIMITED)
+    private var encodeWorker: Job? = null
+
+    init {
+        Log.i(TAG, "init: starting model + store loading")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "init: opening VisionMemoryStore")
+                store = VisionMemoryStore(app)
+                Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
+
+                Log.d(TAG, "init: loading ClipVisionEncoder")
+                visionEncoder = ClipVisionEncoder(app)
+                Log.d(TAG, "init: ClipVisionEncoder OK")
+
+                Log.d(TAG, "init: loading ClipTextEncoder")
+                textEncoder = ClipTextEncoder(app)
+                Log.d(TAG, "init: ClipTextEncoder OK")
+
+                Log.i(TAG, "init: all components ready → Idle")
+                _state.value = AppState.Idle
+            } catch (e: Exception) {
+                Log.e(TAG, "init: FAILED", e)
+            }
+        }
+    }
 
     fun startRecording() {
         recordingStartMs = System.currentTimeMillis()
-        _state.value = AppState.Recording(memoryStore.count(), 0L)
+        savedCount = 0L
+        encodeQueue = Channel(Channel.UNLIMITED)
+        Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
+        _state.value = AppState.Recording(0L, 0L, 0L)
+
+        encodeWorker = viewModelScope.launch(Dispatchers.Default) {
+            for ((file, bitmap) in encodeQueue) {
+                val enc = visionEncoder ?: continue
+                val db  = store ?: continue
+                val timestampMs = file.nameWithoutExtension.removePrefix("frame_").toLongOrNull()
+                    ?: System.currentTimeMillis()
+                val vector = enc.encode(bitmap)
+                db.store(file.absolutePath, vector, timestampMs)
+                file.delete()
+                val indexed = db.count()
+                Log.d(TAG, "encoded+indexed: indexed=$indexed saved=$savedCount")
+                if (_state.value is AppState.Recording) {
+                    val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
+                    _state.value = AppState.Recording(savedCount, indexed, elapsed)
+                }
+            }
+        }
+
+        timerJob?.cancel()
+        timerJob = viewModelScope.launch {
+            while (isActive) {
+                delay(1000)
+                val current = _state.value
+                if (current is AppState.Recording) {
+                    val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
+                    _state.value = current.copy(elapsedSeconds = elapsed)
+                }
+            }
+        }
     }
 
     fun stopRecording() {
+        timerJob?.cancel(); timerJob = null
+        encodeQueue.close()
+        val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
+        Log.i(TAG, "stopRecording: ${elapsed}s saved=$savedCount indexed=${store?.count()}")
         _state.value = AppState.Idle
     }
 
     fun onFrame(bitmap: Bitmap) {
         if (_state.value !is AppState.Recording) return
-        viewModelScope.launch(Dispatchers.Default) {
-            val timestampMs = System.currentTimeMillis()
-            val file = File(imagesDir, "frame_$timestampMs.jpg")
-            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 70, it) }
-            val vector = visionEncoder.encode(bitmap)
-            memoryStore.store(file.absolutePath, vector, timestampMs)
-            val elapsed = (timestampMs - recordingStartMs) / 1000
-            _state.value = AppState.Recording(memoryStore.count(), elapsed)
+        val timestampMs = System.currentTimeMillis()
+        val file = File(imagesDir, "frame_$timestampMs.jpg")
+        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 70, it) }
+        savedCount++
+        val elapsed = (timestampMs - recordingStartMs) / 1000
+        val indexed = store?.count() ?: 0L
+        Log.d(TAG, "frame saved: saved=$savedCount indexed=$indexed")
+        if (_state.value is AppState.Recording) {
+            _state.value = AppState.Recording(savedCount, indexed, elapsed)
         }
+        encodeQueue.trySend(file to bitmap)
     }
 
     fun startListening() {
-        _state.value = AppState.Listening
+        Log.i(TAG, "startListening: waiting for voice input")
+        _state.value = AppState.Listening()
+    }
+
+    fun onVoiceReady() {
+        Log.i(TAG, "onVoiceReady: mic open")
+    }
+
+    fun onVoicePartial(text: String) {
+        val s = _state.value
+        if (s is AppState.Listening) _state.value = AppState.Listening(text)
+        else if (s is AppState.Processing && s.query == "...") _state.value = AppState.Processing(text)
+    }
+
+    fun onVoiceStopped() {
+        if (_state.value is AppState.Listening) _state.value = AppState.Processing("...")
     }
 
     fun onVoiceResult(text: String) {
+        Log.i(TAG, "onVoiceResult: query=\"$text\"")
+        _state.value = AppState.Processing(text)
         viewModelScope.launch(Dispatchers.Default) {
-            val vector = textEncoder.encode(text)
-            val results = memoryStore.search(vector, topK = 3)
+            val enc = textEncoder ?: return@launch
+            val db  = store ?: return@launch
+            val t0 = System.currentTimeMillis()
+            val vector = enc.encode(text)
+            val encMs = System.currentTimeMillis() - t0
+            val results = db.search(vector, topK = 3)
+            val searchMs = System.currentTimeMillis() - t0 - encMs
+            Log.i(TAG, "onVoiceResult: encode=${encMs}ms search=${searchMs}ms results=${results.size}")
+            results.forEachIndexed { i, f ->
+                Log.d(TAG, "  result[$i] score=%.3f path=${f.imagePath.substringAfterLast('/')}".format(f.score))
+            }
             _state.value = AppState.Results(text, results)
         }
     }
 
+    fun frameCount(): Long = store?.count() ?: 0L
+
     fun onVoiceError(error: String) {
+        Log.w(TAG, "onVoiceError: $error")
         _state.value = AppState.Idle
     }
 
     fun backToIdle() {
+        Log.d(TAG, "backToIdle")
         _state.value = AppState.Idle
     }
 
     override fun onCleared() {
         super.onCleared()
-        visionEncoder.close()
-        textEncoder.close()
-        memoryStore.close()
+        Log.i(TAG, "onCleared: releasing resources")
+        visionEncoder?.close()
+        textEncoder?.close()
+        store?.close()
     }
 }

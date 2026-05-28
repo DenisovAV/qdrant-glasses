@@ -31,16 +31,16 @@ class RecordingView(context: Context) : LinearLayout(context) {
         addView(countText)
 
         addView(TextView(context).apply {
-            text = "Long press to stop"
+            text = "Tap to stop"
             textSize = 11f
             setTextColor(Color.GRAY)
         })
     }
 
-    fun update(frameCount: Long, elapsedSeconds: Long) {
+    fun update(saved: Long, indexed: Long, elapsedSeconds: Long) {
         val mins = elapsedSeconds / 60
         val secs = elapsedSeconds % 60
         statusText.text = "● REC  %02d:%02d".format(mins, secs)
-        countText.text = "$frameCount frames indexed"
+        countText.text = "saved: $saved  indexed: $indexed"
     }
 }

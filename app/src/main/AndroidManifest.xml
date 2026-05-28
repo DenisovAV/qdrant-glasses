@@ -10,7 +10,7 @@
     <application
         android:allowBackup="false"
         android:label="Qdrant Glasses"
-        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+        android:theme="@style/Theme.Glasses">
 
         <activity
             android:name=".MainActivity"

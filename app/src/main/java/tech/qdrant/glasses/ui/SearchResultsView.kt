@@ -1,80 +1,76 @@
 package tech.qdrant.glasses.ui
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.view.Gravity
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import tech.qdrant.glasses.storage.MemoryFrame
 
-class SearchResultsView(context: Context) : LinearLayout(context) {
+class SearchResultsView(context: Context) : FrameLayout(context) {
+
+    private val image: ImageView
+    private val overlay: LinearLayout
     private val queryText: TextView
-    private val resultsContainer: LinearLayout
+    private val timeText: TextView
 
     init {
-        orientation = VERTICAL
-        setPadding(16, 16, 16, 16)
         setBackgroundColor(Color.BLACK)
 
+        image = ImageView(context).apply {
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+        }
+        addView(image)
+
+        overlay = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(12, 8, 12, 8)
+            setBackgroundColor(0xCC000000.toInt())
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).also {
+                it.gravity = android.view.Gravity.BOTTOM
+            }
+        }
+
         queryText = TextView(context).apply {
-            textSize = 16f
+            textSize = 18f
             setTextColor(Color.WHITE)
         }
-        addView(queryText)
+        overlay.addView(queryText)
 
-        resultsContainer = LinearLayout(context).apply { orientation = VERTICAL }
-        addView(resultsContainer)
+        timeText = TextView(context).apply {
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+        }
+        overlay.addView(timeText)
 
-        addView(TextView(context).apply {
-            text = "\nTap to search again"
-            textSize = 11f
+        overlay.addView(TextView(context).apply {
+            text = "Tap to dismiss"
+            textSize = 10f
             setTextColor(Color.DKGRAY)
         })
+
+        addView(overlay)
     }
 
     fun showResults(query: String, results: List<MemoryFrame>) {
         queryText.text = "\"$query\""
-        resultsContainer.removeAllViews()
 
         if (results.isEmpty()) {
-            resultsContainer.addView(TextView(context).apply {
-                text = "No results found"
-                setTextColor(Color.GRAY)
-                textSize = 14f
-            })
+            image.setImageDrawable(null)
+            timeText.text = "Nothing found"
             return
         }
 
-        for (frame in results) {
-            val row = LinearLayout(context).apply {
-                orientation = HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, 8, 0, 8)
-            }
+        val best = results.first()
+        try {
+            BitmapFactory.decodeFile(best.imagePath)?.let { image.setImageBitmap(it) }
+        } catch (_: Exception) {}
 
-            val thumb = ImageView(context).apply {
-                layoutParams = LayoutParams(80, 60)
-                scaleType = ImageView.ScaleType.CENTER_CROP
-            }
-            try {
-                BitmapFactory.decodeFile(frame.imagePath)?.let { bmp ->
-                    thumb.setImageBitmap(Bitmap.createScaledBitmap(bmp, 80, 60, true))
-                }
-            } catch (_: Exception) {}
-            row.addView(thumb)
-
-            val elapsedMs = System.currentTimeMillis() - frame.timestampMs
-            row.addView(TextView(context).apply {
-                text = "  ${formatElapsed(elapsedMs)}    ${"%.2f".format(frame.score)}"
-                textSize = 13f
-                setTextColor(Color.WHITE)
-            })
-
-            resultsContainer.addView(row)
-        }
+        val elapsed = formatElapsed(System.currentTimeMillis() - best.timestampMs)
+        timeText.text = "Seen $elapsed"
     }
 
     private fun formatElapsed(ms: Long): String {
