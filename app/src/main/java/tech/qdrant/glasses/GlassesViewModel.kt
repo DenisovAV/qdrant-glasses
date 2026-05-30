@@ -41,6 +41,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<AppState> = _state
 
     private val imagesDir = File(app.filesDir, "images").also { it.mkdirs() }
+    private val thumbsDir = File(app.filesDir, "thumbnails").also { it.mkdirs() }
     private var recordingStartMs = 0L
     private var timerJob: Job? = null
     private var savedCount = 0L
@@ -86,7 +87,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     ?: System.currentTimeMillis()
                 val vector = enc.encode(bitmap)
                 db.store(file.absolutePath, vector, timestampMs)
-                file.delete()
                 val indexed = db.count()
                 Log.d(TAG, "encoded+indexed: indexed=$indexed saved=$savedCount")
                 if (_state.value is AppState.Recording) {

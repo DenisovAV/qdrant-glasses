@@ -25,7 +25,7 @@ class FrameCaptureManager(
 
     private var lastFrameTimeMs = 0L
     private val frameIntervalMs = 1000L
-    private val forceSaveIntervalMs = 5000L  // always save at least once per 5s
+    private val forceSaveIntervalMs = 2000L
 
     private var lastFramePixels: IntArray? = null
     private val ssimSize = 32

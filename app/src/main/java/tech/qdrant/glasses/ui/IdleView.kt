@@ -30,7 +30,7 @@ class IdleView(context: Context) : LinearLayout(context) {
         addView(countText)
 
         addView(TextView(context).apply {
-            text = "\nLong press to record  ·  Tap to search"
+            text = "\nHold button to record  ·  Press to search"
             textSize = 12f
             setTextColor(Color.DKGRAY)
             gravity = Gravity.CENTER

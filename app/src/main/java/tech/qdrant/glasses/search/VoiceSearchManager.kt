@@ -8,6 +8,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.ArrayBlockingQueue
 
 class VoiceSearchManager(
     private val context: Context,
@@ -25,16 +26,14 @@ class VoiceSearchManager(
         private const val SPEECH_TIMEOUT_MS = 1000L
     }
 
-    // Switch between backends here — set to false once Google STT key is available
-    private val useGoogleStt = false
-    private val googleApiKey = ""  // TODO: set key to enable Google STT
-
     private val vosk = VoskSpeechRecognizer(context)
+    private val googleApiKey = ""  // TODO: set key to enable Google STT
     private val googleStt: GoogleSpeechRecognizer? =
-        if (useGoogleStt && googleApiKey.isNotEmpty()) GoogleSpeechRecognizer(googleApiKey) else null
+        if (googleApiKey.isNotEmpty()) GoogleSpeechRecognizer(googleApiKey) else null
 
     private var audioRecord: AudioRecord? = null
     private var readerThread: Thread? = null
+    private var voskThread: Thread? = null
     @Volatile private var isListening = false
     private var listenStartMs = 0L
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -42,91 +41,78 @@ class VoiceSearchManager(
 
     fun startListening() {
         if (isListening) return
-        if (useGoogleStt && googleStt == null) { onError("Google STT: no API key set"); return }
-        if (!useGoogleStt && !vosk.isReady) { onError("VOSK model not ready"); return }
+        if (!vosk.isReady) { onError("VOSK model not ready"); return }
 
-        Log.i(TAG, "startListening [backend=${if (useGoogleStt) "google" else "vosk"}]")
+        Log.i(TAG, "startListening [backend=vosk]")
 
-        // Init STT and start recording immediately — before audio focus IPC (~700ms)
-        if (useGoogleStt) googleStt!!.startListening(onPartial, onResult, onError)
-        else vosk.startListening(onPartial, onResult, onError)
+        requestAudioFocus()
+
+        vosk.startListening(onPartial, onResult, onError)
 
         isListening = true
         listenStartMs = System.currentTimeMillis()
 
         val chunkSamples = SAMPLE_RATE * CHUNK_MS / 1000
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val rec = AudioRecord(
-            MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuf, chunkSamples * 2 * 32)
+
+        val sources = listOf(
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.UNPROCESSED
         )
+        val rec = sources.firstNotNullOfOrNull { src ->
+            try {
+                AudioRecord(src, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, chunkSamples * 2 * 32))
+                    .takeIf { it.state == AudioRecord.STATE_INITIALIZED }
+                    ?.also { Log.i(TAG, "AudioRecord initialized with source=$src") }
+            } catch (e: Exception) { Log.w(TAG, "source=$src failed: ${e.message}"); null }
+        } ?: run { onError("No audio source available"); return }
+
         audioRecord = rec
         rec.startRecording()
         Log.i(TAG, "recording started")
         onReady()
 
-        // Request audio focus after recording started — async so system can't silence us mid-phrase
-        Thread { requestAudioFocus() }.start()
+        // Queue between reader and VOSK threads: reader writes raw chunks, VOSK consumes them.
+        // Capacity 500 = ~10 seconds of 20ms chunks — enough headroom for VOSK to catch up.
+        val audioQueue = ArrayBlockingQueue<ByteArray>(500)
+        // Sentinel to signal VOSK thread that recording is done
+        val POISON = ByteArray(0)
 
-        if (useGoogleStt) {
-            startRecordingThread(rec, chunkSamples, onChunk = null, onStop = { pcm ->
-                Log.i(TAG, "google stt: sending ${pcm.size} bytes")
-                googleStt?.recognize(pcm)
-            })
-        } else {
-            startRecordingThread(rec, chunkSamples, onChunk = { bytes ->
-                vosk.acceptChunk(bytes, onPartial) { text ->
-                    isListening = false
-                    onResult(text)
-                }
-            }, onStop = { _ ->
-                vosk.finalize(onResult, onError)
-            })
-        }
-    }
-
-    private fun startRecordingThread(
-        rec: AudioRecord,
-        chunkSamples: Int,
-        onChunk: ((ByteArray) -> Unit)?,
-        onStop: (ByteArray) -> Unit
-    ) {
+        // Thread 1: reads AudioRecord, does VAD/auto-stop, pushes chunks to queue
         readerThread = Thread {
             val buf = ShortArray(chunkSamples)
-            val pcmBuffer = if (useGoogleStt) ByteArrayOutputStream() else null
-            val diagBuffer = ByteArrayOutputStream()  // record everything for diagnostics
+            val diagBuffer = ByteArrayOutputStream()
             var hadSpeech = false
             var lastSpeechMs = System.currentTimeMillis()
             var logCount = 0
+            var maxRms = 0.0
 
             while (isListening) {
                 val read = rec.read(buf, 0, buf.size)
                 if (read > 0) {
                     val rms = rms(buf, read)
-                    if (logCount++ < 50) Log.v(TAG, "rms=${"%.0f".format(rms)}")
-                    val isSpeech = rms > SILENCE_RMS_THRESHOLD
+                    if (rms > maxRms) maxRms = rms
+                    if (logCount++ < 100) {
+                        val peak = buf.take(read).maxOf { kotlin.math.abs(it.toInt()) }
+                        Log.v(TAG, "rms=${"%.0f".format(rms)} peak=$peak")
+                    }
                     val bytes = shortsToBytes(buf, read)
+                    diagBuffer.write(bytes)
+                    audioQueue.offer(bytes)
 
-                    // For VOSK: send all chunks (VOSK has its own VAD), use RMS only for auto-stop timing
-                    // For Google STT: only buffer speech chunks to save bandwidth
+                    val isSpeech = rms > SILENCE_RMS_THRESHOLD
                     if (isSpeech) {
                         hadSpeech = true
                         lastSpeechMs = System.currentTimeMillis()
-                        pcmBuffer?.write(bytes)
-                        onChunk?.invoke(bytes)
                     } else if (hadSpeech) {
-                        pcmBuffer?.write(bytes)
-                        onChunk?.invoke(bytes)
                         val silenceMs = System.currentTimeMillis() - lastSpeechMs
                         if (silenceMs > SPEECH_TIMEOUT_MS) {
-                            Log.d(TAG, "auto-stop: ${silenceMs}ms silence after speech")
+                            Log.d(TAG, "auto-stop: ${silenceMs}ms silence after speech (maxRms=${"%.0f".format(maxRms)})")
                             isListening = false
                             onStopped()
                         }
-                    } else {
-                        // Pre-speech silence: send to VOSK anyway (it handles silence itself)
-                        onChunk?.invoke(bytes)
                     }
                 }
             }
@@ -134,15 +120,36 @@ class VoiceSearchManager(
             rec.stop()
             rec.release()
             releaseAudioFocus()
-            onStop(pcmBuffer?.toByteArray() ?: ByteArray(0))
+
+            val pcm = diagBuffer.toByteArray()
+            val wavFile = java.io.File(context.filesDir, "diag_audio.wav")
+            saveWav(wavFile, pcm)
+            Log.i(TAG, "diag WAV: ${wavFile.absolutePath} (${pcm.size} bytes, maxRms=${"%.0f".format(maxRms)})")
+
+            audioQueue.offer(POISON)
         }.also { it.priority = Thread.MAX_PRIORITY; it.start() }
+
+        // Thread 2: drains queue, feeds VOSK — decoupled from recording so VAD is not delayed
+        voskThread = Thread {
+            while (true) {
+                val chunk = audioQueue.take()
+                if (chunk === POISON) break
+                if (!isListening) { audioQueue.clear(); break }
+                vosk.acceptChunk(chunk, onPartial) { text ->
+                    if (isListening) onResult(text)
+                }
+            }
+            if (isListening) vosk.finalize(onResult, onError)
+            else vosk.finalize({ }, { })
+        }.also { it.start() }
     }
 
     fun stopListening() {
         val elapsed = System.currentTimeMillis() - listenStartMs
-        if (elapsed < 2000) { Log.d(TAG, "stopListening ignored — too soon"); return }
+        if (elapsed < 1000) { Log.d(TAG, "stopListening ignored — too soon"); return }
         Log.d(TAG, "stopListening after ${elapsed}ms")
         isListening = false
+        onStopped()
     }
 
     fun destroy() {
@@ -182,6 +189,20 @@ class VoiceSearchManager(
         } else {
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(null)
+        }
+    }
+
+    private fun saveWav(file: java.io.File, pcm: ByteArray) {
+        val byteRate = SAMPLE_RATE * 2
+        java.io.FileOutputStream(file).use { fos ->
+            fun writeInt(v: Int) = fos.write(byteArrayOf(v.toByte(), (v shr 8).toByte(), (v shr 16).toByte(), (v shr 24).toByte()))
+            fun writeShort(v: Int) = fos.write(byteArrayOf(v.toByte(), (v shr 8).toByte()))
+            fos.write("RIFF".toByteArray()); writeInt(36 + pcm.size)
+            fos.write("WAVE".toByteArray())
+            fos.write("fmt ".toByteArray()); writeInt(16); writeShort(1); writeShort(1)
+            writeInt(SAMPLE_RATE); writeInt(byteRate); writeShort(2); writeShort(16)
+            fos.write("data".toByteArray()); writeInt(pcm.size)
+            fos.write(pcm)
         }
     }
 

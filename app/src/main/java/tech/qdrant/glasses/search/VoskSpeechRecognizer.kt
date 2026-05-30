@@ -15,6 +15,7 @@ class VoskSpeechRecognizer(context: Context) : SpeechRecognizer {
     private var model: Model? = null
     private var recognizer: Recognizer? = null
     @Volatile private var running = false
+    @Volatile private var gotResult = false
 
     init {
         StorageService.unpack(
@@ -37,8 +38,8 @@ class VoskSpeechRecognizer(context: Context) : SpeechRecognizer {
     ) {
         if (model == null) { onError("VOSK model not ready"); return }
         running = true
+        gotResult = false
         Log.i(TAG, "vosk: startListening")
-        // Recognizer creation is fast when model is already loaded — runs inline
         recognizer?.close()
         recognizer = try { Recognizer(model!!, SAMPLE_RATE.toFloat()) }
         catch (e: Exception) { onError("VOSK recognizer error: ${e.message}"); null }
@@ -50,7 +51,7 @@ class VoskSpeechRecognizer(context: Context) : SpeechRecognizer {
         if (rec.acceptWaveForm(bytes, bytes.size)) {
             val text = extractText(rec.result)
             Log.i(TAG, "vosk auto result: \"$text\"")
-            if (text.isNotEmpty()) onResult(text)
+            if (text.isNotEmpty()) { gotResult = true; onResult(text) }
         } else {
             val partial = extractPartial(rec.partialResult)
             if (partial.isNotEmpty()) onPartial(partial)
@@ -62,7 +63,12 @@ class VoskSpeechRecognizer(context: Context) : SpeechRecognizer {
         val rec = recognizer ?: return
         val text = extractText(rec.finalResult)
         Log.i(TAG, "vosk finalResult: \"$text\"")
-        if (text.isNotEmpty()) onResult(text) else onError("Empty result")
+        when {
+            text.isNotEmpty() -> { gotResult = true; onResult(text) }
+            // If acceptChunk already delivered a result, don't error — we're done
+            gotResult -> Log.i(TAG, "vosk finalResult: empty but already got result, ignoring")
+            else -> onError("Empty result")
+        }
     }
 
     override fun stopListening() {
