@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
+
+// Read the Google STT API key from local.properties (kept out of git).
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val googleSttApiKey: String = localProps.getProperty("GOOGLE_STT_API_KEY", "")
 
 android {
     namespace = "tech.qdrant.glasses"
@@ -13,9 +22,15 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
+        buildConfigField("String", "GOOGLE_STT_API_KEY", "\"$googleSttApiKey\"")
+
         ndk {
             abiFilters += "arm64-v8a"
         }
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
