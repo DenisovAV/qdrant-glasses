@@ -35,13 +35,20 @@ class VoiceSearchManager(
         if (googleApiKey.isNotEmpty()) GoogleSpeechRecognizer(googleApiKey) else null
 
     // True only when a key is configured AND the device currently has internet.
+    // Wrapped in try/catch so a connectivity check failure can never break listening —
+    // worst case we fall back to VOSK.
     private fun useGoogle(): Boolean {
         if (googleStt == null) return false
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val net = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(net) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-               caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        } catch (e: Exception) {
+            Log.w(TAG, "useGoogle check failed, falling back to VOSK: ${e.message}")
+            false
+        }
     }
 
     private var audioRecord: AudioRecord? = null

@@ -65,9 +65,11 @@ class GoogleSpeechRecognizer(private val apiKey: String) : SpeechRecognizer {
                     .post(body.toRequestBody("application/json".toMediaType()))
                     .build()
 
+                val httpStart = System.currentTimeMillis()
                 val response = client.newCall(request).execute()
                 val responseBody = response.body?.string() ?: ""
-                Log.d(TAG, "google stt response: ${response.code}")
+                val httpMs = System.currentTimeMillis() - httpStart
+                Log.d(TAG, "google stt response: ${response.code} (${httpMs}ms)")
 
                 if (!response.isSuccessful) {
                     onErrorCallback?.invoke("Google STT error: ${response.code}")
