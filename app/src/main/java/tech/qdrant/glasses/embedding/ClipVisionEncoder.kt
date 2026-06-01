@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Log
 import java.io.File
 import java.nio.FloatBuffer
 
@@ -18,7 +19,7 @@ class ClipVisionEncoder(context: Context) : AutoCloseable {
 
     init {
         val modelFile = extractAsset(context, "clip-vision-int8.onnx")
-        session = env.createSession(modelFile.absolutePath)
+        session = createAcceleratedSession(env, modelFile.absolutePath)
     }
 
     fun encode(bitmap: Bitmap): FloatArray {
@@ -54,4 +55,27 @@ internal fun extractAsset(context: Context, name: String): File {
         context.assets.open(name).use { it.copyTo(dest.outputStream()) }
     }
     return dest
+}
+
+/**
+ * Creates an ORT session that tries to offload to the device's NPU/GPU via NNAPI.
+ * On the RayNeo X3 Pro (Snapdragon AR1 Gen1) this routes supported ops to the
+ * Hexagon NPU / Adreno 621 instead of the CPU. ORT partitions the graph: ops the
+ * NNAPI driver can't run stay on CPU (we do NOT set CPU_DISABLED, so unsupported
+ * nodes fall back gracefully). If NNAPI can't initialise at all, we fall back to a
+ * plain CPU session — same behaviour as before, never worse.
+ */
+internal fun createAcceleratedSession(env: OrtEnvironment, modelPath: String): OrtSession {
+    return try {
+        val opts = OrtSession.SessionOptions().apply {
+            // Empty flag set = let NNAPI use NPU/GPU with CPU fallback enabled.
+            addNnapi()
+        }
+        env.createSession(modelPath, opts).also {
+            Log.i("ClipEncoder", "ORT session created with NNAPI execution provider")
+        }
+    } catch (e: Throwable) {
+        Log.w("ClipEncoder", "NNAPI unavailable, falling back to CPU: ${e.message}")
+        env.createSession(modelPath)
+    }
 }

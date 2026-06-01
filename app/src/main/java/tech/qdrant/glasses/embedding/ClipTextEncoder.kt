@@ -23,7 +23,7 @@ class ClipTextEncoder(context: Context) : AutoCloseable {
 
     init {
         val modelFile = extractAsset(context, "clip-text-int8.onnx")
-        session = env.createSession(modelFile.absolutePath)
+        session = createAcceleratedSession(env, modelFile.absolutePath)
 
         val root = JSONObject(context.assets.open("clip-tokenizer.json").bufferedReader().readText())
         val model = root.getJSONObject("model")
