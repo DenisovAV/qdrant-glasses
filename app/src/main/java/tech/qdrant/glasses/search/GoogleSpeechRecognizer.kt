@@ -44,6 +44,7 @@ class GoogleSpeechRecognizer(private val apiKey: String) : SpeechRecognizer {
     // Called by VoiceSearchManager with the complete recorded audio (raw PCM 16-bit LE, 16kHz)
     fun recognize(pcmBytes: ByteArray) {
         if (!running) return
+        if (pcmBytes.size < 2) { onErrorCallback?.invoke("No speech detected"); return }
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val audioB64 = Base64.getEncoder().encodeToString(pcmBytes)
@@ -52,7 +53,10 @@ class GoogleSpeechRecognizer(private val apiKey: String) : SpeechRecognizer {
                         put("encoding", "LINEAR16")
                         put("sampleRateHertz", SAMPLE_RATE)
                         put("languageCode", "en-US")
-                        put("model", "command_and_search")
+                        // latest_short: current short-form model, far more robust to silence
+                        // than command_and_search. useEnhanced improves accuracy.
+                        put("model", "latest_short")
+                        put("useEnhanced", true)
                         put("enableAutomaticPunctuation", false)
                     })
                     put("audio", JSONObject().apply {
@@ -72,19 +76,26 @@ class GoogleSpeechRecognizer(private val apiKey: String) : SpeechRecognizer {
                 Log.d(TAG, "google stt response: ${response.code} (${httpMs}ms)")
 
                 if (!response.isSuccessful) {
+                    Log.e(TAG, "google stt error body: $responseBody")
                     onErrorCallback?.invoke("Google STT error: ${response.code}")
                     return@launch
                 }
 
                 val json = JSONObject(responseBody)
                 val results = json.optJSONArray("results")
-                val transcript = results
-                    ?.getJSONObject(0)
-                    ?.getJSONArray("alternatives")
-                    ?.getJSONObject(0)
-                    ?.optString("transcript", "")
-                    ?.trim()
-                    ?: ""
+                // Concatenate transcripts across all result segments (long audio can split
+                // the utterance across results[0], results[1], ...). opt* avoids throwing
+                // when a segment lacks alternatives, so an empty result reads as "" not error.
+                val sb = StringBuilder()
+                if (results != null) for (i in 0 until results.length()) {
+                    val t = results.optJSONObject(i)
+                        ?.optJSONArray("alternatives")
+                        ?.optJSONObject(0)
+                        ?.optString("transcript", "")
+                        ?.trim().orEmpty()
+                    if (t.isNotEmpty()) { if (sb.isNotEmpty()) sb.append(' '); sb.append(t) }
+                }
+                val transcript = sb.toString()
 
                 Log.i(TAG, "google stt result: \"$transcript\"")
                 if (transcript.isNotEmpty()) onResultCallback?.invoke(transcript)

@@ -27,6 +27,8 @@ class VoiceSearchManager(
         private const val CHUNK_MS = 20
         private const val SILENCE_RMS_THRESHOLD = 50
         private const val SPEECH_TIMEOUT_MS = 1000L
+        private const val SPEECH_PAD_MS = 300          // keep this much audio around the speech region
+        private const val MIN_SPEECH_MS = 250          // don't send anything shorter than this to STT
     }
 
     private val vosk = VoskSpeechRecognizer(context)
@@ -80,9 +82,11 @@ class VoiceSearchManager(
         val chunkSamples = SAMPLE_RATE * CHUNK_MS / 1000
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
 
+        // VOICE_RECOGNITION first: purpose-built for STT (tuned AGC/noise suppression) and
+        // designed to coexist with the system voice/hotword service, reducing mic contention.
         val sources = listOf(
-            MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.UNPROCESSED
         )
         val rec = sources.firstNotNullOfOrNull { src ->
@@ -113,9 +117,20 @@ class VoiceSearchManager(
             var lastSpeechMs = System.currentTimeMillis()
             var logCount = 0
             var maxRms = 0.0
+            // Byte offsets of the speech region within diagBuffer, for trimming before send.
+            var firstSpeechByte = -1
+            var lastSpeechByte = -1
 
             while (isListening) {
                 val read = rec.read(buf, 0, buf.size)
+                if (read < 0) {
+                    // ERROR_DEAD_OBJECT / ERROR_INVALID_OPERATION — mic was torn down
+                    // (often the hotword service preempting). Abort cleanly, don't send junk.
+                    Log.e(TAG, "AudioRecord read error $read — aborting")
+                    wasStopped = false
+                    isListening = false
+                    break
+                }
                 if (read > 0) {
                     val rms = rms(buf, read)
                     if (rms > maxRms) maxRms = rms
@@ -124,11 +139,14 @@ class VoiceSearchManager(
                         Log.v(TAG, "rms=${"%.0f".format(rms)} peak=$peak")
                     }
                     val bytes = shortsToBytes(buf, read)
+                    val posBefore = diagBuffer.size()
                     diagBuffer.write(bytes)
                     audioQueue.offer(bytes)
 
                     val isSpeech = rms > SILENCE_RMS_THRESHOLD
                     if (isSpeech) {
+                        if (firstSpeechByte < 0) firstSpeechByte = posBefore
+                        lastSpeechByte = posBefore + bytes.size
                         hadSpeech = true
                         lastSpeechMs = System.currentTimeMillis()
                     } else if (hadSpeech) {
@@ -147,14 +165,19 @@ class VoiceSearchManager(
             rec.release()
             releaseAudioFocus()
 
-            val pcm = diagBuffer.toByteArray()
-            Log.i(TAG, "recording done (${pcm.size} bytes, maxRms=${"%.0f".format(maxRms)})")
-
             if (google) {
-                // Google STT is batch: send the whole utterance once recording stops.
-                // wasStopped distinguishes auto-stop / user-stop (recognize) from cancel.
-                if (wasStopped) googleStt!!.recognize(pcm)
-                else { onError("Cancelled") }
+                // Google STT is batch: send only the speech region (with a small pad) once
+                // recording stops. Sending the whole start-to-stop buffer (mostly silence/
+                // room noise) was causing Google to return empty transcripts.
+                val full = diagBuffer.toByteArray()
+                val pcm = trimToSpeech(full, firstSpeechByte, lastSpeechByte)
+                Log.i(TAG, "recording done: full=${full.size}b speech=${pcm.size}b maxRms=${"%.0f".format(maxRms)}")
+                val minSpeechBytes = SAMPLE_RATE * 2 * MIN_SPEECH_MS / 1000
+                when {
+                    !wasStopped -> onError("Cancelled")
+                    pcm.size < minSpeechBytes -> onError("No speech detected")
+                    else -> googleStt!!.recognize(pcm)
+                }
             } else {
                 audioQueue.offer(POISON)
             }
@@ -239,6 +262,22 @@ class VoiceSearchManager(
             fos.write("data".toByteArray()); writeInt(pcm.size)
             fos.write(pcm)
         }
+    }
+
+    /**
+     * Slices [full] PCM down to the detected speech region [firstByte, lastByte) plus a
+     * [SPEECH_PAD_MS] pad on each side, keeping 16-bit sample alignment. Returns an empty
+     * array if no speech was detected. This is what makes Google STT reliable: it gets a
+     * short clip of actual speech instead of tens of seconds of silence/room noise.
+     */
+    private fun trimToSpeech(full: ByteArray, firstByte: Int, lastByte: Int): ByteArray {
+        if (firstByte < 0 || lastByte <= firstByte) return ByteArray(0)
+        val pad = SAMPLE_RATE * 2 * SPEECH_PAD_MS / 1000
+        var start = (firstByte - pad).coerceAtLeast(0)
+        var end = (lastByte + pad).coerceAtMost(full.size)
+        start = start and 0xFFFFFFFE.toInt()  // keep even (16-bit aligned)
+        end = end and 0xFFFFFFFE.toInt()
+        return full.copyOfRange(start, end)
     }
 
     private fun rms(shorts: ShortArray, count: Int): Double {
