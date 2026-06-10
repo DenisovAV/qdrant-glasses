@@ -7,7 +7,6 @@ import tech.qdrant.edge.Distance
 import tech.qdrant.edge.EdgeConfig
 import tech.qdrant.edge.EdgeShard
 import tech.qdrant.edge.Point
-import tech.qdrant.edge.SearchRequest
 import tech.qdrant.edge.UpdateOperation
 import tech.qdrant.edge.VectorDataConfig
 import tech.qdrant.edge.ffi.PointId
