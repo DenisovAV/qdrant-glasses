@@ -24,8 +24,8 @@ class FrameCaptureManager(
     private var cameraProvider: ProcessCameraProvider? = null
 
     private var lastFrameTimeMs = 0L
-    private val frameIntervalMs = 1000L
-    private val forceSaveIntervalMs = 2000L
+    private val frameIntervalMs = 3000L
+    private val forceSaveIntervalMs = 12000L
 
     private var lastFramePixels: IntArray? = null
     private val ssimSize = 32
