@@ -45,3 +45,10 @@ diag_audio.*
 *.tflite
 app/src/main/assets/model/
 models/
+
+# Sherpa-ONNX streaming model — large, distribute separately
+app/src/main/assets/sherpa/
+
+# Sherpa-ONNX Android AAR — 56MB (>50MB), fetch manually from
+# https://github.com/k2-fsa/sherpa-onnx/releases (sherpa-onnx-1.13.2.aar) into libs/
+libs/sherpa-onnx-*.aar

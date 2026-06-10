@@ -47,6 +47,7 @@ android {
     androidResources {
         noCompress += "onnx"
         noCompress += "tflite"
+        noCompress += "txt"   // sherpa tokens.txt is mmap'd natively, must stay uncompressed
     }
 }
 
