@@ -15,7 +15,10 @@ import android.util.Log
  * On-device speech recognition via Android's standard SpeechRecognizer (Google).
  * Simple, stock usage: the recognizer owns the mic, VAD and endpointing itself.
  */
-class AndroidSpeechRecognizer(private val context: Context) : tech.qdrant.glasses.search.SpeechRecognizer {
+class AndroidSpeechRecognizer(
+    private val context: Context,
+    private val preferOffline: Boolean = true,
+) : tech.qdrant.glasses.search.SpeechRecognizer {
     companion object {
         private const val TAG = "VoiceSearch"
         // The device default RecognitionService is RayNeo's (which hangs silently),
@@ -71,9 +74,7 @@ class AndroidSpeechRecognizer(private val context: Context) : tech.qdrant.glasse
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
                     putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    // DIAG test #1: force online (WiFi present) to isolate whether the
-                    // offline en-US model is the NO_MATCH cause vs the recognizer itself.
-                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOffline)
                     // DIAG test #3: widen the utterance window against early endpointing.
                     putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2500)
                     putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500)
