@@ -48,6 +48,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     private var savedCount = 0L
     private var encodeQueue = Channel<Pair<File, Bitmap>>(Channel.UNLIMITED)
     private var encodeWorker: Job? = null
+    private val recentFrames = ArrayDeque<Pair<String, Long>>()  // (imagePath, t_ms), newest last
+    private val recentFramesMax = 64
+    private var ambient: tech.qdrant.glasses.search.AmbientTranscriber? = null
 
     init {
         Log.i(TAG, "init: starting model + store loading")
@@ -108,6 +111,19 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+
+        ambient = tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
+            viewModelScope.launch(Dispatchers.Default) {
+                val enc = textEncoder ?: return@launch
+                val db = store ?: return@launch
+                val mid = (tStart + tEnd) / 2
+                val nearest = nearestFramePath(mid)
+                if (nearest.isEmpty()) return@launch
+                val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
+                db.storeTranscript(text, vec, tStart, tEnd, nearest)
+                Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
+            }
+        }.also { it.start() }  // offline Google engine has no model-load gate — always startable
     }
 
     fun stopRecording() {
@@ -115,6 +131,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         encodeQueue.close()
         val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
         Log.i(TAG, "stopRecording: ${elapsed}s saved=$savedCount indexed=${store?.count()}")
+        ambient?.stop()
+        ambient = null
         _state.value = AppState.Idle
     }
 
@@ -124,6 +142,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val file = File(imagesDir, "frame_$timestampMs.jpg")
         FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 70, it) }
         savedCount++
+        synchronized(recentFrames) {
+            recentFrames.addLast(file.absolutePath to timestampMs)
+            while (recentFrames.size > recentFramesMax) recentFrames.removeFirst()
+        }
         val elapsed = (timestampMs - recordingStartMs) / 1000
         val indexed = store?.count() ?: 0L
         Log.d(TAG, "frame saved: saved=$savedCount indexed=$indexed")
@@ -131,6 +153,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = AppState.Recording(savedCount, indexed, elapsed)
         }
         encodeQueue.trySend(file to bitmap)
+    }
+
+    private fun nearestFramePath(midMs: Long): String {
+        synchronized(recentFrames) {
+            return recentFrames.minByOrNull { kotlin.math.abs(it.second - midMs) }?.first ?: ""
+        }
     }
 
     fun startListening() {
@@ -189,5 +217,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         visionEncoder?.close()
         textEncoder?.close()
         store?.close()
+        ambient?.destroy()
     }
 }
