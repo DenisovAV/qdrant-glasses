@@ -8,6 +8,14 @@
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
+    <!-- Android 11+ package visibility: allow binding to the on-device speech
+         recognition service (Google's offline ASR) used by AndroidSpeechRecognizer. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="Qdrant Glasses"

@@ -36,6 +36,13 @@ class VoiceSearchManager(
     private val googleStt: GoogleSpeechRecognizer? =
         if (googleApiKey.isNotEmpty()) GoogleSpeechRecognizer(googleApiKey) else null
 
+    // On-device offline Google ASR. Preferred when
+    // available: accurate AND offline. It owns the mic itself (does its own VAD
+    // and endpointing), so it bypasses our AudioRecord/VOSK pipeline entirely.
+    private val androidStt = AndroidSpeechRecognizer(context)
+    private val useAndroidStt = android.speech.SpeechRecognizer.isRecognitionAvailable(context)
+    @Volatile private var androidSttActive = false
+
     // True only when a key is configured AND the device currently has internet.
     // Wrapped in try/catch so a connectivity check failure can never break listening —
     // worst case we fall back to VOSK.
@@ -64,6 +71,22 @@ class VoiceSearchManager(
 
     fun startListening() {
         if (isListening) return
+
+        // Preferred path: on-device offline Google ASR. It manages the mic, VAD and
+        // endpointing itself, so we don't open our own AudioRecord here — just hand off.
+        if (useAndroidStt) {
+            Log.i(TAG, "startListening [backend=android-offline]")
+            isListening = true
+            androidSttActive = true
+            listenStartMs = System.currentTimeMillis()
+            androidStt.startListening(
+                onPartial,
+                onResult = { text -> isListening = false; androidSttActive = false; onResult(text) },
+                onError  = { err -> isListening = false; androidSttActive = false; onError(err) }
+            )
+            onReady()
+            return
+        }
 
         val google = useGoogle()
         if (!google && !vosk.isReady) { onError("VOSK model not ready"); return }
@@ -202,6 +225,13 @@ class VoiceSearchManager(
     }
 
     fun stopListening() {
+        // Android offline ASR owns its own mic/VAD — tell it to finalize and return.
+        if (androidSttActive) {
+            Log.d(TAG, "stopListening [android-offline]")
+            androidStt.stopListening()
+            onStopped()
+            return
+        }
         val elapsed = System.currentTimeMillis() - listenStartMs
         if (elapsed < 1000) { Log.d(TAG, "stopListening ignored — too soon"); return }
         Log.d(TAG, "stopListening after ${elapsed}ms")
@@ -212,11 +242,13 @@ class VoiceSearchManager(
 
     fun destroy() {
         isListening = false
+        androidSttActive = false
         releaseAudioFocus()
         audioRecord?.release()
         audioRecord = null
         vosk.destroy()
         googleStt?.destroy()
+        androidStt.destroy()
     }
 
     private fun requestAudioFocus() {

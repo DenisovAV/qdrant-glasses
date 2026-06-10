@@ -13,8 +13,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import tech.qdrant.glasses.embedding.ClipTextEncoder
-import tech.qdrant.glasses.embedding.ClipVisionEncoder
+import tech.qdrant.glasses.embedding.EncoderFactory
+import tech.qdrant.glasses.embedding.TextEncoder
+import tech.qdrant.glasses.embedding.VisionEncoder
 import tech.qdrant.glasses.storage.MemoryFrame
 import tech.qdrant.glasses.storage.VisionMemoryStore
 import java.io.File
@@ -33,8 +34,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object { private const val TAG = "GlassesVM" }
 
-    private var visionEncoder: ClipVisionEncoder? = null
-    private var textEncoder: ClipTextEncoder? = null
+    private var visionEncoder: VisionEncoder? = null
+    private var textEncoder: TextEncoder? = null
     private var store: VisionMemoryStore? = null
 
     private val _state = MutableStateFlow<AppState>(AppState.Loading)
@@ -56,13 +57,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 store = VisionMemoryStore(app)
                 Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
 
-                Log.d(TAG, "init: loading ClipVisionEncoder")
-                visionEncoder = ClipVisionEncoder(app)
-                Log.d(TAG, "init: ClipVisionEncoder OK")
+                Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
+                visionEncoder = EncoderFactory.createVision(app)
+                Log.d(TAG, "init: vision encoder OK")
 
-                Log.d(TAG, "init: loading ClipTextEncoder")
-                textEncoder = ClipTextEncoder(app)
-                Log.d(TAG, "init: ClipTextEncoder OK")
+                Log.d(TAG, "init: loading text encoder [${EncoderFactory.backend}]")
+                textEncoder = EncoderFactory.createText(app)
+                Log.d(TAG, "init: text encoder OK")
 
                 Log.i(TAG, "init: all components ready → Idle")
                 _state.value = AppState.Idle
