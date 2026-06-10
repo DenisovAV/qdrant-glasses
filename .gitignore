@@ -39,3 +39,9 @@ captures/
 
 # Diagnostic audio dumps
 diag_audio.*
+
+# Model weights — large binaries, kept out of git (distribute separately)
+*.onnx
+*.tflite
+app/src/main/assets/model/
+models/
