@@ -81,14 +81,22 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         } catch (_: Exception) {}
 
         val elapsed = formatElapsed(System.currentTimeMillis() - best.timestampMs)
-        if (best.type == "text" && !best.transcript.isNullOrEmpty()) {
-            transcriptText.text = "“${best.transcript}”"
+        val isTextHit = best.type == "text" && !best.transcript.isNullOrEmpty()
+
+        // Compose what to show: the hit's own line (for a text hit) plus any speech
+        // spoken near this frame (for any hit). An image hit thus still surfaces
+        // "what was said here", not just the picture.
+        val lines = buildList {
+            if (isTextHit) add("“${best.transcript}”")
+            best.nearbyTranscripts.forEach { add("• $it") }
+        }
+        if (lines.isNotEmpty()) {
+            transcriptText.text = lines.joinToString("\n")
             transcriptText.visibility = VISIBLE
-            timeText.text = "Heard $elapsed"
         } else {
             transcriptText.visibility = GONE
-            timeText.text = "Seen $elapsed"
         }
+        timeText.text = if (isTextHit) "Heard $elapsed" else "Seen $elapsed"
     }
 
     private fun formatElapsed(ms: Long): String {

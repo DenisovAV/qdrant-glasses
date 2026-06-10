@@ -22,6 +22,8 @@ import tech.qdrant.edge.ffi.Condition
 import tech.qdrant.edge.ffi.FieldCondition
 import tech.qdrant.edge.ffi.Match
 import tech.qdrant.edge.ffi.ValueVariants
+import tech.qdrant.edge.ffi.ScrollRequest
+import tech.qdrant.edge.ffi.WithVector
 import java.io.File
 import java.util.UUID
 
@@ -31,7 +33,10 @@ data class MemoryFrame(
     val imagePath: String,
     val timestampMs: Long,
     val type: String = "image",
-    val transcript: String? = null
+    val transcript: String? = null,
+    // Transcripts spoken near this frame (filled at result time for the shown hit) —
+    // lets an image hit display "what was said here", not just the picture.
+    val nearbyTranscripts: List<String> = emptyList()
 )
 
 class VisionMemoryStore(context: Context) : AutoCloseable {
@@ -132,6 +137,60 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 type = extractString(payload, "type").ifEmpty { "image" },
                 transcript = extractString(payload, "transcript").ifEmpty { null }
             )
+        }
+    }
+
+    /**
+     * Speech that OVERLAPS a frame in time — the reverse of the transcript→nearest-frame
+     * link, done by time RANGE rather than a single nearest point. A long utterance spans
+     * several frames; each of those frames should surface it ("overlap" chunking, the RAG
+     * best practice), not just the one nearest its midpoint. We scroll all type:"text"
+     * points (there are few — one per spoken utterance) and keep those whose
+     * [t_start_ms, t_end_ms] window covers the frame's timestamp (± a small slack).
+     */
+    fun transcriptsOverlappingFrame(frameTimestampMs: Long, slackMs: Long = 1500): List<String> {
+        val typeText = Condition.Field(FieldCondition(
+            key = "type", match = Match.Value(ValueVariants.String("text")),
+            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+        ))
+        val resp = shard.scroll(
+            ScrollRequest(
+                offset = null, limit = 1000UL,
+                filter = Filter(must = listOf(typeText), should = null, mustNot = null),
+                withPayload = WithPayload.Bool(true),
+                withVector = WithVector.Bool(false),
+                orderBy = null
+            )
+        )
+        val hits = resp.records.mapNotNull { rec ->
+            val p = rec.payload ?: return@mapNotNull null
+            val tStart = extractLong(p, "t_start_ms")
+            val tEnd = extractLong(p, "t_end_ms")
+            val text = extractString(p, "transcript").ifEmpty { return@mapNotNull null }
+            // frame falls within the utterance window (with slack on both sides)
+            if (frameTimestampMs in (tStart - slackMs)..(tEnd + slackMs)) text else null
+        }
+        Log.d(TAG, "transcriptsOverlappingFrame(ts=$frameTimestampMs): ${hits.size} of ${resp.records.size} text points")
+        return hits
+    }
+
+    /** Diagnostic: scroll the entire base and log every point (type, frame, transcript). */
+    fun dumpAll() {
+        val resp = shard.scroll(
+            ScrollRequest(
+                offset = null, limit = 1000UL, filter = null,
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+                orderBy = null
+            )
+        )
+        Log.i(TAG, "DUMP: ${resp.records.size} points total")
+        resp.records.forEach { rec ->
+            val p = rec.payload ?: "{}"
+            val type = extractString(p, "type").ifEmpty { "?" }
+            val frame = extractString(p, "image_path").substringAfterLast('/')
+            val tr = extractString(p, "transcript")
+            val ts = extractLong(p, "timestamp_ms")
+            Log.i(TAG, "DUMP type=$type frame=$frame ts=$ts transcript=\"$tr\"")
         }
     }
 

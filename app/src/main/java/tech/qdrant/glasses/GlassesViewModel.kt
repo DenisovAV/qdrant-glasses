@@ -73,6 +73,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 Log.d(TAG, "init: opening VisionMemoryStore")
                 store = VisionMemoryStore(app)
                 Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
+                store?.dumpAll()  // DIAG: log the whole base at startup
 
                 Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
                 visionEncoder = EncoderFactory.createVision(app)
@@ -229,7 +230,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 results.forEachIndexed { i, f ->
                     Log.d(TAG, "  result[$i] score=%.3f type=${f.type} path=${f.imagePath.substringAfterLast('/')}".format(f.score))
                 }
-                _state.value = AppState.Results(text, results)
+                // Enrich each hit with speech that OVERLAPS its frame in time, so even an
+                // image hit shows "what was said here" — and a long utterance surfaces on
+                // every frame it spanned, not just the one nearest its midpoint.
+                val enriched = results.map { f ->
+                    val overlapping = db.transcriptsOverlappingFrame(f.timestampMs)
+                    // Drop the hit's own transcript from the "also heard" list (avoid echo).
+                    f.copy(nearbyTranscripts = overlapping.filter { it != f.transcript })
+                }
+                _state.value = AppState.Results(text, enriched)
             } catch (e: Exception) {
                 Log.e(TAG, "search failed for \"$text\"", e)
                 _state.value = AppState.Idle
