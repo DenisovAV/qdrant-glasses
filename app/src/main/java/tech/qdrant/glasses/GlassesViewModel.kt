@@ -77,8 +77,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startRecording() {
-        if (_state.value is AppState.Recording) {
-            Log.w(TAG, "startRecording ignored: already recording")
+        // Only start from Idle — never while a query STT is active (Listening/Processing/
+        // Results), or the ambient recognizer would fight the query recognizer for the mic.
+        if (_state.value !is AppState.Idle) {
+            Log.w(TAG, "startRecording ignored: not Idle (state=${_state.value::class.simpleName})")
             return
         }
         recordingStartMs = System.currentTimeMillis()
