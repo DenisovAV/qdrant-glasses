@@ -87,7 +87,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val timestampMs = file.nameWithoutExtension.removePrefix("frame_").toLongOrNull()
                     ?: System.currentTimeMillis()
                 val vector = enc.encode(bitmap)
-                db.store(file.absolutePath, vector, timestampMs)
+                db.storeImage(file.absolutePath, vector, timestampMs)
                 val indexed = db.count()
                 Log.d(TAG, "encoded+indexed: indexed=$indexed saved=$savedCount")
                 if (_state.value is AppState.Recording) {

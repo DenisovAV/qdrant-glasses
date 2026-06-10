@@ -21,7 +21,9 @@ data class MemoryFrame(
     val id: String,
     val score: Float,
     val imagePath: String,
-    val timestampMs: Long
+    val timestampMs: Long,
+    val type: String = "image",
+    val transcript: String? = null
 )
 
 class VisionMemoryStore(context: Context) : AutoCloseable {
@@ -53,23 +55,34 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
         Log.i(TAG, "init: shard opened, existing points=${shard.count(CountRequest(filter = null, exact = false))}")
     }
 
-    fun store(imagePath: String, vector: FloatArray, timestampMs: Long): String {
+    fun storeImage(imagePath: String, vector: FloatArray, timestampMs: Long): String {
         val id = UUID.randomUUID().toString()
-        val payload = """{"image_path":"${imagePath.replace("\\", "\\\\")}","timestamp_ms":$timestampMs}"""
+        val payload = """{"type":"image","image_path":"${imagePath.replace("\\", "\\\\")}","timestamp_ms":$timestampMs}"""
+        upsert(id, vector, payload)
+        Log.d(TAG, "storeImage: id=$id path=${imagePath.substringAfterLast('/')}")
+        return id
+    }
+
+    fun storeTranscript(
+        text: String, vector: FloatArray,
+        tStartMs: Long, tEndMs: Long, nearestImagePath: String
+    ): String {
+        val id = UUID.randomUUID().toString()
+        val safeText = text.replace("\\", "\\\\").replace("\"", "\\\"")
+        val safePath = nearestImagePath.replace("\\", "\\\\")
+        val payload = """{"type":"text","transcript":"$safeText","t_start_ms":$tStartMs,"t_end_ms":$tEndMs,"image_path":"$safePath","timestamp_ms":$tStartMs}"""
+        upsert(id, vector, payload)
+        Log.d(TAG, "storeTranscript: id=$id text=\"${text.take(40)}\"")
+        return id
+    }
+
+    private fun upsert(id: String, vector: FloatArray, payload: String) {
         shard.update(
             UpdateOperation.upsertPoints(
-                listOf(
-                    Point(
-                        id = PointId.Uuid(id),
-                        vector = Vector.Single(vector.toList()),
-                        payload = payload
-                    )
-                )
+                listOf(Point(id = PointId.Uuid(id), vector = Vector.Single(vector.toList()), payload = payload))
             )
         )
         shard.flush()
-        Log.d(TAG, "store: id=$id path=${imagePath.substringAfterLast('/')}")
-        return id
     }
 
     fun search(queryVector: FloatArray, topK: Int = 3): List<MemoryFrame> {
