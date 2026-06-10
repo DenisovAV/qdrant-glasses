@@ -14,6 +14,15 @@ import tech.qdrant.edge.ffi.PointId
 import tech.qdrant.edge.ffi.Query
 import tech.qdrant.edge.ffi.Vector
 import tech.qdrant.edge.ffi.WithPayload
+import tech.qdrant.edge.ffi.QueryRequest
+import tech.qdrant.edge.ffi.Prefetch
+import tech.qdrant.edge.ffi.ScoringQuery
+import tech.qdrant.edge.ffi.Fusion
+import tech.qdrant.edge.ffi.Filter
+import tech.qdrant.edge.ffi.Condition
+import tech.qdrant.edge.ffi.FieldCondition
+import tech.qdrant.edge.ffi.Match
+import tech.qdrant.edge.ffi.ValueVariants
 import java.io.File
 import java.util.UUID
 
@@ -86,27 +95,43 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     }
 
     fun search(queryVector: FloatArray, topK: Int = 3): List<MemoryFrame> {
-        Log.d(TAG, "search: topK=$topK")
-        val results = shard.search(
-            SearchRequest(
-                query = Query.Nearest(vector = queryVector.toList(), using = null),
+        Log.d(TAG, "search (DBSF image+text): topK=$topK")
+        val q = queryVector.toList()
+        fun nearestOfType(t: String) = Prefetch(
+            limit = (topK * 3).toULong(),
+            query = ScoringQuery.Vector(Query.Nearest(vector = q, using = null)),
+            prefetches = emptyList(),
+            filter = Filter(
+                must = listOf(Condition.Field(FieldCondition(
+                    key = "type",
+                    match = Match.Value(ValueVariants.String(t)),
+                    range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                ))),
+                should = null, mustNot = null
+            ),
+            scoreThreshold = null, params = null
+        )
+        val results = shard.query(
+            QueryRequest(
                 limit = topK.toULong(),
                 offset = null,
-                filter = null,
-                params = null,
+                query = ScoringQuery.Fusion(Fusion.Dbsf),
+                prefetches = listOf(nearestOfType("image"), nearestOfType("text")),
                 withVector = null,
                 withPayload = WithPayload.Bool(true),
-                scoreThreshold = null
+                filter = null, scoreThreshold = null, params = null
             )
         )
-        Log.i(TAG, "search: found ${results.size} results")
+        Log.i(TAG, "search: found ${results.size} fused results")
         return results.map { point ->
             val payload = point.payload ?: "{}"
             MemoryFrame(
                 id = (point.id as? PointId.Uuid)?.value ?: point.id.toString(),
                 score = point.score,
                 imagePath = extractString(payload, "image_path"),
-                timestampMs = extractLong(payload, "timestamp_ms")
+                timestampMs = extractLong(payload, "timestamp_ms"),
+                type = extractString(payload, "type").ifEmpty { "image" },
+                transcript = extractString(payload, "transcript").ifEmpty { null }
             )
         }
     }
