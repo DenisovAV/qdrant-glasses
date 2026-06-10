@@ -83,6 +83,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 textEncoder = EncoderFactory.createText(app)
                 Log.d(TAG, "init: text encoder OK")
 
+                // Pre-warm the ambient ASR model (~180MB) off the main thread so the
+                // first recording doesn't block the UI loading it. ensureLoaded is
+                // idempotent + @Synchronized, so AmbientTranscriber.start() becomes a
+                // warm cache hit. Soft: a failure here just disables ambient transcription.
+                tech.qdrant.glasses.search.SherpaStreamingAsr.ensureLoaded(app)
+
                 Log.i(TAG, "init: all components ready → Idle")
                 _state.value = AppState.Idle
             } catch (e: Exception) {

@@ -49,13 +49,20 @@ class AmbientTranscriber(
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf, CHUNK_SAMPLES * 2 * 4)
         )
-        val stream = SherpaStreamingAsr.newStream()
-        rec.startRecording()
-        val pcm = ShortArray(CHUNK_SAMPLES)
-        val floats = FloatArray(CHUNK_SAMPLES)
-        var segStartMs = 0L
-        var sawSpeech = false
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord not initialized (mic busy / no permission?) — ambient disabled")
+            rec.release()
+            running = false
+            return
+        }
+        var stream: com.k2fsa.sherpa.onnx.OnlineStream? = null
         try {
+            stream = SherpaStreamingAsr.newStream()
+            rec.startRecording()
+            val pcm = ShortArray(CHUNK_SAMPLES)
+            val floats = FloatArray(CHUNK_SAMPLES)
+            var segStartMs = 0L
+            var sawSpeech = false
             while (running) {
                 val n = rec.read(pcm, 0, pcm.size)
                 if (n <= 0) continue
@@ -68,7 +75,7 @@ class AmbientTranscriber(
                         Log.i(TAG, "ambient segment: \"${text.take(60)}\"")
                         onSegment(text, if (sawSpeech) segStartMs else System.currentTimeMillis(), System.currentTimeMillis())
                     }
-                    SherpaStreamingAsr.reset(stream)
+                    SherpaStreamingAsr.reset(stream)  // reset clears currentText, so the tail flush below can't re-emit this segment
                     sawSpeech = false
                 }
             }
@@ -82,8 +89,9 @@ class AmbientTranscriber(
         } catch (e: Throwable) {
             Log.e(TAG, "ambient loop error", e)
         } finally {
-            rec.stop(); rec.release()
-            SherpaStreamingAsr.releaseStream(stream)
+            try { rec.stop() } catch (_: Throwable) {}
+            rec.release()
+            stream?.let { SherpaStreamingAsr.releaseStream(it) }
             Log.i(TAG, "ambient transcription stopped")
         }
     }
