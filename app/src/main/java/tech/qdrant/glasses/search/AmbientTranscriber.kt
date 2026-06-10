@@ -20,6 +20,7 @@ class AmbientTranscriber(
         private const val TAG = "AmbientTranscriber"
         private const val MIN_CHARS = 2          // drop trivial noise tokens
         private const val RESTART_DELAY_MS = 250L // brief settle before re-arming
+        private const val MAX_CONSECUTIVE_ERRORS = 8
     }
 
     // Offline Google recognizer (its own mic + VAD); preferOffline defaults to true.
@@ -27,6 +28,7 @@ class AmbientTranscriber(
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var running = false
     private var cycleStartMs = 0L
+    private var consecutiveErrors = 0
 
     /** Always "ready" — the Google engine has no model-load gate like Vosk did. */
     val isReady get() = true
@@ -44,18 +46,26 @@ class AmbientTranscriber(
         recognizer.startListening(
             onPartial = { /* ignored — we only store finalized utterances */ },
             onResult = { text ->
+                // A returned result (even empty/too-short) means the recognizer is healthy.
+                consecutiveErrors = 0
                 val t = text.trim()
                 val tEnd = System.currentTimeMillis()
                 if (t.length >= MIN_CHARS) {
                     Log.i(TAG, "ambient segment: \"${t.take(60)}\"")
                     onSegment(t, cycleStartMs, tEnd)
+                    consecutiveErrors = 0
                 }
                 rearm()
             },
             onError = { err ->
-                // Empty/timeout/no-match are normal between utterances — just re-arm.
-                Log.d(TAG, "ambient cycle ended ($err), re-arming")
-                rearm()
+                consecutiveErrors++
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    Log.w(TAG, "ambient stopping: $consecutiveErrors consecutive STT errors (last: $err) — offline model missing or recognizer unavailable?")
+                    running = false
+                } else {
+                    Log.d(TAG, "ambient cycle ended ($err), re-arming [$consecutiveErrors/$MAX_CONSECUTIVE_ERRORS]")
+                    rearm()
+                }
             },
         )
     }
