@@ -24,7 +24,7 @@ interface TextEncoder : AutoCloseable {
 object EncoderFactory {
     enum class Backend { ONNX, LITERT_CPU, LITERT_GPU, LITERT_NPU }
 
-    val backend = Backend.LITERT_CPU
+    val backend = Backend.ONNX
 
     fun createVision(context: Context): VisionEncoder = when (backend) {
         Backend.ONNX -> OnnxClipVisionEncoder(context)
