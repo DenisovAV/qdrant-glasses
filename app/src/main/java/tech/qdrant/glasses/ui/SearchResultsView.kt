@@ -14,6 +14,7 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
     private val image: ImageView
     private val overlay: LinearLayout
     private val queryText: TextView
+    private val transcriptText: TextView
     private val timeText: TextView
 
     init {
@@ -40,6 +41,15 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         }
         overlay.addView(queryText)
 
+        // What was HEARD at that moment — shown only for transcript (type=text) hits.
+        transcriptText = TextView(context).apply {
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setTypeface(null, android.graphics.Typeface.ITALIC)
+            visibility = GONE
+        }
+        overlay.addView(transcriptText)
+
         timeText = TextView(context).apply {
             textSize = 13f
             setTextColor(Color.LTGRAY)
@@ -60,6 +70,7 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
 
         if (results.isEmpty()) {
             image.setImageDrawable(null)
+            transcriptText.visibility = GONE
             timeText.text = "Nothing found"
             return
         }
@@ -70,7 +81,14 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         } catch (_: Exception) {}
 
         val elapsed = formatElapsed(System.currentTimeMillis() - best.timestampMs)
-        timeText.text = "Seen $elapsed"
+        if (best.type == "text" && !best.transcript.isNullOrEmpty()) {
+            transcriptText.text = "“${best.transcript}”"
+            transcriptText.visibility = VISIBLE
+            timeText.text = "Heard $elapsed"
+        } else {
+            transcriptText.visibility = GONE
+            timeText.text = "Seen $elapsed"
+        }
     }
 
     private fun formatElapsed(ms: Long): String {

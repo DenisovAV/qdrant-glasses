@@ -26,8 +26,15 @@ class FrameCaptureManager(
     private var lastFrameTimeMs = 0L
     private val frameIntervalMs = 3000L
     private val forceSaveIntervalMs = 12000L
+    // Once past the interval gate, don't pay toBitmap+scale at full camera fps while
+    // waiting for the scene to change — analyze at most ~2x/sec.
+    private var lastAnalysisMs = 0L
+    private val analyzeIntervalMs = 500L
 
-    private var lastFramePixels: IntArray? = null
+    // Baseline for dedupe = the last ACCEPTED frame. Comparing against the last
+    // ANALYZED frame degenerates to frame-vs-33ms-ago (always similar), so a gradual
+    // scene change would never trigger an accept until the force interval.
+    private var lastAcceptedPixels: IntArray? = null
     private val ssimSize = 32
     private val similarityThreshold = 0.85f
 
@@ -64,6 +71,11 @@ class FrameCaptureManager(
                 framesSkippedTime++
                 return
             }
+            if (nowMs - lastAnalysisMs < analyzeIntervalMs) {
+                framesSkippedTime++
+                return
+            }
+            lastAnalysisMs = nowMs
             val raw = proxy.toBitmap()
             val rotation = proxy.imageInfo.rotationDegrees
             if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} rotation=$rotation")
@@ -71,13 +83,15 @@ class FrameCaptureManager(
                 val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
                 Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
             } else raw
-            val similarity = computeSimilarity(bitmap)
+            val pixels = downscalePixels(bitmap)
+            val similarity = lastAcceptedPixels?.let { similarityBetween(it, pixels) } ?: 0f
             val forced = (nowMs - lastFrameTimeMs) >= forceSaveIntervalMs
             if (similarity > similarityThreshold && !forced) {
                 framesSkippedSimilar++
                 Log.v(TAG, "frame skipped: similarity=%.2f".format(similarity))
                 return
             }
+            lastAcceptedPixels = pixels  // baseline moves ONLY on accept
             lastFrameTimeMs = nowMs
             framesSent++
             Log.d(TAG, "frame accepted: similarity=%.2f forced=$forced sent=$framesSent".format(similarity))
@@ -87,15 +101,14 @@ class FrameCaptureManager(
         }
     }
 
-    private fun computeSimilarity(bitmap: Bitmap): Float {
+    private fun downscalePixels(bitmap: Bitmap): IntArray {
         val small = Bitmap.createScaledBitmap(bitmap, ssimSize, ssimSize, false)
-        val pixels = IntArray(ssimSize * ssimSize).also {
+        return IntArray(ssimSize * ssimSize).also {
             small.getPixels(it, 0, ssimSize, 0, 0, ssimSize, ssimSize)
         }
-        val prev = lastFramePixels
-        lastFramePixels = pixels
-        if (prev == null) return 0f
+    }
 
+    private fun similarityBetween(prev: IntArray, pixels: IntArray): Float {
         var diffSum = 0L
         for (i in pixels.indices) {
             val lum1 = luminance(prev[i])
