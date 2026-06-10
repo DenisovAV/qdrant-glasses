@@ -53,9 +53,20 @@ class OnnxClipVisionEncoder(context: Context) : VisionEncoder {
 
 internal fun extractAsset(context: Context, name: String): File {
     val dest = File(context.filesDir, name)
-    if (!dest.exists()) {
-        context.assets.open(name).use { it.copyTo(dest.outputStream()) }
+    // Validate by SIZE, not mere existence: a previous extraction can be left truncated
+    // if the process was killed mid-copy (RayNeo's BackgroundAppManager does exactly this
+    // for a backgrounded app), and `dest.exists()` would then happily reuse the fragment
+    // → ORT_INVALID_PROTOBUF. Copy to a temp file and rename atomically so a partial
+    // copy never appears at the final path.
+    val expectedSize = context.assets.openFd(name).use { it.length }
+    if (dest.exists() && dest.length() == expectedSize) return dest
+    val tmp = File(context.filesDir, "$name.tmp")
+    context.assets.open(name).use { input -> tmp.outputStream().use { input.copyTo(it) } }
+    if (tmp.length() != expectedSize) {
+        tmp.delete()
+        error("extractAsset: $name copied ${tmp.length()} of $expectedSize bytes")
     }
+    if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
     return dest
 }
 
