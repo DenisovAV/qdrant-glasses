@@ -9,7 +9,7 @@ import android.util.Log
 import java.io.File
 import java.nio.FloatBuffer
 
-class ClipVisionEncoder(context: Context) : AutoCloseable {
+class OnnxClipVisionEncoder(context: Context) : VisionEncoder {
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
@@ -22,11 +22,13 @@ class ClipVisionEncoder(context: Context) : AutoCloseable {
         session = createAcceleratedSession(env, modelFile.absolutePath)
     }
 
-    fun encode(bitmap: Bitmap): FloatArray {
+    override fun encode(bitmap: Bitmap): FloatArray {
         val resized = Bitmap.createScaledBitmap(bitmap, 224, 224, true)
         val inputName = session.inputNames.iterator().next()
         val tensor = OnnxTensor.createTensor(env, bitmapToTensor(resized), longArrayOf(1, 3, 224, 224))
+        val t1 = System.currentTimeMillis()
         val results = tensor.use { session.run(mapOf(inputName to it)) }
+        Log.i("ClipEncoder", "ONNX vision run=${System.currentTimeMillis() - t1}ms")
         return results.use { (it[0].value as Array<FloatArray>)[0] }
     }
 

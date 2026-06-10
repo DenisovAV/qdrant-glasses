@@ -46,6 +46,7 @@ android {
 
     androidResources {
         noCompress += "onnx"
+        noCompress += "tflite"
     }
 }
 
@@ -58,6 +59,11 @@ dependencies {
     implementation(libs.activity.ktx)
     implementation(libs.bundles.camerax)
     implementation(libs.onnxruntime.android)
+    implementation(libs.litert)
+    implementation(libs.litert.gpu)
+    implementation(libs.litert.gpu.api)
+    implementation(libs.qnn.runtime)
+    implementation(libs.qnn.litert.delegate)
     implementation(libs.coroutines.android)
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("com.alphacephei:vosk-android:0.3.75")

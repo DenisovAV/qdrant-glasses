@@ -4,87 +4,39 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
-import org.json.JSONObject
 import java.nio.LongBuffer
-import tech.qdrant.glasses.embedding.extractAsset
 
-class ClipTextEncoder(context: Context) : AutoCloseable {
+class OnnxClipTextEncoder(context: Context) : TextEncoder {
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
-    private val vocab: Map<String, Int>
-    private val merges: List<Pair<String, String>>
-
-    companion object {
-        private const val MAX_LENGTH = 77
-        private const val SOT_TOKEN = 49406  // <|startoftext|>
-        private const val EOT_TOKEN = 49407  // <|endoftext|>
-    }
+    private val tokenizer = TokenizerFactory.create(context)
 
     init {
         val modelFile = extractAsset(context, "clip-text-int8.onnx")
         session = createAcceleratedSession(env, modelFile.absolutePath)
-
-        val root = JSONObject(context.assets.open("clip-tokenizer.json").bufferedReader().readText())
-        val model = root.getJSONObject("model")
-
-        val vocabObj = model.getJSONObject("vocab")
-        vocab = buildMap { vocabObj.keys().forEach { key -> put(key, vocabObj.getInt(key)) } }
-
-        val mergesArray = model.getJSONArray("merges")
-        merges = buildList {
-            for (i in 0 until mergesArray.length()) {
-                val parts = mergesArray.getString(i).split(" ")
-                if (parts.size == 2) add(parts[0] to parts[1])
-            }
-        }
     }
 
-    fun encode(text: String): FloatArray {
-        val tokenIds = tokenize(text.lowercase().trim())
-        val inputIds = LongBuffer.allocate(MAX_LENGTH)
-        val attnMask = LongBuffer.allocate(MAX_LENGTH)
-
-        inputIds.put(SOT_TOKEN.toLong()); attnMask.put(1L)
-        for (i in tokenIds.indices) {
-            if (i >= MAX_LENGTH - 2) break
-            inputIds.put(tokenIds[i].toLong()); attnMask.put(1L)
+    override fun encode(text: String): FloatArray {
+        val ids = tokenizer.encodeToIds(text)  // [SOT, tok…, EOT, 0-pad], length 77
+        val maxLen = Tokenizer.MAX_LENGTH
+        val inputIds = LongBuffer.allocate(maxLen)
+        val attnMask = LongBuffer.allocate(maxLen)
+        for (i in 0 until maxLen) {
+            val id = ids[i]
+            inputIds.put(id.toLong())
+            // mask = 1 for SOT/tokens/EOT (non-zero, plus index 0=SOT), 0 for pad
+            attnMask.put(if (id != 0 || i == 0) 1L else 0L)
         }
-        inputIds.put(EOT_TOKEN.toLong()); attnMask.put(1L)
-        while (inputIds.position() < MAX_LENGTH) { inputIds.put(0L); attnMask.put(0L) }
         inputIds.rewind(); attnMask.rewind()
 
-        val shape = longArrayOf(1, MAX_LENGTH.toLong())
-        val idsTensor   = OnnxTensor.createTensor(env, inputIds, shape)
-        val maskTensor  = OnnxTensor.createTensor(env, attnMask, shape)
-        val results = idsTensor.use { ids -> maskTensor.use { mask ->
-            session.run(mapOf("input_ids" to ids, "attention_mask" to mask))
+        val shape = longArrayOf(1, maxLen.toLong())
+        val idsTensor = OnnxTensor.createTensor(env, inputIds, shape)
+        val maskTensor = OnnxTensor.createTensor(env, attnMask, shape)
+        val results = idsTensor.use { i -> maskTensor.use { m ->
+            session.run(mapOf("input_ids" to i, "attention_mask" to m))
         }}
         return results.use { (it[0].value as Array<FloatArray>)[0] }
-    }
-
-    private fun tokenize(text: String): List<Int> {
-        val tokens = mutableListOf<Int>()
-        for (word in text.split(" ").filter { it.isNotEmpty() }) {
-            var chars = word.map { it.toString() }.toMutableList()
-            var changed = true
-            while (changed && chars.size > 1) {
-                changed = false
-                for ((first, second) in merges) {
-                    val idx = (0 until chars.size - 1).firstOrNull {
-                        chars[it] == first && chars[it + 1] == second
-                    } ?: continue
-                    chars[idx] = first + second
-                    chars.removeAt(idx + 1)
-                    changed = true
-                    break
-                }
-            }
-            chars.forEach { tok ->
-                vocab[tok + "</w>"]?.let { tokens.add(it) } ?: vocab[tok]?.let { tokens.add(it) }
-            }
-        }
-        return tokens
     }
 
     override fun close() {
