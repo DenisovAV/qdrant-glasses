@@ -53,6 +53,8 @@ android {
 
 dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
+    // sherpa-onnx AAR lives in the ROOT libs/ (per .gitignore convention, fetched manually).
+    implementation(fileTree(mapOf("dir" to rootProject.file("libs"), "include" to listOf("sherpa-onnx-*.aar"))))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
