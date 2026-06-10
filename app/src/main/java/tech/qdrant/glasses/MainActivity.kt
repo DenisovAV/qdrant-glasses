@@ -38,7 +38,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: FrameCaptureManager
     private lateinit var voiceManager: VoiceSearchManager
 
-    private var isRecording = false
     private var buttonDownMs = 0L
     private var buttonLongFired = false
 
@@ -165,14 +164,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleRecordingToggle() {
-        if (!isRecording) {
-            Log.i(TAG, "button: START recording")
-            isRecording = true
-            viewModel.startRecording()
-        } else {
-            Log.i(TAG, "button: STOP recording")
-            isRecording = false
-            viewModel.stopRecording()
+        // Derive the toggle from the actual app state — a local boolean desyncs when
+        // startRecording() rejects (not Idle) and then force-Idles a live query flow.
+        when (val s = viewModel.state.value) {
+            is AppState.Recording -> {
+                Log.i(TAG, "button: STOP recording")
+                viewModel.stopRecording()
+            }
+            is AppState.Idle -> {
+                Log.i(TAG, "button: START recording")
+                viewModel.startRecording()
+            }
+            else -> Log.i(TAG, "button: long press ignored (state=${s::class.simpleName})")
         }
     }
 

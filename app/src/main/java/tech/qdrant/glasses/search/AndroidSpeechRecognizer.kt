@@ -18,6 +18,7 @@ import android.util.Log
 class AndroidSpeechRecognizer(
     private val context: Context,
     private val preferOffline: Boolean = true,
+    private val label: String = "query",  // distinguishes ambient vs query instances in logcat
 ) : tech.qdrant.glasses.search.SpeechRecognizer {
     companion object {
         private const val TAG = "VoiceSearch"
@@ -37,8 +38,8 @@ class AndroidSpeechRecognizer(
         onResult: (String) -> Unit,
         onError: (String) -> Unit
     ) {
-        lastPartial = ""
         mainHandler.post {
+            lastPartial = ""  // reset on main, same thread as onPartialResults writes
             recognizer?.destroy()
             recognizer = SpeechRecognizer.createSpeechRecognizer(
                 context, ComponentName(GOOGLE_PKG, GOOGLE_SERVICE)
@@ -50,7 +51,7 @@ class AndroidSpeechRecognizer(
                         // The Google SODA engine sometimes returns text only in partials and
                         // an empty final bundle — fall back to the last partial we saw.
                         if (text.isEmpty()) text = lastPartial
-                        Log.i(TAG, "android stt result: \"$text\" (lastPartial=\"$lastPartial\")")
+                        Log.i(TAG, "[$label] android stt result: \"$text\" (lastPartial=\"$lastPartial\")")
                         if (text.isNotEmpty()) onResult(text) else onError("Empty result")
                     }
                     override fun onPartialResults(partialResults: Bundle) {
@@ -59,12 +60,12 @@ class AndroidSpeechRecognizer(
                         if (text.isNotEmpty()) { lastPartial = text; onPartial(text) }
                     }
                     override fun onError(error: Int) {
-                        Log.w(TAG, "android stt error: $error")
+                        Log.w(TAG, "[$label] android stt error: $error")
                         onError("STT error: $error")
                     }
-                    override fun onReadyForSpeech(params: Bundle) { Log.i(TAG, "android stt: ready") }
-                    override fun onBeginningOfSpeech() { Log.i(TAG, "android stt: speech started") }
-                    override fun onEndOfSpeech() { Log.i(TAG, "android stt: speech ended") }
+                    override fun onReadyForSpeech(params: Bundle) { Log.i(TAG, "[$label] android stt: ready") }
+                    override fun onBeginningOfSpeech() { Log.i(TAG, "[$label] android stt: speech started") }
+                    override fun onEndOfSpeech() { Log.i(TAG, "[$label] android stt: speech ended") }
                     override fun onRmsChanged(rmsdB: Float) {}
                     override fun onBufferReceived(buffer: ByteArray?) {}
                     override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -81,7 +82,7 @@ class AndroidSpeechRecognizer(
                     putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500)
                 })
             }
-            Log.i(TAG, "android stt: startListening")
+            Log.i(TAG, "[$label] android stt: startListening")
         }
     }
 
