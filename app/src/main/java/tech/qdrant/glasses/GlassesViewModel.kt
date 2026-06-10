@@ -77,6 +77,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startRecording() {
+        if (_state.value is AppState.Recording) {
+            Log.w(TAG, "startRecording ignored: already recording")
+            return
+        }
         recordingStartMs = System.currentTimeMillis()
         savedCount = 0L
         encodeQueue = Channel(Channel.UNLIMITED)
@@ -114,11 +118,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
         ambient = tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
             viewModelScope.launch(Dispatchers.Default) {
-                val enc = textEncoder ?: return@launch
-                val db = store ?: return@launch
+                val enc = textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
+                val db = store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
                 val mid = (tStart + tEnd) / 2
                 val nearest = nearestFramePath(mid)
-                if (nearest.isEmpty()) return@launch
+                if (nearest.isEmpty()) { Log.d(TAG, "ambient drop: no nearby frame for \"${text.take(40)}\""); return@launch }
                 val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
                 db.storeTranscript(text, vec, tStart, tEnd, nearest)
                 Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
