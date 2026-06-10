@@ -16,6 +16,9 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
  * AmbientTranscriber each session, so the recognizer must NOT live in that instance).
  *
  * Assets live in assets/sherpa/ — sherpa reads them natively via AssetManager, no extraction.
+ *
+ * Contract: call [ensureLoaded] first; the stream methods must be called on a single
+ * dedicated audio thread, with one [OnlineStream] per recording session.
  */
 object SherpaStreamingAsr {
     private const val TAG = "SherpaAsr"
@@ -54,19 +57,42 @@ object SherpaStreamingAsr {
         }
     }
 
-    fun newStream(): OnlineStream = recognizer!!.createStream("")
+    fun newStream(): OnlineStream {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
+        return rec.createStream("")
+    }
 
     fun feed(stream: OnlineStream, samples: FloatArray) {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
         stream.acceptWaveform(samples, SAMPLE_RATE)
-        val rec = recognizer!!
         while (rec.isReady(stream)) rec.decode(stream)
     }
 
-    fun currentText(stream: OnlineStream): String = recognizer!!.getResult(stream).text.trim()
+    /**
+     * Flush the stream at session end: signal end-of-input and drain the decoder so the
+     * final utterance (which may not have triggered an endpoint) is fully decoded before
+     * the caller reads [currentText] and releases the stream.
+     */
+    fun finishStream(stream: OnlineStream) {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
+        stream.inputFinished()
+        while (rec.isReady(stream)) rec.decode(stream)
+    }
 
-    fun isEndpoint(stream: OnlineStream): Boolean = recognizer!!.isEndpoint(stream)
+    fun currentText(stream: OnlineStream): String {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
+        return rec.getResult(stream).text.trim()
+    }
 
-    fun reset(stream: OnlineStream) = recognizer!!.reset(stream)
+    fun isEndpoint(stream: OnlineStream): Boolean {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
+        return rec.isEndpoint(stream)
+    }
+
+    fun reset(stream: OnlineStream) {
+        val rec = checkNotNull(recognizer) { "SherpaStreamingAsr: call ensureLoaded() first" }
+        rec.reset(stream)
+    }
 
     fun releaseStream(stream: OnlineStream) = stream.release()
 }
