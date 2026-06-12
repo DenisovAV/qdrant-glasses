@@ -53,6 +53,7 @@ class OnnxClipVisionEncoder(context: Context) : VisionEncoder {
 
 internal fun extractAsset(context: Context, name: String): File {
     val dest = File(context.filesDir, name)
+    dest.parentFile?.mkdirs()
     // Validate by SIZE, not mere existence: a previous extraction can be left truncated
     // if the process was killed mid-copy (RayNeo's BackgroundAppManager does exactly this
     // for a backgrounded app), and `dest.exists()` would then happily reuse the fragment
