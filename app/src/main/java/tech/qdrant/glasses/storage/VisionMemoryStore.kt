@@ -158,14 +158,17 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 orderBy = null
             )
         )
-        return resp.records.map { rec -> toFrame(rec.payload ?: "{}", null) }
+        return resp.records.map { rec -> toFrame(rec.payload ?: "{}", rec.id, 0f) }
             .also { Log.i(TAG, "keyword(\"$query\"): ${it.size} hits") }
     }
 
     private fun toFrame(payload: String, scored: ScoredPoint?): MemoryFrame =
+        toFrame(payload, scored?.id, scored?.score ?: 0f)
+
+    private fun toFrame(payload: String, pointId: tech.qdrant.edge.ffi.PointId?, score: Float): MemoryFrame =
         MemoryFrame(
-            id = (scored?.id as? PointId.Uuid)?.value ?: "",
-            score = scored?.score ?: 0f,
+            id = (pointId as? PointId.Uuid)?.value ?: "",
+            score = score,
             imagePath = extractString(payload, "image_path"),
             timestampMs = extractLong(payload, "timestamp_ms"),
             type = extractString(payload, "type").ifEmpty { "image" },
