@@ -102,7 +102,12 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         }
         transcriptText.text = lines.joinToString("\n")
         transcriptText.visibility = if (lines.isEmpty()) GONE else VISIBLE
-        val badges = (if (card.fromVision) "👁" else "") + (if (card.fromHeard) "🎙" else "")
+        // No badge at all = low-confidence fallback (all gates closed) — mark with "?".
+        val badges = when {
+            card.fromVision || card.fromHeard ->
+                (if (card.fromVision) "👁" else "") + (if (card.fromHeard) "🎙" else "")
+            else -> "?"
+        }
         val verb = if (card.fromHeard && !card.fromVision) "Heard" else "Seen"
         timeText.text = "$badges  $verb ${formatElapsed(System.currentTimeMillis() - f.timestampMs)}"
         pagerText.text = "${index + 1}/${cards.size}"

@@ -73,9 +73,22 @@ class MomentRetriever(private val store: VisionMemoryStore) {
                 )
             }
         }
-        return merged.sortedByDescending { it.strength }.take(MAX_CARDS)
-            .also { r -> Log.i(TAG, "moments: " + r.joinToString { m ->
+        val top = merged.sortedByDescending { it.strength }.take(MAX_CARDS)
+        if (top.isNotEmpty()) {
+            Log.i(TAG, "moments: " + top.joinToString { m ->
                 "[%s%s %.2f %s]".format(if (m.fromVision) "👁" else "", if (m.fromHeard) "🎙" else "",
-                    m.strength, m.frame.imagePath.substringAfterLast('/')) }) }
+                    m.strength, m.frame.imagePath.substringAfterLast('/')) })
+            return top
+        }
+        // FALLBACK: never return an empty answer — an AR display renders "nothing" as a
+        // transparent hole. When every gate is closed (garbled query, noisy transcripts),
+        // show the best low-confidence vision hit, marked as neither-channel-confident.
+        val fb = vision.firstOrNull() ?: heard.firstOrNull()
+        if (fb != null) {
+            Log.i(TAG, "moments: FALLBACK low-confidence %.3f %s".format(fb.score, fb.frame.imagePath.substringAfterLast('/')))
+            return listOf(MomentCard(fb.frame, fromVision = false, fromHeard = false, strength = fb.score))
+        }
+        Log.i(TAG, "moments: none (empty base)")
+        return emptyList()
     }
 }
