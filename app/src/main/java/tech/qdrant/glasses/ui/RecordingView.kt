@@ -37,10 +37,10 @@ class RecordingView(context: Context) : LinearLayout(context) {
         })
     }
 
-    fun update(saved: Long, indexed: Long, elapsedSeconds: Long) {
+    fun update(frames: Long, speech: Long, elapsedSeconds: Long) {
         val mins = elapsedSeconds / 60
         val secs = elapsedSeconds % 60
         statusText.text = "● REC  %02d:%02d".format(mins, secs)
-        countText.text = "saved: $saved  indexed: $indexed"
+        countText.text = "frames: $frames  speech: $speech"
     }
 }
