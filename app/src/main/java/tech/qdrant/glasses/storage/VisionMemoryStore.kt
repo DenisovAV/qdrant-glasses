@@ -101,6 +101,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     fun search(queryVector: FloatArray, topK: Int = 3): List<MemoryFrame> {
         Log.d(TAG, "search (DBSF image+text): topK=$topK")
         val q = queryVector.toList()
+        diagRawScores(q)  // DIAG: raw per-modality scores BEFORE fusion (remove after tuning)
         fun nearestOfType(t: String) = Prefetch(
             limit = (topK * 3).toULong(),
             query = ScoringQuery.Vector(Query.Nearest(vector = q, using = null)),
@@ -137,6 +138,38 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 type = extractString(payload, "type").ifEmpty { "image" },
                 transcript = extractString(payload, "transcript").ifEmpty { null }
             )
+        }
+    }
+
+    /**
+     * DIAG: log raw (un-fused) cosine scores per modality so we can see where a text
+     * point loses: low raw similarity (weak text tower) vs killed by DBSF normalization
+     * (3-point distribution is statistical noise). Remove once fusion is tuned.
+     */
+    private fun diagRawScores(q: List<Float>) {
+        fun rawTop(t: String) = shard.query(
+            QueryRequest(
+                limit = 5UL, offset = null,
+                query = ScoringQuery.Vector(Query.Nearest(vector = q, using = null)),
+                prefetches = emptyList(),
+                withVector = null, withPayload = WithPayload.Bool(true),
+                filter = Filter(
+                    must = listOf(Condition.Field(FieldCondition(
+                        key = "type", match = Match.Value(ValueVariants.String(t)),
+                        range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                    ))),
+                    should = null, mustNot = null
+                ),
+                scoreThreshold = null, params = null
+            )
+        )
+        for (t in listOf("text", "image")) {
+            rawTop(t).forEachIndexed { i, p ->
+                val payload = p.payload ?: "{}"
+                val label = if (t == "text") extractString(payload, "transcript").take(35)
+                            else extractString(payload, "image_path").substringAfterLast('/')
+                Log.i(TAG, "DIAG raw[$t][$i] score=%.4f \"%s\"".format(p.score, label))
+            }
         }
     }
 
