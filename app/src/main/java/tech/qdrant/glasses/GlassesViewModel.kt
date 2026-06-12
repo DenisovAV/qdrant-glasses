@@ -32,7 +32,7 @@ sealed class AppState {
     data class Recording(val saved: Long, val indexed: Long, val elapsedSeconds: Long) : AppState()
     data class Listening(val partial: String = "") : AppState()
     data class Processing(val query: String) : AppState()
-    data class Results(val query: String, val frames: List<MemoryFrame>) : AppState()
+    data class Results(val query: String, val cards: List<tech.qdrant.glasses.search.MomentCard>) : AppState()
 }
 
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
@@ -41,6 +41,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     private var visionEncoder: VisionEncoder? = null
     private var textEncoder: TextEncoder? = null
+    private var bgeEncoder: tech.qdrant.glasses.embedding.BgeTextEncoder? = null
+    private var retriever: tech.qdrant.glasses.search.MomentRetriever? = null
     private var store: VisionMemoryStore? = null
 
     private val _state = MutableStateFlow<AppState>(AppState.Loading)
@@ -74,6 +76,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 store = VisionMemoryStore(app)
                 Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
                 store?.dumpAll()  // DIAG: log the whole base at startup
+                retriever = store?.let { tech.qdrant.glasses.search.MomentRetriever(it) }
 
                 Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
                 visionEncoder = EncoderFactory.createVision(app)
@@ -82,6 +85,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 Log.d(TAG, "init: loading text encoder [${EncoderFactory.backend}]")
                 textEncoder = EncoderFactory.createText(app)
                 Log.d(TAG, "init: text encoder OK")
+
+                bgeEncoder = tech.qdrant.glasses.embedding.BgeTextEncoder(app)
+                Log.d(TAG, "init: bge encoder OK")
 
                 // Pre-warm the ambient ASR model (~180MB) off the main thread so the
                 // first recording doesn't block the UI loading it. ensureLoaded is
@@ -150,8 +156,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 if (nearest.isEmpty()) { Log.d(TAG, "ambient drop: no nearby frame for \"${text.take(40)}\""); return@launch }
                 try {
                     val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
-                    // TEMP zero bge vector — real one wired in Canon Task 5
-                    db.storeTranscript(text, vec, FloatArray(384), tStart, tEnd, nearest)
+                    val bge = bgeEncoder?.encode(text) ?: run {
+                        Log.d(TAG, "ambient drop: bge not ready"); return@launch
+                    }
+                    db.storeTranscript(text, vec, bge, tStart, tEnd, nearest)
                     Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
                 } catch (e: Exception) {
                     // An encoder/FFI throw must not kill the recording session.
@@ -229,20 +237,21 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             val db  = store ?: return@launch
             try {
                 val t0 = System.currentTimeMillis()
-                val vector = enc.encode(text)
+                val clipVec = enc.encode(text)
+                val bgeVec = bgeEncoder?.encode(text)
+                val ret = retriever
+                if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); _state.value = AppState.Idle; return@launch }
                 val encMs = System.currentTimeMillis() - t0
-                val results = db.searchVision(vector).map { it.frame }
-                Log.i(TAG, "onVoiceResult: encode=${encMs}ms results=${results.size}")
-                results.forEachIndexed { i, f ->
-                    Log.d(TAG, "  result[$i] score=%.3f type=${f.type} path=${f.imagePath.substringAfterLast('/')}".format(f.score))
-                }
+                val cards = ret.retrieve(text, clipVec, bgeVec)
+                Log.i(TAG, "onVoiceResult: encode=${encMs}ms cards=${cards.size}")
                 // Enrich each hit with speech that OVERLAPS its frame in time, so even an
                 // image hit shows "what was said here" — and a long utterance surfaces on
                 // every frame it spanned, not just the one nearest its midpoint.
-                val enriched = results.map { f ->
-                    val overlapping = db.transcriptsOverlappingFrame(f.timestampMs)
-                    // Drop the hit's own transcript from the "also heard" list (avoid echo).
-                    f.copy(nearbyTranscripts = overlapping.filter { it != f.transcript })
+                val enriched = cards.map { c ->
+                    c.copy(frame = c.frame.copy(
+                        nearbyTranscripts = db.transcriptsOverlappingFrame(c.frame.timestampMs)
+                            .filter { it != c.frame.transcript }
+                    ))
                 }
                 _state.value = AppState.Results(text, enriched)
             } catch (e: Exception) {
@@ -279,6 +288,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         }
         visionEncoder?.close()
         textEncoder?.close()
+        bgeEncoder?.close()
         store?.close()
     }
 }

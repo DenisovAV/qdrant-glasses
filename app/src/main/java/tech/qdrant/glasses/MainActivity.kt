@@ -213,7 +213,7 @@ class MainActivity : AppCompatActivity() {
                     is AppState.Processing -> showInBothEyes { ProcessingView(this@MainActivity, state.query) }
                     is AppState.Results -> showInBothEyes {
                         SearchResultsView(this@MainActivity).also {
-                            it.showResults(state.query, state.frames)
+                            it.showResults(state.query, state.cards)
                         }
                     }
                 }

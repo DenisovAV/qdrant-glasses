@@ -65,17 +65,17 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         addView(overlay)
     }
 
-    fun showResults(query: String, results: List<MemoryFrame>) {
+    fun showResults(query: String, cards: List<tech.qdrant.glasses.search.MomentCard>) {
         queryText.text = "\"$query\""
 
-        if (results.isEmpty()) {
+        if (cards.isEmpty()) {
             image.setImageDrawable(null)
             transcriptText.visibility = GONE
             timeText.text = "Nothing found"
             return
         }
 
-        val best = results.first()
+        val best = cards.first().frame
         try {
             BitmapFactory.decodeFile(best.imagePath)?.let { image.setImageBitmap(it) }
         } catch (_: Exception) {}
