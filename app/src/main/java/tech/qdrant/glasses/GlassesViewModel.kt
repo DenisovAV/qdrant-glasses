@@ -29,7 +29,7 @@ import java.io.FileOutputStream
 sealed class AppState {
     object Loading : AppState()
     object Idle : AppState()
-    data class Recording(val frames: Long, val speech: Long, val elapsedSeconds: Long) : AppState()
+    data class Recording(val indexed: Long, val elapsedSeconds: Long) : AppState()
     data class Listening(val partial: String = "") : AppState()
     data class Processing(val query: String) : AppState()
     data class Results(val query: String, val cards: List<tech.qdrant.glasses.search.MomentCard>) : AppState()
@@ -52,8 +52,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     private val thumbsDir = File(app.filesDir, "thumbnails").also { it.mkdirs() }
     private var recordingStartMs = 0L
     private var timerJob: Job? = null
-    private var savedCount = 0L
-    private var sessionSpeech = 0L  // transcripts stored THIS session (HUD counter)
+    private var savedCount = 0L      // frames captured (internal log only)
+    private var sessionIndexed = 0L  // HUD: memories actually INDEXED this session (frames + transcripts)
     private var encodeQueue = Channel<Pair<File, Bitmap>>(Channel.UNLIMITED)
     private var encodeWorker: Job? = null
     private val recentFrames = ArrayDeque<Pair<String, Long>>()  // (imagePath, t_ms), newest last
@@ -113,13 +113,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         }
         recordingStartMs = System.currentTimeMillis()
         savedCount = 0L
-        sessionSpeech = 0L
+        sessionIndexed = 0L
         encodeQueue = Channel(Channel.UNLIMITED)
         // Fresh session — frames of the previous session must not become "nearest"
         // for this session's first transcripts.
         synchronized(recentFrames) { recentFrames.clear() }
         Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
-        _state.value = AppState.Recording(0L, 0L, 0L)
+        _state.value = AppState.Recording(0L, 0L)
 
         encodeWorker = viewModelScope.launch(inferLane) {
             for ((file, bitmap) in encodeQueue) {
@@ -130,9 +130,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         ?: System.currentTimeMillis()
                     val vector = enc.encode(bitmap)
                     db.storeImage(file.absolutePath, vector, timestampMs)
-                    Log.d(TAG, "encoded+indexed: total=${db.count()} frames=$savedCount")
-                    // HUD counters (frames/speech) are session-scoped and updated at
-                    // capture/store time — the encode queue no longer drives the HUD.
+                    sessionIndexed++
+                    val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
+                    _state.update { if (it is AppState.Recording) AppState.Recording(sessionIndexed, elapsed) else it }
+                    Log.d(TAG, "indexed frame ($sessionIndexed this session, total=${db.count()})")
                 } catch (e: Exception) {
                     Log.e(TAG, "encode/store frame failed, dropping ${file.name}", e)
                 }
@@ -161,9 +162,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         Log.d(TAG, "ambient drop: bge not ready"); return@launch
                     }
                     db.storeTranscript(text, vec, bge, tStart, tEnd, nearest)
-                    sessionSpeech++
+                    sessionIndexed++
                     val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-                    _state.update { if (it is AppState.Recording) AppState.Recording(savedCount, sessionSpeech, elapsed) else it }
+                    _state.update { if (it is AppState.Recording) AppState.Recording(sessionIndexed, elapsed) else it }
                     Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
                 } catch (e: Exception) {
                     // An encoder/FFI throw must not kill the recording session.
@@ -183,7 +184,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         timerJob?.cancel(); timerJob = null
         encodeQueue.close()
         val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-        Log.i(TAG, "stopRecording: ${elapsed}s frames=$savedCount speech=$sessionSpeech total=${store?.count()}")
+        Log.i(TAG, "stopRecording: ${elapsed}s indexed=$sessionIndexed (captured frames=$savedCount) total=${store?.count()}")
         ambient?.stop()
         ambient = null
         _state.value = AppState.Idle
@@ -199,9 +200,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             recentFrames.addLast(file.absolutePath to timestampMs)
             while (recentFrames.size > recentFramesMax) recentFrames.removeFirst()
         }
-        val elapsed = (timestampMs - recordingStartMs) / 1000
-        Log.d(TAG, "frame saved: frames=$savedCount")
-        _state.update { if (it is AppState.Recording) AppState.Recording(savedCount, sessionSpeech, elapsed) else it }
+        Log.d(TAG, "frame captured: $savedCount (queued for indexing)")
         encodeQueue.trySend(file to bitmap)
     }
 

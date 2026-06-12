@@ -205,7 +205,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     is AppState.Recording -> showInBothEyes {
                         RecordingView(this@MainActivity).also {
-                            it.update(state.frames, state.speech, state.elapsedSeconds)
+                            it.update(state.indexed, state.elapsedSeconds)
                         }
                     }
                     is AppState.Listening -> {
