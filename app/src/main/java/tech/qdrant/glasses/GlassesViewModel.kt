@@ -150,7 +150,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 if (nearest.isEmpty()) { Log.d(TAG, "ambient drop: no nearby frame for \"${text.take(40)}\""); return@launch }
                 try {
                     val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
-                    db.storeTranscript(text, vec, tStart, tEnd, nearest)
+                    // TEMP zero bge vector — real one wired in Canon Task 5
+                    db.storeTranscript(text, vec, FloatArray(384), tStart, tEnd, nearest)
                     Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
                 } catch (e: Exception) {
                     // An encoder/FFI throw must not kill the recording session.
@@ -230,9 +231,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val t0 = System.currentTimeMillis()
                 val vector = enc.encode(text)
                 val encMs = System.currentTimeMillis() - t0
-                val results = db.search(vector, topK = 3)
-                val searchMs = System.currentTimeMillis() - t0 - encMs
-                Log.i(TAG, "onVoiceResult: encode=${encMs}ms search=${searchMs}ms results=${results.size}")
+                val results = db.searchVision(vector).map { it.frame }
+                Log.i(TAG, "onVoiceResult: encode=${encMs}ms results=${results.size}")
                 results.forEachIndexed { i, f ->
                     Log.d(TAG, "  result[$i] score=%.3f type=${f.type} path=${f.imagePath.substringAfterLast('/')}".format(f.score))
                 }

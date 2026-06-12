@@ -9,14 +9,14 @@ import tech.qdrant.edge.EdgeShard
 import tech.qdrant.edge.Point
 import tech.qdrant.edge.UpdateOperation
 import tech.qdrant.edge.VectorDataConfig
+import tech.qdrant.edge.ffi.NamedVector
 import tech.qdrant.edge.ffi.PointId
 import tech.qdrant.edge.ffi.Query
+import tech.qdrant.edge.ffi.ScoredPoint
 import tech.qdrant.edge.ffi.Vector
 import tech.qdrant.edge.ffi.WithPayload
 import tech.qdrant.edge.ffi.QueryRequest
-import tech.qdrant.edge.ffi.Prefetch
 import tech.qdrant.edge.ffi.ScoringQuery
-import tech.qdrant.edge.ffi.Fusion
 import tech.qdrant.edge.ffi.Filter
 import tech.qdrant.edge.ffi.Condition
 import tech.qdrant.edge.ffi.FieldCondition
@@ -45,6 +45,8 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
         private const val TAG = "VisionMemory"
         private const val VECTOR_DIM = 512UL
         private const val VECTOR_FIELD = ""
+        private const val TEXT_FIELD = "text"
+        private const val TEXT_DIM = 384UL
     }
 
     private val shard: EdgeShard
@@ -55,11 +57,12 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
         val config = EdgeConfig(
             vectorData = mapOf(
                 VECTOR_FIELD to VectorDataConfig(
-                    size = VECTOR_DIM,
-                    distance = Distance.COSINE,
-                    quantizationConfig = null,
-                    multivectorConfig = null,
-                    datatype = null
+                    size = VECTOR_DIM, distance = Distance.COSINE,
+                    quantizationConfig = null, multivectorConfig = null, datatype = null
+                ),
+                TEXT_FIELD to VectorDataConfig(
+                    size = TEXT_DIM, distance = Distance.COSINE,
+                    quantizationConfig = null, multivectorConfig = null, datatype = null
                 )
             ),
             sparseVectorData = emptyMap()
@@ -71,91 +74,54 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     fun storeImage(imagePath: String, vector: FloatArray, timestampMs: Long): String {
         val id = UUID.randomUUID().toString()
         val payload = """{"type":"image","image_path":"${imagePath.replace("\\", "\\\\")}","timestamp_ms":$timestampMs}"""
-        upsert(id, vector, payload)
+        upsert(id, mapOf(VECTOR_FIELD to vector), payload)
         Log.d(TAG, "storeImage: id=$id path=${imagePath.substringAfterLast('/')}")
         return id
     }
 
     fun storeTranscript(
-        text: String, vector: FloatArray,
+        text: String, clipVector: FloatArray, bgeVector: FloatArray,
         tStartMs: Long, tEndMs: Long, nearestImagePath: String
     ): String {
         val id = UUID.randomUUID().toString()
         val safeText = text.replace("\\", "\\\\").replace("\"", "\\\"")
         val safePath = nearestImagePath.replace("\\", "\\\\")
         val payload = """{"type":"text","transcript":"$safeText","t_start_ms":$tStartMs,"t_end_ms":$tEndMs,"image_path":"$safePath","timestamp_ms":$tStartMs}"""
-        upsert(id, vector, payload)
+        upsert(id, mapOf(VECTOR_FIELD to clipVector, TEXT_FIELD to bgeVector), payload)
         Log.d(TAG, "storeTranscript: id=$id text=\"${text.take(40)}\"")
         return id
     }
 
-    private fun upsert(id: String, vector: FloatArray, payload: String) {
+    private fun upsert(id: String, vectors: Map<String, FloatArray>, payload: String) {
+        val named = Vector.Named(vectors.mapValues { NamedVector.Dense(it.value.toList()) })
         shard.update(
             UpdateOperation.upsertPoints(
-                listOf(Point(id = PointId.Uuid(id), vector = Vector.Single(vector.toList()), payload = payload))
+                listOf(Point(id = PointId.Uuid(id), vector = named, payload = payload))
             )
         )
         shard.flush()
     }
 
-    fun search(queryVector: FloatArray, topK: Int = 3): List<MemoryFrame> {
-        Log.d(TAG, "search (DBSF image+text): topK=$topK")
-        val q = queryVector.toList()
-        diagRawScores(q)  // DIAG: raw per-modality scores BEFORE fusion (remove after tuning)
-        fun nearestOfType(t: String) = Prefetch(
-            limit = (topK * 3).toULong(),
-            query = ScoringQuery.Vector(Query.Nearest(vector = q, using = null)),
-            prefetches = emptyList(),
-            filter = Filter(
-                must = listOf(Condition.Field(FieldCondition(
-                    key = "type",
-                    match = Match.Value(ValueVariants.String(t)),
-                    range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
-                ))),
-                should = null, mustNot = null
-            ),
-            scoreThreshold = null, params = null
-        )
+    data class Hit(val frame: MemoryFrame, val score: Float)
+
+    /** "Saw" channel: CLIP query vector over image points (default vector field). */
+    fun searchVision(clipVec: FloatArray, topK: Int = 5): List<Hit> =
+        channelQuery(clipVec.toList(), using = null, typeValue = "image", topK = topK)
+
+    /** "Heard" channel: bge query vector over transcript points (field "text"). */
+    fun searchHeard(bgeVec: FloatArray, topK: Int = 5): List<Hit> =
+        channelQuery(bgeVec.toList(), using = TEXT_FIELD, typeValue = "text", topK = topK)
+
+    private fun channelQuery(q: List<Float>, using: String?, typeValue: String, topK: Int): List<Hit> {
         val results = shard.query(
             QueryRequest(
-                limit = topK.toULong(),
-                offset = null,
-                query = ScoringQuery.Fusion(Fusion.Dbsf),
-                prefetches = listOf(nearestOfType("image"), nearestOfType("text")),
-                withVector = null,
-                withPayload = WithPayload.Bool(true),
-                filter = null, scoreThreshold = null, params = null
-            )
-        )
-        Log.i(TAG, "search: found ${results.size} fused results")
-        return results.map { point ->
-            val payload = point.payload ?: "{}"
-            MemoryFrame(
-                id = (point.id as? PointId.Uuid)?.value ?: point.id.toString(),
-                score = point.score,
-                imagePath = extractString(payload, "image_path"),
-                timestampMs = extractLong(payload, "timestamp_ms"),
-                type = extractString(payload, "type").ifEmpty { "image" },
-                transcript = extractString(payload, "transcript").ifEmpty { null }
-            )
-        }
-    }
-
-    /**
-     * DIAG: log raw (un-fused) cosine scores per modality so we can see where a text
-     * point loses: low raw similarity (weak text tower) vs killed by DBSF normalization
-     * (3-point distribution is statistical noise). Remove once fusion is tuned.
-     */
-    private fun diagRawScores(q: List<Float>) {
-        fun rawTop(t: String) = shard.query(
-            QueryRequest(
-                limit = 5UL, offset = null,
-                query = ScoringQuery.Vector(Query.Nearest(vector = q, using = null)),
+                limit = topK.toULong(), offset = null,
+                query = ScoringQuery.Vector(Query.Nearest(vector = q, using = using)),
                 prefetches = emptyList(),
                 withVector = null, withPayload = WithPayload.Bool(true),
                 filter = Filter(
                     must = listOf(Condition.Field(FieldCondition(
-                        key = "type", match = Match.Value(ValueVariants.String(t)),
+                        key = "type", match = Match.Value(ValueVariants.String(typeValue)),
                         range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
                     ))),
                     should = null, mustNot = null
@@ -163,15 +129,48 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 scoreThreshold = null, params = null
             )
         )
-        for (t in listOf("text", "image")) {
-            rawTop(t).forEachIndexed { i, p ->
-                val payload = p.payload ?: "{}"
-                val label = if (t == "text") extractString(payload, "transcript").take(35)
-                            else extractString(payload, "image_path").substringAfterLast('/')
-                Log.i(TAG, "DIAG raw[$t][$i] score=%.4f \"%s\"".format(p.score, label))
-            }
-        }
+        val hits = results.map { p -> Hit(toFrame(p.payload ?: "{}", p), p.score) }
+        Log.i(TAG, "channel[$typeValue]: " + hits.take(3).joinToString {
+            "%.3f \"%s\"".format(it.score, (it.frame.transcript ?: it.frame.imagePath.substringAfterLast('/')).take(25))
+        })
+        return hits
     }
+
+    /** Keyword channel: transcripts containing the query words (binary lexical signal). */
+    fun keywordHits(query: String, limit: Int = 5): List<MemoryFrame> {
+        val resp = shard.scroll(
+            ScrollRequest(
+                offset = null, limit = limit.toULong(),
+                filter = Filter(
+                    must = listOf(
+                        Condition.Field(FieldCondition(
+                            key = "type", match = Match.Value(ValueVariants.String("text")),
+                            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                        )),
+                        Condition.Field(FieldCondition(
+                            key = "transcript", match = Match.Text(query),
+                            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                        ))
+                    ),
+                    should = null, mustNot = null
+                ),
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+                orderBy = null
+            )
+        )
+        return resp.records.map { rec -> toFrame(rec.payload ?: "{}", null) }
+            .also { Log.i(TAG, "keyword(\"$query\"): ${it.size} hits") }
+    }
+
+    private fun toFrame(payload: String, scored: ScoredPoint?): MemoryFrame =
+        MemoryFrame(
+            id = (scored?.id as? PointId.Uuid)?.value ?: "",
+            score = scored?.score ?: 0f,
+            imagePath = extractString(payload, "image_path"),
+            timestampMs = extractLong(payload, "timestamp_ms"),
+            type = extractString(payload, "type").ifEmpty { "image" },
+            transcript = extractString(payload, "transcript").ifEmpty { null }
+        )
 
     /**
      * Speech that OVERLAPS a frame in time — the reverse of the transcript→nearest-frame
