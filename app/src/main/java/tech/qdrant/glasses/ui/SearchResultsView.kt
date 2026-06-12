@@ -77,7 +77,11 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
 
     fun showCards(query: String, cards: List<MomentCard>) {
         this.cards = cards; this.index = 0
-        queryText.text = "\"$query\""
+        // All-"?" cards mean every confidence gate closed: say so explicitly, while
+        // still showing the closest frames (an empty screen reads as a transparent
+        // hole on the AR display).
+        val noneConfident = cards.none { it.fromVision || it.fromHeard }
+        queryText.text = if (noneConfident) "\"$query\"\nNOTHING FOUND - closest:" else "\"$query\""
         render()
     }
 
@@ -97,8 +101,9 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         val f = card.frame
         try { BitmapFactory.decodeFile(f.imagePath)?.let { image.setImageBitmap(it) } } catch (_: Exception) {}
         val lines = buildList {
-            f.transcript?.let { add("“$it”") }
-            f.nearbyTranscripts.forEach { add("• $it") }
+            // ASCII only — the HUD font renders smart quotes / bullets as tofu boxes.
+            f.transcript?.let { add("\"$it\"") }
+            f.nearbyTranscripts.forEach { add("- $it") }
         }
         transcriptText.text = lines.joinToString("\n")
         transcriptText.visibility = if (lines.isEmpty()) GONE else VISIBLE
@@ -110,7 +115,7 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
             card.fromHeard -> "HEARD"
             else -> "?"
         }
-        timeText.text = "$label · ${formatElapsed(System.currentTimeMillis() - f.timestampMs)}"
+        timeText.text = "$label - ${formatElapsed(System.currentTimeMillis() - f.timestampMs)}"
         pagerText.text = "${index + 1}/${cards.size}"
     }
 
