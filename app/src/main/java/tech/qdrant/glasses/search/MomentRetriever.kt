@@ -73,22 +73,27 @@ class MomentRetriever(private val store: VisionMemoryStore) {
                 )
             }
         }
-        val top = merged.sortedByDescending { it.strength }.take(MAX_CARDS)
-        if (top.isNotEmpty()) {
-            Log.i(TAG, "moments: " + top.joinToString { m ->
-                "[%s%s %.2f %s]".format(if (m.fromVision) "👁" else "", if (m.fromHeard) "🎙" else "",
-                    m.strength, m.frame.imagePath.substringAfterLast('/')) })
-            return top
+        val top = ArrayList(merged.sortedByDescending { it.strength }.take(MAX_CARDS))
+
+        // BACKFILL: never return fewer than MAX_CARDS when candidates exist — an AR
+        // display renders "nothing" as a transparent hole, and a single card leaves
+        // nothing to page through. Confident (gated) moments rank first; remaining
+        // slots are topped up with low-confidence vision hits marked "?" (no badges).
+        if (top.size < MAX_CARDS) {
+            for (h in vision + heard) {
+                if (top.size >= MAX_CARDS) break
+                val dup = top.any {
+                    it.frame.imagePath == h.frame.imagePath ||
+                    kotlin.math.abs(it.frame.timestampMs - h.frame.timestampMs) <= MERGE_MS
+                }
+                if (!dup) top.add(MomentCard(h.frame, fromVision = false, fromHeard = false, strength = h.score))
+            }
         }
-        // FALLBACK: never return an empty answer — an AR display renders "nothing" as a
-        // transparent hole. When every gate is closed (garbled query, noisy transcripts),
-        // show the best low-confidence vision hit, marked as neither-channel-confident.
-        val fb = vision.firstOrNull() ?: heard.firstOrNull()
-        if (fb != null) {
-            Log.i(TAG, "moments: FALLBACK low-confidence %.3f %s".format(fb.score, fb.frame.imagePath.substringAfterLast('/')))
-            return listOf(MomentCard(fb.frame, fromVision = false, fromHeard = false, strength = fb.score))
-        }
-        Log.i(TAG, "moments: none (empty base)")
-        return emptyList()
+        Log.i(TAG, "moments: " + top.joinToString { m ->
+            "[%s %.2f %s]".format(
+                when { m.fromVision && m.fromHeard -> "S+H"; m.fromVision -> "S"; m.fromHeard -> "H"; else -> "?" },
+                m.strength, m.frame.imagePath.substringAfterLast('/'))
+        }.ifEmpty { "none (empty base)" })
+        return top
     }
 }
