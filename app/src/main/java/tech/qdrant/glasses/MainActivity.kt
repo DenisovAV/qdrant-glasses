@@ -156,11 +156,19 @@ class MainActivity : AppCompatActivity() {
                 viewModel.backToIdle()
             }
             is AppState.Results -> {
-                voiceManager.stopListening()
-                viewModel.backToIdle()
+                val left = eyeLeft.getChildAt(0) as? SearchResultsView
+                val right = eyeRight.getChildAt(0) as? SearchResultsView
+                val advanced = (left?.nextCard() ?: false)
+                right?.nextCard()
+                if (!advanced) { voiceManager.stopListening(); viewModel.backToIdle() }
             }
             else -> {}
         }
+    }
+
+    override fun onGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        Log.d(TAG, "genericMotion: ${event.actionMasked} x=${event.x} y=${event.y} src=${event.source}")
+        return super.onGenericMotionEvent(event)
     }
 
     private fun handleRecordingToggle() {
@@ -213,7 +221,7 @@ class MainActivity : AppCompatActivity() {
                     is AppState.Processing -> showInBothEyes { ProcessingView(this@MainActivity, state.query) }
                     is AppState.Results -> showInBothEyes {
                         SearchResultsView(this@MainActivity).also {
-                            it.showResults(state.query, state.cards)
+                            it.showCards(state.query, state.cards)
                         }
                     }
                 }

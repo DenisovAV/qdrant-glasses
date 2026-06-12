@@ -7,7 +7,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import tech.qdrant.glasses.storage.MemoryFrame
+import tech.qdrant.glasses.search.MomentCard
 
 class SearchResultsView(context: Context) : FrameLayout(context) {
 
@@ -16,6 +16,10 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
     private val queryText: TextView
     private val transcriptText: TextView
     private val timeText: TextView
+    private val pagerText: TextView
+
+    private var cards: List<MomentCard> = emptyList()
+    private var index = 0
 
     init {
         setBackgroundColor(Color.BLACK)
@@ -56,8 +60,14 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         }
         overlay.addView(timeText)
 
+        pagerText = TextView(context).apply {
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+        }
+        overlay.addView(pagerText)
+
         overlay.addView(TextView(context).apply {
-            text = "Tap to dismiss"
+            text = "Tap: next / dismiss"
             textSize = 10f
             setTextColor(Color.DKGRAY)
         })
@@ -65,38 +75,37 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         addView(overlay)
     }
 
-    fun showResults(query: String, cards: List<tech.qdrant.glasses.search.MomentCard>) {
+    fun showCards(query: String, cards: List<MomentCard>) {
+        this.cards = cards; this.index = 0
         queryText.text = "\"$query\""
+        render()
+    }
 
-        if (cards.isEmpty()) {
-            image.setImageDrawable(null)
-            transcriptText.visibility = GONE
-            timeText.text = "Nothing found"
+    /** Advance to next card. Returns false if there is no next (caller should dismiss). */
+    fun nextCard(): Boolean {
+        if (index + 1 >= cards.size) return false
+        index++; render(); return true
+    }
+
+    private fun render() {
+        val card = cards.getOrNull(index)
+        if (card == null) {
+            image.setImageDrawable(null); transcriptText.visibility = GONE
+            timeText.text = "Nothing found"; pagerText.text = ""
             return
         }
-
-        val best = cards.first().frame
-        try {
-            BitmapFactory.decodeFile(best.imagePath)?.let { image.setImageBitmap(it) }
-        } catch (_: Exception) {}
-
-        val elapsed = formatElapsed(System.currentTimeMillis() - best.timestampMs)
-        val isTextHit = best.type == "text" && !best.transcript.isNullOrEmpty()
-
-        // Compose what to show: the hit's own line (for a text hit) plus any speech
-        // spoken near this frame (for any hit). An image hit thus still surfaces
-        // "what was said here", not just the picture.
+        val f = card.frame
+        try { BitmapFactory.decodeFile(f.imagePath)?.let { image.setImageBitmap(it) } } catch (_: Exception) {}
         val lines = buildList {
-            if (isTextHit) add("“${best.transcript}”")
-            best.nearbyTranscripts.forEach { add("• $it") }
+            f.transcript?.let { add("“$it”") }
+            f.nearbyTranscripts.forEach { add("• $it") }
         }
-        if (lines.isNotEmpty()) {
-            transcriptText.text = lines.joinToString("\n")
-            transcriptText.visibility = VISIBLE
-        } else {
-            transcriptText.visibility = GONE
-        }
-        timeText.text = if (isTextHit) "Heard $elapsed" else "Seen $elapsed"
+        transcriptText.text = lines.joinToString("\n")
+        transcriptText.visibility = if (lines.isEmpty()) GONE else VISIBLE
+        val badges = (if (card.fromVision) "👁" else "") + (if (card.fromHeard) "🎙" else "")
+        val verb = if (card.fromHeard && !card.fromVision) "Heard" else "Seen"
+        timeText.text = "$badges  $verb ${formatElapsed(System.currentTimeMillis() - f.timestampMs)}"
+        pagerText.text = "${index + 1}/${cards.size}"
     }
 
     private fun formatElapsed(ms: Long): String {
