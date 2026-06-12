@@ -53,3 +53,6 @@ app/src/main/assets/sherpa/
 # https://github.com/k2-fsa/sherpa-onnx/releases (sherpa-onnx-1.13.2.aar) into libs/
 libs/sherpa-onnx-*.aar
 app/libs/sherpa-onnx-*.aar
+
+# bge-small text-embedding model — distribute separately
+app/src/main/assets/bge/
