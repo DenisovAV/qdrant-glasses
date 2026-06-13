@@ -3,6 +3,7 @@ package tech.qdrant.glasses.search
 import android.content.Context
 import android.util.Log
 import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
@@ -44,7 +45,16 @@ object SherpaStreamingAsr {
                     numThreads = 2,
                     modelType = "zipformer",
                 ),
-                endpointConfig = EndpointConfig(),
+                // "Lazy" endpoint — only fire on a REAL pause (>=2s), so continuous
+                // speech (a lecture) is NOT chopped on every micro-pause. Inside fluent
+                // speech the endpoint stays silent and AmbientTranscriber's word-cap does
+                // the chunking; a genuine inter-remark pause still ends the segment.
+                // EndpointRule(mustContainNonSilence, minTrailingSilence, minUtteranceLength).
+                endpointConfig = EndpointConfig(
+                    rule1 = EndpointRule(false, 3.0f, 0f),  // silence-only fallback
+                    rule2 = EndpointRule(true, 2.0f, 0f),   // after speech: need 2s of trailing silence
+                    rule3 = EndpointRule(false, 0f, 30f),   // hard cap; our 10s word-cap fires first
+                ),
                 enableEndpoint = true,
                 decodingMethod = "greedy_search",
             )
