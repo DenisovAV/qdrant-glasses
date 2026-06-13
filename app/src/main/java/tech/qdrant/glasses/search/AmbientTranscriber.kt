@@ -24,9 +24,15 @@ class AmbientTranscriber(
         private const val MIN_CHARS = 2
         private const val SAMPLE_RATE = SherpaStreamingAsr.SAMPLE_RATE  // 16000
         private const val CHUNK_SAMPLES = 1600  // ~100ms at 16kHz
-        private const val MAX_WORDS = 12            // cut at ~1 sentence even without a pause (lecture)
-        private const val MAX_SEGMENT_MS = 10_000L  // safety cap against runaway accumulation
-        private const val OVERLAP_WORDS = 4         // carry the tail of a forced cut into the next chunk
+        // Aggregation chunking: small recognized PIECES are accumulated into a meaningful
+        // WINDOW before storing — 2-word fragments are useless for retrieval (research:
+        // recall tanks below ~5 sentences). A window is emitted at TARGET_WORDS or after
+        // FLUSH_SILENCE_MS of quiet (a remark that ended). PIECE_WORDS forces a piece even
+        // in pause-less speech so the buffer keeps filling.
+        private const val PIECE_WORDS = 12          // finalize a piece this big even without a pause
+        private const val TARGET_WORDS = 60         // emit a window once the buffer reaches this
+        private const val OVERLAP_WORDS = 8         // seed the next window with this tail (seam safety)
+        private const val FLUSH_SILENCE_MS = 4000L  // emit a non-empty buffer after this much quiet
     }
 
     @Volatile private var running = false
@@ -65,23 +71,34 @@ class AmbientTranscriber(
             val s = stream  // non-null inside this try
             val pcm = ShortArray(CHUNK_SAMPLES)
             val floats = FloatArray(CHUNK_SAMPLES)
-            var segStartMs = 0L
-            var sawSpeech = false
-            var pendingPrefix = ""   // overlap tail prepended to the next emitted chunk
 
-            // Finalize the current chunk. byEndpoint=true = a real pause (clean boundary,
-            // no overlap). false = a forced cap cut → carry an overlap tail so the word
-            // on the seam isn't lost in either chunk.
-            fun cut(text: String, byEndpoint: Boolean) {
-                val full = (if (pendingPrefix.isEmpty()) text else "$pendingPrefix $text").trim()
+            // Aggregation buffer: pieces accumulate here into a searchable window.
+            var windowBuf = ""        // words gathered so far (includes overlap seed)
+            var windowStartMs = 0L    // wall-clock of the first piece in this window
+            var lastPieceMs = 0L      // wall-clock of the most recent finalized piece
+
+            fun wordCount(t: String) = if (t.isBlank()) 0 else t.split(" ").count { it.isNotEmpty() }
+
+            // Emit the accumulated window and seed the next one with an overlap tail.
+            fun emitWindow() {
+                val full = windowBuf.trim()
                 if (full.length >= MIN_CHARS) {
-                    Log.i(TAG, "ambient segment (${if (byEndpoint) "endpoint" else "cap"}): \"${full.take(60)}\"")
-                    onSegment(full, if (sawSpeech) segStartMs else System.currentTimeMillis(), System.currentTimeMillis())
+                    Log.i(TAG, "ambient window (${wordCount(full)}w): \"${full.take(70)}\"")
+                    onSegment(full, if (windowStartMs > 0) windowStartMs else System.currentTimeMillis(), System.currentTimeMillis())
                 }
-                pendingPrefix = if (byEndpoint) ""
-                    else text.split(" ").filter { it.isNotEmpty() }.takeLast(OVERLAP_WORDS).joinToString(" ")
+                windowBuf = full.split(" ").filter { it.isNotEmpty() }.takeLast(OVERLAP_WORDS).joinToString(" ")
+                windowStartMs = 0L     // next real piece sets a fresh start
+            }
+
+            // Append a finalized recognition piece to the window buffer.
+            fun addPiece(piece: String) {
+                val p = piece.trim()
+                if (p.isEmpty()) return
+                if (windowStartMs == 0L) windowStartMs = System.currentTimeMillis()
+                windowBuf = if (windowBuf.isEmpty()) p else "$windowBuf $p"
+                lastPieceMs = System.currentTimeMillis()
                 SherpaStreamingAsr.reset(s)
-                sawSpeech = false
+                if (wordCount(windowBuf) >= TARGET_WORDS) emitWindow()
             }
 
             while (running) {
@@ -90,23 +107,23 @@ class AmbientTranscriber(
                 for (i in 0 until n) floats[i] = pcm[i] / 32768f
                 SherpaStreamingAsr.feed(s, if (n == floats.size) floats else floats.copyOf(n))
                 val text = SherpaStreamingAsr.currentText(s)
-                if (text.isNotEmpty() && !sawSpeech) { segStartMs = System.currentTimeMillis(); sawSpeech = true }
-                val words = if (text.isEmpty()) 0 else text.split(" ").count { it.isNotEmpty() }
-                val tooLong = sawSpeech && (System.currentTimeMillis() - segStartMs) >= MAX_SEGMENT_MS
-                when {
-                    SherpaStreamingAsr.isEndpoint(s) -> cut(text, byEndpoint = true)
-                    words >= MAX_WORDS               -> cut(text, byEndpoint = false)
-                    tooLong                          -> cut(text, byEndpoint = false)
+                // A piece is "done" on a real pause (endpoint) or once it's big enough that
+                // a pause-less stream still yields pieces to accumulate.
+                if (SherpaStreamingAsr.isEndpoint(s) || wordCount(text) >= PIECE_WORDS) {
+                    addPiece(text)
+                }
+                // Idle flush: a remark ended and nothing followed — store what we have.
+                if (windowBuf.isNotBlank() && lastPieceMs > 0 &&
+                    System.currentTimeMillis() - lastPieceMs >= FLUSH_SILENCE_MS) {
+                    emitWindow()
+                    windowBuf = ""        // idle flush is a clean boundary — drop the overlap seed
+                    lastPieceMs = 0L
                 }
             }
-            // Flush the final in-flight utterance before tearing down (with overlap prefix).
+            // Drain the last in-flight piece, then flush whatever remains.
             SherpaStreamingAsr.finishStream(s)
-            val rawTail = SherpaStreamingAsr.currentText(s)
-            val tail = (if (pendingPrefix.isEmpty()) rawTail else "$pendingPrefix $rawTail").trim()
-            if (tail.length >= MIN_CHARS) {
-                Log.i(TAG, "ambient final segment: \"${tail.take(60)}\"")
-                onSegment(tail, if (sawSpeech) segStartMs else System.currentTimeMillis(), System.currentTimeMillis())
-            }
+            addPiece(SherpaStreamingAsr.currentText(s))
+            if (windowBuf.isNotBlank()) emitWindow()
         } catch (e: Throwable) {
             Log.e(TAG, "ambient loop error", e)
         } finally {
