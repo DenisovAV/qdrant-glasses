@@ -56,3 +56,7 @@ app/libs/sherpa-onnx-*.aar
 
 # bge-small text-embedding model — distribute separately
 app/src/main/assets/bge/
+
+# VAD + Moonshine offline ASR models — distribute separately
+app/src/main/assets/vad/
+app/src/main/assets/moonshine/
