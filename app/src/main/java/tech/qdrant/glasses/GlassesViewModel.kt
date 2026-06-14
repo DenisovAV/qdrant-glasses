@@ -90,11 +90,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 bgeEncoder = tech.qdrant.glasses.embedding.BgeTextEncoder(app)
                 Log.d(TAG, "init: bge encoder OK")
 
-                // Pre-warm the ambient ASR model (~180MB) off the main thread so the
+                // Pre-warm the ambient ASR model (~290MB) off the main thread so the
                 // first recording doesn't block the UI loading it. ensureLoaded is
                 // idempotent + @Synchronized, so AmbientTranscriber.start() becomes a
                 // warm cache hit. Soft: a failure here just disables ambient transcription.
-                tech.qdrant.glasses.search.SherpaStreamingAsr.ensureLoaded(app)
+                tech.qdrant.glasses.search.SherpaVadAsr.ensureLoaded(app)
 
                 Log.i(TAG, "init: all components ready → Idle")
                 _state.value = AppState.Idle
