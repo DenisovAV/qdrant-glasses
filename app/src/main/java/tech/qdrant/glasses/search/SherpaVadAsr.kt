@@ -53,46 +53,56 @@ object SherpaVadAsr {
      * Load Silero VAD and Moonshine offline recognizer. Idempotent and thread-safe.
      * Returns true immediately if both are already loaded.
      * Returns false (and logs the error) on any failure — the app continues without ASR (soft-degrade).
+     *
+     * Each component is constructed only if its field is still null, so a retry after a half-load
+     * reuses the already-built native object and only constructs the missing one (no orphaned handles).
+     * Callers MUST receive true before invoking [acceptWaveform], [pollSegment], [transcribe], or
+     * [reset] — see the class-level threading contract.
      */
     @Synchronized
     fun ensureLoaded(context: Context): Boolean {
         if (vad != null && recognizer != null) return true
+        val t0 = System.currentTimeMillis()
         return try {
-            val t0 = System.currentTimeMillis()
-
-            val vadConfig = VadModelConfig(
-                sileroVadModelConfig = SileroVadModelConfig(
-                    model = VAD_MODEL,
-                    threshold = VAD_THRESHOLD,
-                    minSilenceDuration = VAD_MIN_SILENCE_DURATION,
-                    minSpeechDuration = VAD_MIN_SPEECH_DURATION,
-                    windowSize = VAD_WINDOW_SIZE,
-                    maxSpeechDuration = VAD_MAX_SPEECH_DURATION,
-                ),
-                sampleRate = SAMPLE_RATE,
-                numThreads = NUM_THREADS,
-            )
-            vad = Vad(context.assets, vadConfig)
-            Log.i(TAG, "VAD loaded in ${System.currentTimeMillis() - t0}ms")
-
-            val t1 = System.currentTimeMillis()
-            val recognizerConfig = OfflineRecognizerConfig(
-                featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80, dither = 0f),
-                modelConfig = OfflineModelConfig(
-                    moonshine = OfflineMoonshineModelConfig(
-                        preprocessor = MOONSHINE_PREPROCESSOR,
-                        encoder = MOONSHINE_ENCODER,
-                        uncachedDecoder = MOONSHINE_UNCACHED_DECODER,
-                        cachedDecoder = MOONSHINE_CACHED_DECODER,
-                        mergedDecoder = "",
+            if (vad == null) {
+                val vadConfig = VadModelConfig(
+                    sileroVadModelConfig = SileroVadModelConfig(
+                        model = VAD_MODEL,
+                        threshold = VAD_THRESHOLD,
+                        minSilenceDuration = VAD_MIN_SILENCE_DURATION,
+                        minSpeechDuration = VAD_MIN_SPEECH_DURATION,
+                        windowSize = VAD_WINDOW_SIZE,
+                        maxSpeechDuration = VAD_MAX_SPEECH_DURATION,
                     ),
-                    tokens = MOONSHINE_TOKENS,
+                    sampleRate = SAMPLE_RATE,
                     numThreads = NUM_THREADS,
-                    modelType = "moonshine",
-                ),
-            )
-            recognizer = OfflineRecognizer(context.assets, recognizerConfig)
-            Log.i(TAG, "Moonshine recognizer loaded in ${System.currentTimeMillis() - t1}ms")
+                )
+                val t1 = System.currentTimeMillis()
+                vad = Vad(context.assets, vadConfig)
+                Log.i(TAG, "VAD loaded in ${System.currentTimeMillis() - t1}ms")
+            }
+
+            if (recognizer == null) {
+                val recognizerConfig = OfflineRecognizerConfig(
+                    featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80, dither = 0f),
+                    modelConfig = OfflineModelConfig(
+                        moonshine = OfflineMoonshineModelConfig(
+                            preprocessor = MOONSHINE_PREPROCESSOR,
+                            encoder = MOONSHINE_ENCODER,
+                            uncachedDecoder = MOONSHINE_UNCACHED_DECODER,
+                            cachedDecoder = MOONSHINE_CACHED_DECODER,
+                            mergedDecoder = "",
+                        ),
+                        tokens = MOONSHINE_TOKENS,
+                        numThreads = NUM_THREADS,
+                        modelType = "moonshine",
+                    ),
+                )
+                val t2 = System.currentTimeMillis()
+                recognizer = OfflineRecognizer(context.assets, recognizerConfig)
+                Log.i(TAG, "Moonshine recognizer loaded in ${System.currentTimeMillis() - t2}ms")
+            }
+
             Log.i(TAG, "SherpaVadAsr fully loaded in ${System.currentTimeMillis() - t0}ms total")
             true
         } catch (e: Throwable) {
