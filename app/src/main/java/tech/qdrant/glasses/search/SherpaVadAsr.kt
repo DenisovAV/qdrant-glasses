@@ -17,7 +17,7 @@ import com.k2fsa.sherpa.onnx.VadModelConfig
  *
  * The VAD and recognizer load ONCE via [ensureLoaded] and remain alive for the process lifetime —
  * they are intentionally never released (no [Vad.release] / [OfflineRecognizer.release] calls in
- * normal operation), mirroring the pattern in [SherpaStreamingAsr]. This amortises the ~multi-
+ * normal operation), mirroring the pattern in the streaming recognizer used in earlier iterations. This amortises the ~multi-
  * second load cost across all recording sessions in one app run.
  *
  * Threading contract:
@@ -147,6 +147,15 @@ object SherpaVadAsr {
         } finally {
             stream.release()
         }
+    }
+
+    /**
+     * Force any in-progress buffered speech into the segment queue without waiting for
+     * trailing silence — call at session stop so a mid-utterance final segment is not lost.
+     * Must be called from the dedicated audio thread.
+     */
+    fun flush() {
+        vad?.flush()
     }
 
     /**

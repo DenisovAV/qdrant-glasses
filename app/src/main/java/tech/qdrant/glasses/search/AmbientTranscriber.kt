@@ -30,6 +30,7 @@ class AmbientTranscriber(
 
     fun start() {
         if (running) { Log.w(TAG, "start skipped (already running)"); return }
+        if (thread?.isAlive == true) { Log.w(TAG, "start skipped (previous audio thread still alive)"); return }
         if (!SherpaVadAsr.ensureLoaded(context)) {
             Log.w(TAG, "ambient disabled — model unavailable")
             return
@@ -74,7 +75,9 @@ class AmbientTranscriber(
                 }
             }
 
-            // Safety-net drain: a segment that completed on the last read must not be lost.
+            // Session ending: flush the VAD so a mid-utterance final segment is emitted
+            // (Silero otherwise waits for trailing silence), then drain everything pending.
+            SherpaVadAsr.flush()
             while (true) {
                 val seg = SherpaVadAsr.pollSegment() ?: break
                 handleSegment(seg)
@@ -106,14 +109,14 @@ class AmbientTranscriber(
     fun stop() {
         if (!running) return
         running = false
-        thread?.join(1500)
+        thread?.let { it.join(1500); if (it.isAlive) Log.w(TAG, "audio thread did not stop within 1500ms") }
         thread = null
         SherpaVadAsr.reset()
     }
 
     fun destroy() {
         running = false
-        thread?.join(1500)
+        thread?.let { it.join(1500); if (it.isAlive) Log.w(TAG, "audio thread did not stop within 1500ms") }
         thread = null
         // VAD and recognizer are process-level warm singletons; not released here.
     }
