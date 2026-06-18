@@ -32,6 +32,12 @@ data class MemoryFrame(
     val score: Float,
     val imagePath: String,
     val timestampMs: Long,
+    // End of the moment's time span. For a transcript point this is t_end_ms (the
+    // utterance end); for an image point it equals timestampMs (a frame is an instant).
+    // Lets moment-merge align a frame to an utterance by INTERVAL overlap rather than by
+    // comparing two point timestamps that intentionally differ (frame=capture time,
+    // transcript=utterance start), which otherwise splits one moment into two cards.
+    val tEndMs: Long,
     val type: String = "image",
     val transcript: String? = null,
     // Transcripts spoken near this frame (filled at result time for the shown hit) —
@@ -165,15 +171,20 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     private fun toFrame(payload: String, scored: ScoredPoint?): MemoryFrame =
         toFrame(payload, scored?.id, scored?.score ?: 0f)
 
-    private fun toFrame(payload: String, pointId: tech.qdrant.edge.ffi.PointId?, score: Float): MemoryFrame =
-        MemoryFrame(
+    private fun toFrame(payload: String, pointId: tech.qdrant.edge.ffi.PointId?, score: Float): MemoryFrame {
+        val ts = extractLong(payload, "timestamp_ms")
+        // t_end_ms exists only on transcript points; image points are instants (tEnd=ts).
+        val tEnd = extractLong(payload, "t_end_ms").let { if (it > 0) it else ts }
+        return MemoryFrame(
             id = (pointId as? PointId.Uuid)?.value ?: "",
             score = score,
             imagePath = extractString(payload, "image_path"),
-            timestampMs = extractLong(payload, "timestamp_ms"),
+            timestampMs = ts,
+            tEndMs = tEnd,
             type = extractString(payload, "type").ifEmpty { "image" },
             transcript = extractString(payload, "transcript").ifEmpty { null }
         )
+    }
 
     /**
      * Speech that OVERLAPS a frame in time — the reverse of the transcript→nearest-frame

@@ -16,14 +16,20 @@ data class MomentCard(
  * Dual-channel retrieval with strength gates (canon design, 2026-06-12 spec):
  *  - vision: ABSOLUTE score gate (room frames are mutually similar; margins are noise)
  *  - heard: MARGIN gate (top1−top2) OR keyword override (exact word present)
- * Surviving hits collapse into moments: same frame, or |frame.ts − hit.ts| within
- * MERGE_MS, count as one moment with summed strength (double-confirmed ranks first).
+ * Surviving hits collapse into moments: same frame, or their time SPANS overlap (an
+ * image is an instant, a transcript covers its utterance), count as one moment with
+ * summed strength (double-confirmed ranks first). See [spansOverlap].
  */
 class MomentRetriever(private val store: VisionMemoryStore) {
     companion object {
         private const val TAG = "MomentRetriever"
-        // Calibrated from 13 on-device DIAG queries (TinyCLIP-40M):
-        const val VISION_MIN_SCORE = 0.28f   // relevant ~0.30+, background 0.19–0.25
+        // Calibrated from on-device DIAG (TinyCLIP-40M). Absolute CLIP cosine sits in
+        // ~0.15–0.40 (modality gap; random pairs avg ~0.22). On real glasses frames a
+        // descriptive query lifts the right frame to ~0.21–0.23, background ~0.18–0.20.
+        // 0.20 passed too much low-confidence background; 0.28 rejected real-but-weak hits.
+        // 0.25 favors precision (fewer false vision cards) at the cost of missing weak
+        // single-word matches — the heard channel is the strong signal, so this is OK.
+        const val VISION_MIN_SCORE = 0.25f   // background ~0.18–0.20, weak-but-real ~0.21–0.23
         const val HEARD_MIN_MARGIN = 0.10f   // real hits ≥0.16, noise ≤0.054
         const val MERGE_MS = 5_000L
         const val MAX_CARDS = 3
@@ -55,12 +61,17 @@ class MomentRetriever(private val store: VisionMemoryStore) {
             }
         }
 
-        // merge into moments: same imagePath or timestamps within MERGE_MS
+        // merge into moments: same imagePath, or their time SPANS overlap (within slack).
+        // Interval overlap — not |Δtimestamp| — because a frame's timestamp is its capture
+        // instant while a transcript's is its utterance START; comparing the two points
+        // directly splits one moment into two cards once an utterance runs longer than
+        // MERGE_MS. Each MemoryFrame carries [timestampMs, tEndMs] (an image is an instant,
+        // a transcript spans its utterance), so we test span overlap, the canonical
+        // frame↔utterance alignment for multimodal retrieval.
         val merged = ArrayList<MomentCard>()
         for (c in cards.sortedByDescending { it.strength }) {
             val near = merged.indexOfFirst {
-                it.frame.imagePath == c.frame.imagePath ||
-                kotlin.math.abs(it.frame.timestampMs - c.frame.timestampMs) <= MERGE_MS
+                it.frame.imagePath == c.frame.imagePath || spansOverlap(it.frame, c.frame)
             }
             if (near == -1) merged.add(c)
             else merged[near] = merged[near].let { m ->
@@ -73,27 +84,45 @@ class MomentRetriever(private val store: VisionMemoryStore) {
                 )
             }
         }
-        val top = ArrayList(merged.sortedByDescending { it.strength }.take(MAX_CARDS))
 
-        // BACKFILL: never return fewer than MAX_CARDS when candidates exist — an AR
-        // display renders "nothing" as a transparent hole, and a single card leaves
-        // nothing to page through. Confident (gated) moments rank first; remaining
-        // slots are topped up with low-confidence vision hits marked "?" (no badges).
-        if (top.size < MAX_CARDS) {
-            for (h in vision + heard) {
-                if (top.size >= MAX_CARDS) break
-                val dup = top.any {
-                    it.frame.imagePath == h.frame.imagePath ||
-                    kotlin.math.abs(it.frame.timestampMs - h.frame.timestampMs) <= MERGE_MS
-                }
-                if (!dup) top.add(MomentCard(h.frame, fromVision = false, fromHeard = false, strength = h.score))
+        // Enrich the SAW/HEARD badge: a heard signal that didn't clear its own margin
+        // gate still confirms the source channel of an ALREADY-CONFIDENT moment. Mark
+        // fromHeard on any merged moment that overlaps a heard/keyword hit in time, so a
+        // frame matched both visually and by speech shows "SAW+HEARD", not just "SAW".
+        // This only annotates existing moments — it never adds a card on its own.
+        // Use ONLY the strongest heard match (top-1) for the overlap, not the whole
+        // result tail: with continuous speech a frame is almost always within MERGE_MS
+        // of SOME low-score transcript, which would falsely badge everything SAW+HEARD.
+        val heardFrames = (keyword + listOfNotNull(heard.firstOrNull()?.frame))
+        for (i in merged.indices) {
+            val m = merged[i]
+            if (m.fromHeard) continue
+            val overlapsHeard = heardFrames.any { hf ->
+                hf.imagePath == m.frame.imagePath || spansOverlap(hf, m.frame)
             }
+            if (overlapsHeard) merged[i] = m.copy(fromHeard = true)
         }
+
+        // Only confident, gated moments are returned. When every gate closed the list is
+        // empty and the caller shows an honest "NOTHING FOUND" (no closest-frame backfill).
+        val top = merged.sortedByDescending { it.strength }.take(MAX_CARDS)
         Log.i(TAG, "moments: " + top.joinToString { m ->
             "[%s %.2f %s]".format(
-                when { m.fromVision && m.fromHeard -> "S+H"; m.fromVision -> "S"; m.fromHeard -> "H"; else -> "?" },
+                when { m.fromVision && m.fromHeard -> "S+H"; m.fromVision -> "S"; m.fromHeard -> "H"; else -> "ERR" },
                 m.strength, m.frame.imagePath.substringAfterLast('/'))
         }.ifEmpty { "none (empty base)" })
         return top
     }
+
+    /**
+     * Do two moments cover the same point in time? Tests overlap of their [timestampMs,
+     * tEndMs] spans widened by MERGE_MS on each side. An image span is an instant
+     * (start == end); a transcript span covers its whole utterance — so a 12s utterance
+     * still aligns to a frame captured anywhere inside it, which |Δtimestamp| would miss.
+     * The effective merge window for a transcript is therefore [start − MERGE_MS,
+     * end + MERGE_MS] — it scales with utterance length (~20s for a 10s utterance), not a
+     * fixed 2·MERGE_MS, which is what makes a long utterance group all the frames it spans.
+     */
+    private fun spansOverlap(a: MemoryFrame, b: MemoryFrame): Boolean =
+        a.timestampMs - MERGE_MS <= b.tEndMs && b.timestampMs - MERGE_MS <= a.tEndMs
 }

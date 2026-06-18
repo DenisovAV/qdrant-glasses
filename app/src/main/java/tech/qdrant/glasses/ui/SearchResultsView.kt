@@ -77,11 +77,9 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
 
     fun showCards(query: String, cards: List<MomentCard>) {
         this.cards = cards; this.index = 0
-        // All-"?" cards mean every confidence gate closed: say so explicitly, while
-        // still showing the closest frames (an empty screen reads as a transparent
-        // hole on the AR display).
-        val noneConfident = cards.none { it.fromVision || it.fromHeard }
-        queryText.text = if (noneConfident) "\"$query\"\nNOTHING FOUND - closest:" else "\"$query\""
+        // Retriever returns only confident, gated moments. An empty list means every
+        // gate closed — show an honest "NOTHING FOUND" with no frame (no backfill).
+        queryText.text = if (cards.isEmpty()) "\"$query\"\nNOTHING FOUND" else "\"$query\""
         render()
     }
 
@@ -94,12 +92,18 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
     private fun render() {
         val card = cards.getOrNull(index)
         if (card == null) {
-            image.setImageDrawable(null); transcriptText.visibility = GONE
-            timeText.text = "Nothing found"; pagerText.text = ""
+            // No confident moment — show a blank (black=transparent) frame, no stale image.
+            image.setImageDrawable(null)
+            transcriptText.visibility = GONE
+            timeText.text = ""
+            pagerText.text = ""
             return
         }
         val f = card.frame
-        try { BitmapFactory.decodeFile(f.imagePath)?.let { image.setImageBitmap(it) } } catch (_: Exception) {}
+        // decodeFile can return null (missing/empty path) — clear the view so a stale
+        // bitmap from the previous card is never shown next to a different result.
+        val bmp = try { BitmapFactory.decodeFile(f.imagePath) } catch (_: Exception) { null }
+        if (bmp != null) image.setImageBitmap(bmp) else image.setImageDrawable(null)
         val lines = buildList {
             // ASCII only — the HUD font renders smart quotes / bullets as tofu boxes.
             f.transcript?.let { add("\"$it\"") }
@@ -108,12 +112,11 @@ class SearchResultsView(context: Context) : FrameLayout(context) {
         transcriptText.text = lines.joinToString("\n")
         transcriptText.visibility = if (lines.isEmpty()) GONE else VISIBLE
         // ASCII labels — the RayNeo HUD font has no color-emoji glyphs.
-        // SAW/HEARD = which channel(s) confidently matched; "?" = low-confidence backfill.
+        // Every returned card cleared a gate, so it always has SAW and/or HEARD.
         val label = when {
             card.fromVision && card.fromHeard -> "SAW+HEARD"
             card.fromVision -> "SAW"
-            card.fromHeard -> "HEARD"
-            else -> "?"
+            else -> "HEARD"
         }
         timeText.text = "$label - ${formatElapsed(System.currentTimeMillis() - f.timestampMs)}"
         pagerText.text = "${index + 1}/${cards.size}"
