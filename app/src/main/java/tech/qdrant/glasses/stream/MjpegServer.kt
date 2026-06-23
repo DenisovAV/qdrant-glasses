@@ -32,10 +32,25 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
     private val clients = CopyOnWriteArrayList<Client>()
 
     @Volatile private var latestJpeg: ByteArray? = null
+    // A standby frame shown when no live camera frame is flowing (app idle / not recording).
+    // Without it a freshly-connected browser <img> stays blank-white until the first real
+    // frame. Set once by the Activity; offerFrame() takes over the moment recording starts.
+    @Volatile private var placeholderJpeg: ByteArray? = null
+
+    /** Provide a standby JPEG shown to viewers until live frames start (and after they stop). */
+    fun setPlaceholder(jpeg: ByteArray) {
+        placeholderJpeg = jpeg
+        // Push it to anyone already watching so they leave the blank state immediately.
+        if (latestJpeg == null) broadcast(jpeg)
+    }
 
     /** Called from the camera thread with each freshly-encoded JPEG frame. */
     fun offerFrame(jpeg: ByteArray) {
         latestJpeg = jpeg
+        broadcast(jpeg)
+    }
+
+    private fun broadcast(jpeg: ByteArray) {
         if (clients.isEmpty()) return
         val header = ("--$BOUNDARY\r\n" +
                 "Content-Type: image/jpeg\r\n" +
@@ -64,10 +79,11 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
             "/stream" -> serveStream()
             else -> newFixedLengthResponse(
                 Response.Status.OK, "text/html",
-                "<html><body style='font-family:sans-serif'>" +
-                        "<h2>Glasses camera stream</h2>" +
-                        "<p>MJPEG: <a href='/stream'>/stream</a></p>" +
-                        "<img src='/stream' style='max-width:100%'/>" +
+                "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                        "<title>Qdrant Glasses</title></head>" +
+                        "<body style='margin:0;background:#0c0c0e;display:flex;flex-direction:column;" +
+                        "align-items:center;justify-content:center;height:100vh;font-family:sans-serif'>" +
+                        "<img src='/stream' style='max-width:100%;max-height:90vh;border-radius:8px'/>" +
                         "</body></html>"
             )
         }
@@ -87,8 +103,9 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
         clients.add(client)
         Log.i(TAG, "client connected (${clients.size} total)")
 
-        // Prime the new client with the latest frame immediately so the viewer isn't blank.
-        latestJpeg?.let { jpeg ->
+        // Prime the new client immediately so the viewer isn't blank: a live frame if we have
+        // one, otherwise the standby placeholder.
+        (latestJpeg ?: placeholderJpeg)?.let { jpeg ->
             try {
                 val header = ("--$BOUNDARY\r\n" +
                         "Content-Type: image/jpeg\r\n" +

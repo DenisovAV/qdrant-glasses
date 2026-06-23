@@ -175,12 +175,35 @@ class MainActivity : AppCompatActivity() {
     private fun startStreamer() {
         try {
             mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080).also { it.start(10_000, false) }
+            mjpeg?.setPlaceholder(buildPlaceholderJpeg())
             viewModel.attachStreamer(mjpeg!!)
             Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
             Log.i(TAG, "embed endpoint expected on :9000 — desktop: adb reverse tcp:9000 tcp:9000")
         } catch (e: Exception) {
             Log.e(TAG, "MJPEG start failed", e)
         }
+    }
+
+    /** A standby frame so the browser shows something (not blank white) before recording starts. */
+    private fun buildPlaceholderJpeg(): ByteArray {
+        val w = 640; val h = 480
+        val bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(bmp)
+        c.drawColor(android.graphics.Color.rgb(18, 18, 22))
+        val title = android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE; textSize = 34f; isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        val sub = android.graphics.Paint().apply {
+            color = android.graphics.Color.rgb(150, 150, 160); textSize = 22f; isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        c.drawText("Qdrant Glasses", w / 2f, h / 2f - 18f, title)
+        c.drawText("Waiting for recording — hold the button to start", w / 2f, h / 2f + 24f, sub)
+        val baos = java.io.ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
+        bmp.recycle()
+        return baos.toByteArray()
     }
 
     private fun setupVoice() {
