@@ -102,13 +102,20 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 store?.dumpAll()  // DIAG: log the whole base at startup
                 retriever = store?.let { tech.qdrant.glasses.search.MomentRetriever(it) }
 
-                Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
-                visionEncoder = EncoderFactory.createVision(app)
-                Log.d(TAG, "init: vision encoder OK")
+                // The whole-frame CLIP encoders (~945MB of on-device weights) are LEGACY-only:
+                // in OBJECTS mode crop embedding runs on the Mac (SigLIP2), so these models are
+                // never used — and are excluded from the APK via androidResources.ignoreAssetsPattern.
+                // Loading must therefore be gated by mode too: touching a missing asset here would
+                // throw and the init try/catch would never reach Idle.
+                if (appMode == AppMode.LEGACY) {
+                    Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
+                    visionEncoder = EncoderFactory.createVision(app)
+                    Log.d(TAG, "init: vision encoder OK")
 
-                Log.d(TAG, "init: loading text encoder [${EncoderFactory.backend}]")
-                textEncoder = EncoderFactory.createText(app)
-                Log.d(TAG, "init: text encoder OK")
+                    Log.d(TAG, "init: loading text encoder [${EncoderFactory.backend}]")
+                    textEncoder = EncoderFactory.createText(app)
+                    Log.d(TAG, "init: text encoder OK")
+                }
 
                 bgeEncoder = tech.qdrant.glasses.embedding.BgeTextEncoder(app)
                 Log.d(TAG, "init: bge encoder OK")
@@ -264,49 +271,64 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val trk = tracker ?: return
         val store = objectStore ?: return
         val enc = cropEncoder ?: return
+        // The camera RECYCLES `bitmap` the instant this callback returns (KEEP_ONLY_LATEST +
+        // proxy.close() in the analyzer's finally). All real work runs async on inferLane, by
+        // which time `bitmap` is dead → "Can't copy a recycled bitmap". Take an independent
+        // snapshot synchronously here and own it ourselves; recycle the snapshot when done.
+        val frame = try { bitmap.copy(Bitmap.Config.ARGB_8888, false) } catch (e: Throwable) {
+            Log.w(TAG, "frame snapshot failed: ${e.message}"); return
+        }
         viewModelScope.launch(inferLane) {
-            val t0 = System.currentTimeMillis()
-            val detections = try { det.detect(bitmap) } catch (e: Throwable) {
-                Log.e(TAG, "detect failed", e); return@launch
-            }
-            val detMs = System.currentTimeMillis() - t0
-            trk.update(detections)
-            Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
+            try {
+                val t0 = System.currentTimeMillis()
+                val detections = try { det.detect(frame) } catch (e: Throwable) {
+                    Log.e(TAG, "detect failed", e); return@launch
+                }
+                val detMs = System.currentTimeMillis() - t0
+                trk.update(detections)
+                Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
-            // 1) Stream the frame with boxes (cheap; safe on this lane).
-            streamer?.let { s ->
-                try {
-                    val boxed = tech.qdrant.glasses.stream.drawBoxes(bitmap, detections)
-                    val baos = java.io.ByteArrayOutputStream()
-                    boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                    s.offerFrame(baos.toByteArray())
-                } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
-            }
-
-            // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
-            //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
-            for (track in trk.confirmedUnembedded()) {
-                val crop = cropFrom(bitmap, track.bbox) ?: continue
-                val thumbFile = File(objectsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
-                try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
-                catch (_: Throwable) {}
-                val bboxStr = "%.3f,%.3f,%.3f,%.3f".format(
-                    track.bbox.left / bitmap.width, track.bbox.top / bitmap.height,
-                    track.bbox.width() / bitmap.width, track.bbox.height() / bitmap.height)
-                val tid = track.trackId; val label = track.label
-                viewModelScope.launch(cropLane) {
+                // 1) Stream the frame with boxes (cheap; safe on this lane).
+                streamer?.let { s ->
                     try {
-                        val vec = enc.encode(crop)
-                        store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
-                        // markEmbedded mutates tracker state → marshal back to inferLane (the
-                        // tracker's only legal thread). Dedup applies only on a successful store.
-                        withContext(inferLane) { trk.markEmbedded(tid) }
-                        Log.i(TAG, "object stored: $label (track $tid), total=${store.count()}")
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
-                        // not marked embedded → retried on a later sighting
+                        val boxed = tech.qdrant.glasses.stream.drawBoxes(frame, detections)
+                        val baos = java.io.ByteArrayOutputStream()
+                        boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                        s.offerFrame(baos.toByteArray())
+                    } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
+                }
+
+                // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
+                //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
+                //    cropFrom() copies pixels out of `frame` synchronously, so the snapshot can be
+                //    safely recycled below even while these cropLane coroutines are still running.
+                for (track in trk.confirmedUnembedded()) {
+                    val crop = cropFrom(frame, track.bbox) ?: continue
+                    val thumbFile = File(objectsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
+                    try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
+                    catch (_: Throwable) {}
+                    val bboxStr = "%.3f,%.3f,%.3f,%.3f".format(
+                        track.bbox.left / frame.width, track.bbox.top / frame.height,
+                        track.bbox.width() / frame.width, track.bbox.height() / frame.height)
+                    val tid = track.trackId; val label = track.label
+                    viewModelScope.launch(cropLane) {
+                        try {
+                            val vec = enc.encode(crop)
+                            store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
+                            // markEmbedded mutates tracker state → marshal back to inferLane (the
+                            // tracker's only legal thread). Dedup applies only on a successful store.
+                            withContext(inferLane) { trk.markEmbedded(tid) }
+                            Log.i(TAG, "object stored: $label (track $tid), total=${store.count()}")
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
+                            // not marked embedded → retried on a later sighting
+                        } finally {
+                            crop.recycle()  // crop is our own pixels; release once encoded/stored
+                        }
                     }
                 }
+            } finally {
+                frame.recycle()  // our snapshot; crops were already copied out above
             }
         }
     }
