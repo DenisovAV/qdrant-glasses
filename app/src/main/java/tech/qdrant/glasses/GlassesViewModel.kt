@@ -154,8 +154,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val enc = textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
                 val db = store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
                 val mid = (tStart + tEnd) / 2
+                // The speech is valuable on its own (the heard channel searches transcripts);
+                // a frame is only an "episode cover". On a static scene the frame-dedup drops
+                // near-identical frames, so recentFrames can be empty for this window — store
+                // the transcript anyway with an empty image_path rather than losing the speech.
                 val nearest = nearestFramePath(mid)
-                if (nearest.isEmpty()) { Log.d(TAG, "ambient drop: no nearby frame for \"${text.take(40)}\""); return@launch }
+                if (nearest.isEmpty()) Log.d(TAG, "ambient: no nearby frame (deduped?), storing transcript without a cover")
                 try {
                     val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
                     val bge = bgeEncoder?.encode(text) ?: run {
@@ -233,18 +237,23 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onVoiceResult(text: String) {
         Log.i(TAG, "onVoiceResult: query=\"$text\"")
-        _state.value = AppState.Processing(text)
+        // Don't search on silence: an empty/blank or 1-char STT result is noise, not a
+        // query. Encoding "" still yields a vector that can scrape a stray frame past the
+        // (low) vision gate, so guard at the source and just return to Idle.
+        val query = text.trim()
+        if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); _state.value = AppState.Idle; return }
+        _state.value = AppState.Processing(query)
         viewModelScope.launch(inferLane) {
             val enc = textEncoder ?: return@launch
             val db  = store ?: return@launch
             try {
                 val t0 = System.currentTimeMillis()
-                val clipVec = enc.encode(text)
-                val bgeVec = bgeEncoder?.encode(text)
+                val clipVec = enc.encode(query)
+                val bgeVec = bgeEncoder?.encode(query)
                 val ret = retriever
                 if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); _state.value = AppState.Idle; return@launch }
                 val encMs = System.currentTimeMillis() - t0
-                val cards = ret.retrieve(text, clipVec, bgeVec)
+                val cards = ret.retrieve(query, clipVec, bgeVec)
                 Log.i(TAG, "onVoiceResult: encode=${encMs}ms cards=${cards.size}")
                 // Enrich each hit with speech that OVERLAPS its frame in time, so even an
                 // image hit shows "what was said here" — and a long utterance surfaces on
@@ -255,7 +264,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             .filter { it != c.frame.transcript }
                     ))
                 }
-                _state.value = AppState.Results(text, enriched)
+                _state.value = AppState.Results(query, enriched)
             } catch (e: Exception) {
                 Log.e(TAG, "search failed for \"$text\"", e)
                 _state.value = AppState.Idle

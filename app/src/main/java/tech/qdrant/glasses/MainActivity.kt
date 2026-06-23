@@ -29,7 +29,14 @@ import tech.qdrant.glasses.ui.SearchResultsView
 
 class MainActivity : AppCompatActivity() {
 
-    companion object { private const val TAG = "GlassesMain" }
+    companion object {
+        private const val TAG = "GlassesMain"
+        // Button gesture tuning (RayNeo action button, keyCode 289).
+        private const val ACTION_KEYCODE = 289
+        private const val LONG_PRESS_MS = 1200L     // hold this long in Idle to start recording
+        private const val START_GRACE_MS = 1000L    // ignore stop-releases for this long after start
+        private const val DOWN_DEBOUNCE_MS = 250L   // drop a DOWN arriving this soon after the last
+    }
 
     private val viewModel: GlassesViewModel by viewModels()
     private lateinit var root: LinearLayout
@@ -38,8 +45,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: FrameCaptureManager
     private lateinit var voiceManager: VoiceSearchManager
 
-    private var buttonDownMs = 0L
-    private var buttonLongFired = false
+    // Button gesture model (RayNeo action button, keyCode 289).
+    //   IDLE:      long press — fires WHILE HELD at LONG_PRESS_MS (the original feel; you
+    //              see recording begin and release) → start recording
+    //              short press (released before that) → voice search
+    //   RECORDING: ANY release (short or long)       → stop recording
+    // Stop is decided on ACTION_UP so a stray brush doesn't end a session; a start-grace
+    // window swallows the release of the very long-press that started the recording. A
+    // DOWN-debounce drops button chatter.
+    private var buttonDownMs = 0L              // wall-clock of the current press's DOWN (0 = up)
+    private var lastDownMs = 0L                // for DOWN debounce
+    private var longFired = false              // long-press already started recording this press
+    private var recordingStartedAtMs = 0L      // when the current recording began (for grace)
+    private val longPressRunnable = Runnable {
+        // Fired while the button is still held — the original start feel.
+        if (buttonDownMs != 0L && !longFired && viewModel.state.value is AppState.Idle) {
+            longFired = true
+            recordingStartedAtMs = System.currentTimeMillis()
+            Log.i(TAG, "button: long press (held) → start recording")
+            // Drop the dedup baseline so the first frame of THIS session is always saved —
+            // the camera ran before recording, so otherwise the opening frame is deduped
+            // against the pre-recording scene and early speech gets no cover frame.
+            cameraManager.resetForNewSession()
+            viewModel.startRecording()
+        }
+    }
 
     private val actionButtonReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -50,33 +80,49 @@ class MainActivity : AppCompatActivity() {
             try {
                 val obj = JSONObject(json)
                 val type = obj.getString("type")
-                val keyCode = obj.getInt("keyCode")
-                if (keyCode != 289) return
-                Log.i(TAG, "actionButton: type=$type")
+                if (obj.getInt("keyCode") != ACTION_KEYCODE) return
+                val now = System.currentTimeMillis()
                 when (type) {
                     "ACTION_DOWN" -> {
-                        buttonDownMs = System.currentTimeMillis()
-                        buttonLongFired = false
-                        window.decorView.postDelayed({
-                            if (!buttonLongFired) {
-                                buttonLongFired = true
-                                Log.i(TAG, "button: long press → recording toggle")
-                                handleRecordingToggle()
-                            }
-                        }, 1200)
+                        if (now - lastDownMs < DOWN_DEBOUNCE_MS) return  // bounce
+                        lastDownMs = now
+                        buttonDownMs = now
+                        longFired = false
+                        // Start fires while held (Idle only); harmless if not Idle.
+                        window.decorView.postDelayed(longPressRunnable, LONG_PRESS_MS)
                     }
                     "ACTION_UP" -> {
-                        if (!buttonLongFired) {
-                            buttonLongFired = true  // cancel pending long press
-                            Log.i(TAG, "button: short press → tap")
-                            handleTap()
-                        }
+                        val downAt = buttonDownMs
+                        buttonDownMs = 0L
+                        window.decorView.removeCallbacks(longPressRunnable)
+                        if (downAt == 0L) return                         // UP with no matching DOWN
+                        onButtonRelease(now - downAt, longFired)
                     }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "actionButtonReceiver error: $e")
             }
         }
+    }
+
+    /** A press was released after [heldMs]; [longAlreadyStarted] = the long-press timer fired. */
+    private fun onButtonRelease(heldMs: Long, longAlreadyStarted: Boolean) {
+        // The long-press that just started a recording already did its job; its release is
+        // swallowed by the start grace below — do not treat it as a stop or a tap.
+        val state = viewModel.state.value
+        if (state is AppState.Recording) {
+            if (System.currentTimeMillis() - recordingStartedAtMs < START_GRACE_MS) {
+                Log.i(TAG, "button: release ignored (start grace, held=${heldMs}ms)")
+                return
+            }
+            Log.i(TAG, "button: STOP recording (held=${heldMs}ms)")
+            viewModel.stopRecording()
+            return
+        }
+        // Not recording: a long-press that already fired its start consumed this press.
+        if (longAlreadyStarted) return
+        Log.i(TAG, "button: short press (held=${heldMs}ms) → tap")
+        handleTap()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -169,22 +215,6 @@ class MainActivity : AppCompatActivity() {
     override fun onGenericMotionEvent(event: android.view.MotionEvent): Boolean {
         Log.d(TAG, "genericMotion: ${event.actionMasked} x=${event.x} y=${event.y} src=${event.source}")
         return super.onGenericMotionEvent(event)
-    }
-
-    private fun handleRecordingToggle() {
-        // Derive the toggle from the actual app state — a local boolean desyncs when
-        // startRecording() rejects (not Idle) and then force-Idles a live query flow.
-        when (val s = viewModel.state.value) {
-            is AppState.Recording -> {
-                Log.i(TAG, "button: STOP recording")
-                viewModel.stopRecording()
-            }
-            is AppState.Idle -> {
-                Log.i(TAG, "button: START recording")
-                viewModel.startRecording()
-            }
-            else -> Log.i(TAG, "button: long press ignored (state=${s::class.simpleName})")
-        }
     }
 
     private fun showInBothEyes(makeView: () -> android.view.View) {

@@ -63,6 +63,19 @@ class FrameCaptureManager(
         cameraProvider?.unbindAll()
     }
 
+    /**
+     * Start a fresh recording: drop the dedup baseline and timers so the FIRST frame of the
+     * session is always accepted. The camera runs continuously from app launch, so without
+     * this the first recorded frame is deduped against a frame captured BEFORE recording (the
+     * same static scene), leaving the opening seconds — and any speech then — with no frame.
+     */
+    fun resetForNewSession() {
+        lastAcceptedPixels = null   // next frame can't be "similar to last" → forced accept
+        lastFrameTimeMs = 0L        // no interval gate against a pre-recording frame
+        lastAnalysisMs = 0L
+        Log.i(TAG, "resetForNewSession: dedup baseline cleared")
+    }
+
     private fun analyzeFrame(proxy: ImageProxy) {
         try {
             framesAnalyzed++

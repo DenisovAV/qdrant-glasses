@@ -24,12 +24,13 @@ class MomentRetriever(private val store: VisionMemoryStore) {
     companion object {
         private const val TAG = "MomentRetriever"
         // Calibrated from on-device DIAG (TinyCLIP-40M). Absolute CLIP cosine sits in
-        // ~0.15–0.40 (modality gap; random pairs avg ~0.22). On real glasses frames a
-        // descriptive query lifts the right frame to ~0.21–0.23, background ~0.18–0.20.
-        // 0.20 passed too much low-confidence background; 0.28 rejected real-but-weak hits.
-        // 0.25 favors precision (fewer false vision cards) at the cost of missing weak
-        // single-word matches — the heard channel is the strong signal, so this is OK.
-        const val VISION_MIN_SCORE = 0.25f   // background ~0.18–0.20, weak-but-real ~0.21–0.23
+        // ~0.15–0.40 (modality gap; random pairs avg ~0.22). A small object in a cluttered
+        // scene (a person ~10% of the frame) scores only ~0.20 even as the #1-ranked correct
+        // frame, while background sits ~0.19–0.20 — separation is tiny (~0.006), below noise,
+        // so no single threshold cleanly splits them. Set to 0.20 to let correct-but-small
+        // objects through (e.g. "woman"→sofa frame = 0.203); the cost is occasional background
+        // false positives. The heard channel remains the strong, reliable signal.
+        const val VISION_MIN_SCORE = 0.20f   // real-but-small object ~0.20, background ~0.19
         const val HEARD_MIN_MARGIN = 0.10f   // real hits ≥0.16, noise ≤0.054
         const val MERGE_MS = 5_000L
         const val MAX_CARDS = 3
@@ -71,7 +72,7 @@ class MomentRetriever(private val store: VisionMemoryStore) {
         val merged = ArrayList<MomentCard>()
         for (c in cards.sortedByDescending { it.strength }) {
             val near = merged.indexOfFirst {
-                it.frame.imagePath == c.frame.imagePath || spansOverlap(it.frame, c.frame)
+                samePath(it.frame, c.frame) || spansOverlap(it.frame, c.frame)
             }
             if (near == -1) merged.add(c)
             else merged[near] = merged[near].let { m ->
@@ -98,7 +99,7 @@ class MomentRetriever(private val store: VisionMemoryStore) {
             val m = merged[i]
             if (m.fromHeard) continue
             val overlapsHeard = heardFrames.any { hf ->
-                hf.imagePath == m.frame.imagePath || spansOverlap(hf, m.frame)
+                samePath(hf, m.frame) || spansOverlap(hf, m.frame)
             }
             if (overlapsHeard) merged[i] = m.copy(fromHeard = true)
         }
@@ -113,6 +114,14 @@ class MomentRetriever(private val store: VisionMemoryStore) {
         }.ifEmpty { "none (empty base)" })
         return top
     }
+
+    /**
+     * Same cover frame? Only when both paths are non-empty and equal. A transcript stored
+     * on a static (deduped) scene has an EMPTY image_path; two such transcripts must NOT
+     * collapse just because "" == "" — they merge only if their time spans overlap.
+     */
+    private fun samePath(a: MemoryFrame, b: MemoryFrame): Boolean =
+        a.imagePath.isNotEmpty() && a.imagePath == b.imagePath
 
     /**
      * Do two moments cover the same point in time? Tests overlap of their [timestampMs,

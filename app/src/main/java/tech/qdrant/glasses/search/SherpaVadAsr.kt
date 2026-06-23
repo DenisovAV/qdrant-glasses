@@ -32,7 +32,11 @@ object SherpaVadAsr {
     // VAD configuration constants
     const val SAMPLE_RATE = 16000
     private const val VAD_MODEL = "vad/silero_vad.onnx"
-    private const val VAD_THRESHOLD = 0.5f
+    // Lowered 0.5 → 0.3: on-device DIAG showed real speech reaching the mic at only
+    // RMS ~0.01 (peak ~0.11), where Silero's speech probability sits just under the
+    // default 0.5 gate — whole utterances produced ZERO segments. 0.3 catches medium-
+    // volume speech from the glasses mic. (Silero recommends 0.2–0.3 for quiet input.)
+    private const val VAD_THRESHOLD = 0.3f
     private const val VAD_MIN_SILENCE_DURATION = 0.5f
     private const val VAD_MIN_SPEECH_DURATION = 0.25f
     private const val VAD_MAX_SPEECH_DURATION = 10f
