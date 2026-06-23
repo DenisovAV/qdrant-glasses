@@ -31,10 +31,13 @@ class MediaPipeDetector(context: Context) : ObjectDetector {
         Log.i(TAG, "MediaPipe detector ready")
     }
 
-    override fun detect(bitmap: Bitmap): List<Detection> =
-        // MPImage is Closeable; close it per frame so native buffers don't accumulate
-        // (detect() is called once per camera frame).
-        BitmapImageBuilder(bitmap).build().use { mpImage ->
+    override fun detect(bitmap: Bitmap): List<Detection> {
+        // BitmapImageBuilder wraps the bitmap by reference and MPImage.close() calls
+        // bitmap.recycle() on it. We must NOT hand MediaPipe our caller's bitmap, or it
+        // will be recycled before drawBoxes/cropFrom can use it. Pass a dedicated mutable
+        // copy that MediaPipe is free to recycle; the caller's bitmap is left untouched.
+        val mpBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        return BitmapImageBuilder(mpBitmap).build().use { mpImage ->
             detector.detect(mpImage).detections().mapNotNull { d ->
                 val cat = d.categories().firstOrNull() ?: return@mapNotNull null
                 val b = d.boundingBox()
@@ -45,6 +48,7 @@ class MediaPipeDetector(context: Context) : ObjectDetector {
                 )
             }
         }
+    }
 
     override fun close() = detector.close()
 
