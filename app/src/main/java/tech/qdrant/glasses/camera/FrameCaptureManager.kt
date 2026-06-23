@@ -16,6 +16,10 @@ import kotlin.math.abs
 
 class FrameCaptureManager(
     private val context: Context,
+    // Object mode: deliver every analyzed frame (still ~2/sec via analyzeIntervalMs), skipping
+    // the 3s interval gate and the SSIM dedup — object tracking needs frame continuity, and
+    // near-identical frames are exactly what keeps a track alive between distinct objects.
+    private val passthrough: Boolean = false,
     private val onFrame: (Bitmap) -> Unit
 ) {
     companion object { private const val TAG = "FrameCapture" }
@@ -80,7 +84,9 @@ class FrameCaptureManager(
         try {
             framesAnalyzed++
             val nowMs = System.currentTimeMillis()
-            if (nowMs - lastFrameTimeMs < frameIntervalMs) {
+            // The 3s interval gate is for the legacy CLIP path; passthrough delivers far more
+            // frequently (capped only by analyzeIntervalMs below) so tracking stays continuous.
+            if (!passthrough && nowMs - lastFrameTimeMs < frameIntervalMs) {
                 framesSkippedTime++
                 return
             }
@@ -91,23 +97,25 @@ class FrameCaptureManager(
             lastAnalysisMs = nowMs
             val raw = proxy.toBitmap()
             val rotation = proxy.imageInfo.rotationDegrees
-            if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} rotation=$rotation")
+            if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} rotation=$rotation passthrough=$passthrough")
             val bitmap = if (rotation != 0) {
                 val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
                 Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
             } else raw
-            val pixels = downscalePixels(bitmap)
-            val similarity = lastAcceptedPixels?.let { similarityBetween(it, pixels) } ?: 0f
-            val forced = (nowMs - lastFrameTimeMs) >= forceSaveIntervalMs
-            if (similarity > similarityThreshold && !forced) {
-                framesSkippedSimilar++
-                Log.v(TAG, "frame skipped: similarity=%.2f".format(similarity))
-                return
+            if (!passthrough) {
+                val pixels = downscalePixels(bitmap)
+                val similarity = lastAcceptedPixels?.let { similarityBetween(it, pixels) } ?: 0f
+                val forced = (nowMs - lastFrameTimeMs) >= forceSaveIntervalMs
+                if (similarity > similarityThreshold && !forced) {
+                    framesSkippedSimilar++
+                    Log.v(TAG, "frame skipped: similarity=%.2f".format(similarity))
+                    return
+                }
+                lastAcceptedPixels = pixels  // baseline moves ONLY on accept
+                Log.d(TAG, "frame accepted: similarity=%.2f forced=$forced sent=${framesSent + 1}".format(similarity))
             }
-            lastAcceptedPixels = pixels  // baseline moves ONLY on accept
             lastFrameTimeMs = nowMs
             framesSent++
-            Log.d(TAG, "frame accepted: similarity=%.2f forced=$forced sent=$framesSent".format(similarity))
             onFrame(bitmap)
         } finally {
             proxy.close()

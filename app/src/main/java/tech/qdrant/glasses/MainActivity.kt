@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var eyeRight: FrameLayout
     private lateinit var cameraManager: FrameCaptureManager
     private lateinit var voiceManager: VoiceSearchManager
+    private var mjpeg: tech.qdrant.glasses.stream.MjpegServer? = null
 
     // Button gesture model (RayNeo action button, keyCode 289).
     //   IDLE:      long press — fires WHILE HELD at LONG_PRESS_MS (the original feel; you
@@ -137,6 +138,7 @@ class MainActivity : AppCompatActivity() {
         requestMissingPermissions()
         setupCamera()
         setupVoice()
+        startStreamer()
         observeState()
         registerReceiver(actionButtonReceiver, IntentFilter("com.rayneo.key_pass_to_user"))
     }
@@ -164,8 +166,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupCamera() {
         Log.d(TAG, "setupCamera")
-        cameraManager = FrameCaptureManager(this) { bitmap -> viewModel.onFrame(bitmap) }
+        // Object mode is the active mode: deliver every analyzed frame (passthrough) so the
+        // detector/tracker get continuous frames. The legacy CLIP dedup gate is bypassed.
+        cameraManager = FrameCaptureManager(this, passthrough = true) { bitmap -> viewModel.onFrame(bitmap) }
         cameraManager.start(this)
+    }
+
+    private fun startStreamer() {
+        try {
+            mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080).also { it.start(10_000, false) }
+            viewModel.attachStreamer(mjpeg!!)
+            Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
+            Log.i(TAG, "embed endpoint expected on :9000 — desktop: adb reverse tcp:9000 tcp:9000")
+        } catch (e: Exception) {
+            Log.e(TAG, "MJPEG start failed", e)
+        }
     }
 
     private fun setupVoice() {
@@ -265,5 +280,6 @@ class MainActivity : AppCompatActivity() {
         unregisterReceiver(actionButtonReceiver)
         cameraManager.stop()
         voiceManager.destroy()
+        mjpeg?.stop()
     }
 }

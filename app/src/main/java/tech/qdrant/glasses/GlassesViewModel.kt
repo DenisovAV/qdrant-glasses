@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import tech.qdrant.glasses.embedding.EncoderFactory
 import tech.qdrant.glasses.embedding.TextEncoder
@@ -66,8 +67,30 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // TFLite Interpreter.run is NOT thread-safe, and EdgeShard's thread-safety is
     // unverified — serialize ALL inference + store work on one lane. A late ambient
     // segment encoding concurrently with a query encode is a real (demo-shaped) overlap.
+    // This is ALSO the object-detection / tracker lane (ObjectTracker is not thread-safe:
+    // update/confirmedUnembedded/markEmbedded must all run here, single-threaded).
     @OptIn(ExperimentalCoroutinesApi::class)
     private val inferLane = Dispatchers.Default.limitedParallelism(1)
+
+    // ---- Object mode -------------------------------------------------------------------
+    enum class AppMode { LEGACY, OBJECTS }
+    private val appMode = AppMode.OBJECTS   // flip to LEGACY for the old whole-frame path
+
+    private var detector: tech.qdrant.glasses.detect.ObjectDetector? = null
+    private var tracker: tech.qdrant.glasses.detect.ObjectTracker? = null
+    private var cropEncoder: tech.qdrant.glasses.embedding.CropEncoder? = null
+    private var objectStore: tech.qdrant.glasses.storage.ObjectStore? = null
+    // Crop embedding is a network call (Mac endpoint). It runs on its OWN single-thread lane
+    // so a slow embed never blocks detection on inferLane. markEmbedded is marshalled BACK to
+    // inferLane (the tracker's only legal thread) after a successful embed+upsert.
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val cropLane = Dispatchers.IO.limitedParallelism(1)
+    @Volatile private var streamer: tech.qdrant.glasses.stream.MjpegServer? = null  // set by MainActivity
+    private val objectsDir by lazy {
+        File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
+    }
+
+    fun attachStreamer(s: tech.qdrant.glasses.stream.MjpegServer) { streamer = s }
 
     init {
         Log.i(TAG, "init: starting model + store loading")
@@ -89,6 +112,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
                 bgeEncoder = tech.qdrant.glasses.embedding.BgeTextEncoder(app)
                 Log.d(TAG, "init: bge encoder OK")
+
+                if (appMode == AppMode.OBJECTS) {
+                    detector = tech.qdrant.glasses.detect.DetectorFactory.create(app)
+                    tracker = tech.qdrant.glasses.detect.ObjectTracker(confirmSightings = 3)
+                    cropEncoder = tech.qdrant.glasses.embedding.CropEncoderFactory.create(app)
+                    objectStore = tech.qdrant.glasses.storage.ObjectStore(app, dim = cropEncoder!!.dim)
+                    Log.i(TAG, "object mode ready (detector+tracker+encoder+store), objects=${objectStore?.count()}")
+                }
 
                 // Pre-warm the ambient ASR model (~290MB) off the main thread so the
                 // first recording doesn't block the UI loading it. ensureLoaded is
@@ -195,6 +226,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onFrame(bitmap: Bitmap) {
+        if (appMode == AppMode.OBJECTS) { onObjectFrame(bitmap); return }
         if (_state.value !is AppState.Recording) return
         val timestampMs = System.currentTimeMillis()
         val file = File(imagesDir, "frame_$timestampMs.jpg")
@@ -214,6 +246,77 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             // A frame minutes away is a wrong memory, not a near one — reject it.
             return if (kotlin.math.abs(best.second - midMs) <= maxFrameAssocMs) best.first else ""
         }
+    }
+
+    /**
+     * Object-mode per-frame processing: detect → track → stream boxes → embed confirmed crops.
+     *
+     * Called from the camera analyzer thread (FrameCaptureManager's single-thread executor),
+     * NOT inferLane. ObjectTracker is NOT thread-safe, so the whole detect/track/confirm body
+     * is dispatched onto inferLane (the tracker's only legal thread). The crop embed (a network
+     * call to the Mac endpoint) runs on a SEPARATE cropLane so it can't block detection; on
+     * success it marshals markEmbedded BACK to inferLane — the dedup flag is part of tracker
+     * state and may only be mutated there.
+     */
+    fun onObjectFrame(bitmap: Bitmap) {
+        if (_state.value !is AppState.Recording) return
+        val det = detector ?: return
+        val trk = tracker ?: return
+        val store = objectStore ?: return
+        val enc = cropEncoder ?: return
+        viewModelScope.launch(inferLane) {
+            val t0 = System.currentTimeMillis()
+            val detections = try { det.detect(bitmap) } catch (e: Throwable) {
+                Log.e(TAG, "detect failed", e); return@launch
+            }
+            val detMs = System.currentTimeMillis() - t0
+            trk.update(detections)
+            Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
+
+            // 1) Stream the frame with boxes (cheap; safe on this lane).
+            streamer?.let { s ->
+                try {
+                    val boxed = tech.qdrant.glasses.stream.drawBoxes(bitmap, detections)
+                    val baos = java.io.ByteArrayOutputStream()
+                    boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                    s.offerFrame(baos.toByteArray())
+                } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
+            }
+
+            // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
+            //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
+            for (track in trk.confirmedUnembedded()) {
+                val crop = cropFrom(bitmap, track.bbox) ?: continue
+                val thumbFile = File(objectsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
+                try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
+                catch (_: Throwable) {}
+                val bboxStr = "%.3f,%.3f,%.3f,%.3f".format(
+                    track.bbox.left / bitmap.width, track.bbox.top / bitmap.height,
+                    track.bbox.width() / bitmap.width, track.bbox.height() / bitmap.height)
+                val tid = track.trackId; val label = track.label
+                viewModelScope.launch(cropLane) {
+                    try {
+                        val vec = enc.encode(crop)
+                        store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
+                        // markEmbedded mutates tracker state → marshal back to inferLane (the
+                        // tracker's only legal thread). Dedup applies only on a successful store.
+                        withContext(inferLane) { trk.markEmbedded(tid) }
+                        Log.i(TAG, "object stored: $label (track $tid), total=${store.count()}")
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
+                        // not marked embedded → retried on a later sighting
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cropFrom(frame: Bitmap, box: android.graphics.RectF): Bitmap? {
+        val l = box.left.toInt().coerceIn(0, frame.width - 1)
+        val t = box.top.toInt().coerceIn(0, frame.height - 1)
+        val r = box.right.toInt().coerceIn(l + 1, frame.width)
+        val b = box.bottom.toInt().coerceIn(t + 1, frame.height)
+        return try { Bitmap.createBitmap(frame, l, t, r - l, b - t) } catch (_: Throwable) { null }
     }
 
     fun startListening() {
@@ -244,6 +347,29 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); _state.value = AppState.Idle; return }
         _state.value = AppState.Processing(query)
         viewModelScope.launch(inferLane) {
+            if (appMode == AppMode.OBJECTS) {
+                val cropEnc = cropEncoder ?: run { _state.value = AppState.Idle; return@launch }
+                val objStore = objectStore ?: run { _state.value = AppState.Idle; return@launch }
+                val t0 = System.currentTimeMillis()
+                val qvec = try { cropEnc.encodeText(query) } catch (e: Throwable) {
+                    Log.e(TAG, "query embed failed", e); _state.value = AppState.Idle; return@launch
+                }
+                val encMs = System.currentTimeMillis() - t0
+                val hits = objStore.search(qvec, topK = 5)
+                Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms hits=${hits.size}")
+                val cards = hits.map { h ->
+                    tech.qdrant.glasses.search.MomentCard(
+                        frame = MemoryFrame(
+                            id = h.id, score = h.score, imagePath = h.thumbPath,
+                            timestampMs = h.timestampMs, tEndMs = h.timestampMs,
+                            type = "object", transcript = h.label,
+                        ),
+                        fromVision = true, fromHeard = false, strength = h.score,
+                    )
+                }
+                _state.value = AppState.Results(query, cards)
+                return@launch
+            }
             val enc = textEncoder ?: return@launch
             val db  = store ?: return@launch
             try {
@@ -301,5 +427,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         textEncoder?.close()
         bgeEncoder?.close()
         store?.close()
+        detector?.close()
+        cropEncoder?.close()
+        objectStore?.close()
     }
 }
