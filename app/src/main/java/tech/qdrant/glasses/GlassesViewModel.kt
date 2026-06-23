@@ -398,7 +398,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun frameCount(): Long = store?.count() ?: 0L
+    fun frameCount(): Long =
+        if (appMode == AppMode.OBJECTS) objectStore?.count() ?: 0L
+        else store?.count() ?: 0L
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")
