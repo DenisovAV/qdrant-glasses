@@ -87,4 +87,5 @@ dependencies {
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
