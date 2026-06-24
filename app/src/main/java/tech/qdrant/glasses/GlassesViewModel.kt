@@ -285,17 +285,22 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     Log.e(TAG, "detect failed", e); return@launch
                 }
                 val detMs = System.currentTimeMillis() - t0
-                trk.update(detections)
+                val tracks = trk.update(detections)
                 Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
-                // 1) Stream the frame with boxes (cheap; safe on this lane).
+                // 1) Stream the CLEAN frame (no baked boxes) + send box coordinates as an event.
                 streamer?.let { s ->
                     try {
-                        val boxed = tech.qdrant.glasses.stream.drawBoxes(frame, detections)
                         val baos = java.io.ByteArrayOutputStream()
-                        boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                        frame.compress(Bitmap.CompressFormat.JPEG, 70, baos)
                         s.offerFrame(baos.toByteArray())
-                    } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
+                        // score per track: a track's bbox == its matched detection's bbox this frame.
+                        val scoreByTrack = HashMap<Int, Float>()
+                        for (tk in tracks) {
+                            detections.firstOrNull { it.label == tk.label && it.bbox == tk.bbox }?.let { scoreByTrack[tk.trackId] = it.score }
+                        }
+                        s.pushEvent(tech.qdrant.glasses.stream.HudEvents.boxesEvent(tracks, scoreByTrack, frame.width, frame.height))
+                    } catch (e: Throwable) { Log.w(TAG, "stream/boxes failed: ${e.message}") }
                 }
 
                 // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
@@ -312,13 +317,22 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         track.bbox.width() / frame.width, track.bbox.height() / frame.height)
                     val tid = track.trackId; val label = track.label
                     viewModelScope.launch(cropLane) {
+                        val embedT0 = System.currentTimeMillis()
                         try {
                             val vec = enc.encode(crop)
+                            val embedMs = System.currentTimeMillis() - embedT0
+                            val storeT0 = System.currentTimeMillis()
                             store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
+                            val storeMs = System.currentTimeMillis() - storeT0
                             // markEmbedded mutates tracker state → marshal back to inferLane (the
                             // tracker's only legal thread). Dedup applies only on a successful store.
                             withContext(inferLane) { trk.markEmbedded(tid) }
-                            Log.i(TAG, "object stored: $label (track $tid), total=${store.count()}")
+                            val count = store.count()
+                            val key = thumbFile.nameWithoutExtension
+                            streamer?.registerThumb(key, thumbFile.absolutePath)
+                            streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.storedEvent(key, label, count))
+                            streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.tickEvent(detMs, embedMs, storeMs, count))
+                            Log.i(TAG, "object stored: $label (track $tid), total=$count")
                         } catch (e: Throwable) {
                             Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
                             // not marked embedded → retried on a later sighting
