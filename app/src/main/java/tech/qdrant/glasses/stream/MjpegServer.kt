@@ -128,6 +128,8 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     private fun serveAsset(path: String, mime: String): Response = try {
         val bytes = assets.open(path).use { it.readBytes() }
         newFixedLengthResponse(Response.Status.OK, mime, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
+            // The HUD assets change between builds; never let the browser serve a stale app.js/css.
+            .apply { addHeader("Cache-Control", "no-store, must-revalidate") }
     } catch (e: Exception) {
         Log.w(TAG, "asset missing: $path (${e.message})")
         newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")

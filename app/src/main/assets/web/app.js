@@ -4,8 +4,42 @@ const RAIL_CAP = 40;
 let frameDim = [640, 480];
 let tracks = new Map(); // id -> {cur:{x,y,w,h}, target:{x,y,w,h}, label}
 
-const es = new EventSource("/events");
-es.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (_) {} };
+console.log("[hud] app.js loaded; feed=", !!feed, "overlay=", !!overlay, "ctx=", !!octx);
+
+// Read /events as a fetch stream and parse the SSE "data: ...\n\n" frames ourselves.
+// EventSource on some browsers buffers NanoHTTPD's chunked pipe and never fires onmessage,
+// even though the bytes are flowing — fetch+ReadableStream delivers chunks as they arrive.
+let _evCount = 0;
+async function streamEvents() {
+  while (true) {
+    try {
+      const resp = await fetch("/events", { headers: { "Accept": "text/event-stream" } });
+      console.log("[hud] /events connected, status", resp.status);
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) { console.warn("[hud] /events closed, reconnecting"); break; }
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;                       // skip ": connected" comments
+          const json = line.slice(5).trim();
+          try {
+            const ev = JSON.parse(json);
+            if (_evCount++ < 5 || ev.t !== "boxes") console.log("[hud] event", ev.t, ev.count != null ? "count=" + ev.count : "");
+            handle(ev);
+          } catch (err) { console.error("[hud] handle failed:", err, "raw:", json); }
+        }
+      }
+    } catch (err) { console.warn("[hud] /events error, retrying in 1s", err); }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+streamEvents();
 
 function handle(ev) {
   if (ev.t === "boxes") {
@@ -66,7 +100,10 @@ function renderResults(items) {
 
 // render loop: scale frame coords to the displayed <img>, draw + interpolate boxes
 function draw() {
-  const rw = feed.clientWidth, rh = feed.clientHeight;
+  // Use the canvas's own rendered size (CSS now stretches it over the feed). Before the video
+  // has loaded, feed.clientWidth can be 0 — fall back to the wrap width so boxes still scale.
+  const rw = overlay.clientWidth || feed.clientWidth, rh = overlay.clientHeight || feed.clientHeight;
+  if (!rw || !rh) { requestAnimationFrame(draw); return; }
   if (overlay.width !== rw || overlay.height !== rh) { overlay.width = rw; overlay.height = rh; }
   const sx = rw / frameDim[0], sy = rh / frameDim[1];
   octx.clearRect(0, 0, rw, rh);
