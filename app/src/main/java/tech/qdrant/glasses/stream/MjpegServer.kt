@@ -74,9 +74,30 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
 
     fun clientCount(): Int = clients.size
 
+    /** One open Server-Sent-Events connection (the HUD's /events channel). */
+    private val eventClients = CopyOnWriteArrayList<Client>()
+
+    /** Fan out one SSE event line to every connected HUD. Safe to call from any thread. */
+    fun pushEvent(line: String) {
+        if (eventClients.isEmpty()) return
+        val payload = "data: $line\n\n".toByteArray()
+        for (c in eventClients) {
+            if (!c.alive) { eventClients.remove(c); continue }
+            try {
+                synchronized(c.out) { c.out.write(payload); c.out.flush() }
+            } catch (e: Exception) {
+                c.alive = false; eventClients.remove(c)
+                Log.d(TAG, "event client dropped: ${e.message}")
+            }
+        }
+    }
+
+    fun eventClientCount(): Int = eventClients.size
+
     override fun serve(session: IHTTPSession): Response {
         return when (session.uri) {
             "/stream" -> serveStream()
+            "/events" -> serveEvents()
             else -> newFixedLengthResponse(
                 Response.Status.OK, "text/html",
                 "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
@@ -123,6 +144,20 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
         )
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "close")
+        return resp
+    }
+
+    private fun serveEvents(): Response {
+        val pipeIn = java.io.PipedInputStream(64 * 1024)
+        val pipeOut = java.io.PipedOutputStream(pipeIn)
+        val client = Client(pipeOut)
+        eventClients.add(client)
+        Log.i(TAG, "event client connected (${eventClients.size} total)")
+        // SSE preamble so the browser's EventSource opens cleanly.
+        try { synchronized(client.out) { client.out.write(": connected\n\n".toByteArray()); client.out.flush() } } catch (_: Exception) {}
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", pipeIn)
+        resp.addHeader("Cache-Control", "no-cache, private")
+        resp.addHeader("Connection", "keep-alive")
         return resp
     }
 }
