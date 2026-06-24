@@ -33,7 +33,7 @@ class FrameCaptureManager(
     // Once past the interval gate, don't pay toBitmap+scale at full camera fps while
     // waiting for the scene to change — analyze at most ~2x/sec.
     private var lastAnalysisMs = 0L
-    private val analyzeIntervalMs = 500L
+    private val analyzeIntervalMs = 150L
 
     // Baseline for dedupe = the last ACCEPTED frame. Comparing against the last
     // ANALYZED frame degenerates to frame-vs-33ms-ago (always similar), so a gradual
