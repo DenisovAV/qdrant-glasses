@@ -3,9 +3,56 @@ package tech.qdrant.glasses.stream
 import android.content.res.AssetManager
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
-import java.io.OutputStream
+import java.io.InputStream
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.LinkedBlockingQueue
+
+/**
+ * An InputStream fed by discrete byte[] messages from any number of writer threads.
+ * read(b,off,len) blocks until a message is queued, then returns it in one shot.
+ *
+ * This replaces PipedInputStream/PipedOutputStream, whose sparse-write wakeup is unreliable:
+ * NanoHTTPD's sendBody does data.read(buf,0,16384) in a loop and emits one HTTP chunk per read.
+ * High-rate MJPEG kept the piped reader cycling so it drained; low-rate SSE events (stored/tick)
+ * left the parked reader un-retriggered and sat undelivered (PipedOutputStream.flush() is
+ * notify-only — it doesn't push bytes). With a queue, each message → one read → one chunk → one
+ * immediate socket flush, for one byte or one megabyte, any number of writers.
+ */
+private class MessageStream : InputStream() {
+    private val queue = LinkedBlockingQueue<ByteArray>()
+    private val poison = ByteArray(0)
+    @Volatile private var closed = false
+    private var current: ByteArray? = null
+    private var pos = 0
+
+    fun offer(bytes: ByteArray) { if (!closed) queue.offer(bytes) }
+
+    override fun read(): Int {
+        val one = ByteArray(1); val n = read(one, 0, 1)
+        return if (n <= 0) -1 else (one[0].toInt() and 0xFF)
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (len == 0) return 0
+        var cur = current
+        if (cur == null || pos >= cur.size) {
+            val next = try { queue.take() } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt(); return -1
+            }
+            if (next === poison) return -1
+            cur = next; current = cur; pos = 0
+        }
+        val n = minOf(len, cur.size - pos)
+        System.arraycopy(cur, pos, b, off, n)
+        pos += n
+        if (pos >= cur.size) current = null
+        return n
+    }
+
+    override fun available(): Int = current?.let { it.size - pos } ?: 0
+    override fun close() { closed = true; queue.offer(poison) }
+}
 
 /**
  * Minimal MJPEG (multipart/x-mixed-replace) HTTP server.
@@ -26,8 +73,8 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
         private const val BOUNDARY = "frameboundary"
     }
 
-    /** One open client connection that we keep writing JPEG parts to. */
-    private class Client(val out: OutputStream) {
+    /** One open client connection — backed by a message queue, not a pipe. */
+    private class Client(val stream: MessageStream) {
         @Volatile var alive = true
     }
 
@@ -63,20 +110,11 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
         val header = ("--$BOUNDARY\r\n" +
                 "Content-Type: image/jpeg\r\n" +
                 "Content-Length: ${jpeg.size}\r\n\r\n").toByteArray()
+        // One whole multipart part = one queued message = one contiguous chunk.
+        val part = header + jpeg + "\r\n".toByteArray()
         for (c in clients) {
             if (!c.alive) { clients.remove(c); continue }
-            try {
-                synchronized(c.out) {
-                    c.out.write(header)
-                    c.out.write(jpeg)
-                    c.out.write("\r\n".toByteArray())
-                    c.out.flush()
-                }
-            } catch (e: Exception) {
-                c.alive = false
-                clients.remove(c)
-                Log.d(TAG, "client dropped: ${e.message}")
-            }
+            c.stream.offer(part)
         }
     }
 
@@ -88,15 +126,11 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     /** Fan out one SSE event line to every connected HUD. Safe to call from any thread. */
     fun pushEvent(line: String) {
         if (eventClients.isEmpty()) return
+        // One complete SSE event = one queued message = one HTTP chunk = one socket flush.
         val payload = "data: $line\n\n".toByteArray()
         for (c in eventClients) {
             if (!c.alive) { eventClients.remove(c); continue }
-            try {
-                synchronized(c.out) { c.out.write(payload); c.out.flush() }
-            } catch (e: Exception) {
-                c.alive = false; eventClients.remove(c)
-                Log.d(TAG, "event client dropped: ${e.message}")
-            }
+            c.stream.offer(payload)
         }
     }
 
@@ -151,29 +185,24 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
      * a writer thread feeds. Each registered Client receives [offerFrame] writes.
      */
     private fun serveStream(): Response {
-        val pipeIn = java.io.PipedInputStream(64 * 1024)
-        val pipeOut = java.io.PipedOutputStream(pipeIn)
-        val client = Client(pipeOut)
+        val stream = MessageStream()
+        val client = Client(stream)
         clients.add(client)
         Log.i(TAG, "client connected (${clients.size} total)")
 
         // Prime the new client immediately so the viewer isn't blank: a live frame if we have
         // one, otherwise the standby placeholder.
         (latestJpeg ?: placeholderJpeg)?.let { jpeg ->
-            try {
-                val header = ("--$BOUNDARY\r\n" +
-                        "Content-Type: image/jpeg\r\n" +
-                        "Content-Length: ${jpeg.size}\r\n\r\n").toByteArray()
-                synchronized(client.out) {
-                    client.out.write(header); client.out.write(jpeg); client.out.write("\r\n".toByteArray()); client.out.flush()
-                }
-            } catch (_: Exception) {}
+            val header = ("--$BOUNDARY\r\n" +
+                    "Content-Type: image/jpeg\r\n" +
+                    "Content-Length: ${jpeg.size}\r\n\r\n").toByteArray()
+            stream.offer(header + jpeg + "\r\n".toByteArray())
         }
 
         val resp = newChunkedResponse(
             Response.Status.OK,
             "multipart/x-mixed-replace; boundary=$BOUNDARY",
-            pipeIn
+            stream
         )
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "close")
@@ -181,14 +210,13 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     }
 
     private fun serveEvents(): Response {
-        val pipeIn = java.io.PipedInputStream(64 * 1024)
-        val pipeOut = java.io.PipedOutputStream(pipeIn)
-        val client = Client(pipeOut)
+        val stream = MessageStream()
+        val client = Client(stream)
         eventClients.add(client)
         Log.i(TAG, "event client connected (${eventClients.size} total)")
-        // SSE preamble so the browser's EventSource opens cleanly.
-        try { synchronized(client.out) { client.out.write(": connected\n\n".toByteArray()); client.out.flush() } } catch (_: Exception) {}
-        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", pipeIn)
+        // SSE preamble (a comment line) so the client's reader opens cleanly.
+        stream.offer(": connected\n\n".toByteArray())
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "keep-alive")
         return resp
