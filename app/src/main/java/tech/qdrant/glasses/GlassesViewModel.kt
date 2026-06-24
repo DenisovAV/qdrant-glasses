@@ -158,6 +158,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         synchronized(recentFrames) { recentFrames.clear() }
         Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
         _state.value = AppState.Recording(0L, 0L)
+        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
 
         encodeWorker = viewModelScope.launch(inferLane) {
             for ((file, bitmap) in encodeQueue) {
@@ -230,6 +231,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         ambient?.stop()
         ambient = null
         _state.value = AppState.Idle
+        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
 
     fun onFrame(bitmap: Bitmap) {
@@ -382,6 +384,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val query = text.trim()
         if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); _state.value = AppState.Idle; return }
         _state.value = AppState.Processing(query)
+        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
                 val cropEnc = cropEncoder ?: run { _state.value = AppState.Idle; return@launch }
@@ -393,6 +396,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val encMs = System.currentTimeMillis() - t0
                 val hits = objStore.search(qvec, topK = 5)
                 Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms hits=${hits.size}")
+                val resultItems = hits.map { h ->
+                    val key = java.io.File(h.thumbPath).nameWithoutExtension
+                    streamer?.registerThumb(key, h.thumbPath)
+                    tech.qdrant.glasses.stream.HudEvents.ResultItem(key, h.label, h.score)
+                }
+                streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.resultsEvent(resultItems))
                 val cards = hits.map { h ->
                     tech.qdrant.glasses.search.MomentCard(
                         frame = MemoryFrame(
