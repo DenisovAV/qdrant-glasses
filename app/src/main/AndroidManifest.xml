@@ -22,6 +22,13 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.Glasses">
 
+        <!-- Android 12+ isolates vendor native libs by namespace: to dlopen the system's
+             /vendor/lib64/libcdsprpc.so (FastRPC transport to the Hexagon DSP, needed by the
+             QNN HTP delegate) the app must declare it here, else QNN fails with
+             "libcdsprpc.so not found in namespace classloader-namespace". required=false so
+             the app still runs on devices that lack it. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

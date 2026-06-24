@@ -58,6 +58,10 @@ android {
 
     packaging {
         jniLibs {
+            // QNN HTP/FastRPC needs the native .so extracted to disk (not mmap'd from the APK)
+            // so the dynamic loader can resolve the vendor libcdsprpc.so transport. This is the
+            // AGP-sanctioned replacement for android:extractNativeLibs="true" in the manifest.
+            useLegacyPackaging = true
             // We ship arm64-v8a only (see ndk.abiFilters). On arm64 the sherpa
             // static-link AAR has onnxruntime statically linked into
             // libsherpa-onnx-jni.so and ships NO standalone libonnxruntime.so, so
