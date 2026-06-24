@@ -290,19 +290,20 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val tracks = trk.update(detections)
                 Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
-                // 1) Stream the CLEAN frame (no baked boxes) + send box coordinates as an event.
+                // 1) Stream the frame with boxes BAKED IN. Drawing boxes on-device into the JPEG
+                //    is reliable — the browser renders MJPEG natively, no SSE/canvas needed (the
+                //    SSE box channel didn't deliver through NanoHTTPD's chunked pipe in browsers).
                 streamer?.let { s ->
                     try {
-                        val baos = java.io.ByteArrayOutputStream()
-                        frame.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                        s.offerFrame(baos.toByteArray())
-                        // score per track: a track's bbox == its matched detection's bbox this frame.
-                        val scoreByTrack = HashMap<Int, Float>()
-                        for (tk in tracks) {
-                            detections.firstOrNull { it.label == tk.label && it.bbox == tk.bbox }?.let { scoreByTrack[tk.trackId] = it.score }
-                        }
-                        s.pushEvent(tech.qdrant.glasses.stream.HudEvents.boxesEvent(tracks, scoreByTrack, frame.width, frame.height))
-                    } catch (e: Throwable) { Log.w(TAG, "stream/boxes failed: ${e.message}") }
+                        // drawBoxes returns a NEW mutable bitmap — recycle it after compress or it
+                        // leaks ~2-3MB/sec (every streamed frame) → OOM.
+                        val boxed = tech.qdrant.glasses.stream.drawBoxes(frame, detections)
+                        try {
+                            val baos = java.io.ByteArrayOutputStream()
+                            boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                            s.offerFrame(baos.toByteArray())
+                        } finally { boxed.recycle() }
+                    } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
                 }
 
                 // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
@@ -328,7 +329,21 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             val storeMs = System.currentTimeMillis() - storeT0
                             // markEmbedded mutates tracker state → marshal back to inferLane (the
                             // tracker's only legal thread). Dedup applies only on a successful store.
-                            withContext(inferLane) { trk.markEmbedded(tid) }
+                            // Bump the session counter there too (same lane) so the glasses' HUD
+                            // shows objects-indexed-this-session, not a stuck 0.
+                            withContext(inferLane) {
+                                trk.markEmbedded(tid)
+                                // Only count + update the HUD while still Recording. A late crop
+                                // embed finishing after stopRecording() must not bump the counter
+                                // on a dead session — guard the increment inside the atomic update.
+                                _state.update {
+                                    if (it is AppState.Recording) {
+                                        sessionIndexed++
+                                        val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
+                                        AppState.Recording(sessionIndexed, elapsed)
+                                    } else it
+                                }
+                            }
                             val count = store.count()
                             val key = thumbFile.nameWithoutExtension
                             streamer?.registerThumb(key, thumbFile.absolutePath)

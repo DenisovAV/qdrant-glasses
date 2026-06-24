@@ -22,7 +22,13 @@ class FrameCaptureManager(
     private val passthrough: Boolean = false,
     private val onFrame: (Bitmap) -> Unit
 ) {
-    companion object { private const val TAG = "FrameCapture" }
+    companion object {
+        private const val TAG = "FrameCapture"
+        // Max edge of the delivered frame. RayNeo ignores setTargetResolution and sends the full
+        // sensor (~1728x2304); downscale to this so detection/stream/crops stay fast. ~960 keeps
+        // enough detail for detection + a crisp browser stream while the JPEG stays tens of KB.
+        private const val MAX_EDGE = 960
+    }
 
     private val executor = Executors.newSingleThreadExecutor()
     private var cameraProvider: ProcessCameraProvider? = null
@@ -98,10 +104,24 @@ class FrameCaptureManager(
             val raw = proxy.toBitmap()
             val rotation = proxy.imageInfo.rotationDegrees
             if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} rotation=$rotation passthrough=$passthrough")
-            val bitmap = if (rotation != 0) {
+            // rotate creates a NEW bitmap; recycle the source raw once we have the rotated copy.
+            val rotated = if (rotation != 0) {
                 val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+                Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true).also { raw.recycle() }
             } else raw
+            // setTargetResolution(640x480) is only a HINT — RayNeo's camera ignores it and
+            // delivers the full sensor (~1728x2304). That huge frame makes detection slow
+            // (resize cost), the MJPEG stream choke (a ~MB JPEG 2x/sec overflows the pipe →
+            // blank browser), and crops oversized. Downscale to a max edge of MAX_EDGE here so
+            // the whole pipeline below works at a sane size while keeping the aspect ratio.
+            // scale creates a NEW bitmap; recycle the (intermediate) rotated once scaled. These
+            // intermediates would otherwise leak ~31MB/frame at full sensor res → OOM in ~1 min.
+            val maxEdge = maxOf(rotated.width, rotated.height)
+            val bitmap = if (maxEdge > MAX_EDGE) {
+                val s = MAX_EDGE.toFloat() / maxEdge
+                Bitmap.createScaledBitmap(rotated, (rotated.width * s).toInt(), (rotated.height * s).toInt(), true)
+                    .also { if (it !== rotated) rotated.recycle() }
+            } else rotated
             if (!passthrough) {
                 val pixels = downscalePixels(bitmap)
                 val similarity = lastAcceptedPixels?.let { similarityBetween(it, pixels) } ?: 0f
