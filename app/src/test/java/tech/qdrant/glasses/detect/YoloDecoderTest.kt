@@ -52,4 +52,12 @@ class YoloDecoderTest {
         assertEquals(0f, d.bbox.left, 0.5f); assertEquals(640f, d.bbox.right, 0.5f)
         assertEquals(0f, d.bbox.top, 0.5f); assertEquals(480f, d.bbox.bottom, 0.5f)
     }
+
+    @Test fun nmsKeepsDifferentClasses() {
+        val (b, s, c) = blank()
+        put(b, s, c, 0, 288f, 216f, 352f, 264f, 41, 0.9f)  // cup
+        put(b, s, c, 1, 288f, 216f, 352f, 264f, 39, 0.8f)  // bottle — same box, different class
+        val dets = YoloDecoder().decode(b, s, c, 640, 640, 640)
+        assertEquals(2, dets.size)   // different labels → NMS must keep both
+    }
 }
