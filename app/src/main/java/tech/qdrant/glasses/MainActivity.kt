@@ -174,7 +174,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startStreamer() {
         try {
-            mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080).also { it.start(10_000, false) }
+            mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080, assets).also { it.start(10_000, false) }
             mjpeg?.setPlaceholder(buildPlaceholderJpeg())
             viewModel.attachStreamer(mjpeg!!)
             Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")

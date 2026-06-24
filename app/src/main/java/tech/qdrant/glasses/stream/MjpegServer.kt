@@ -1,9 +1,11 @@
 package tech.qdrant.glasses.stream
 
+import android.content.res.AssetManager
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import java.io.OutputStream
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Minimal MJPEG (multipart/x-mixed-replace) HTTP server.
@@ -17,7 +19,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * gets whatever the most recent frame is (no per-client queue — newest wins, lowest
  * latency, which is what a live demo wants).
  */
-class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
+class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.0.0", port) {
 
     companion object {
         private const val TAG = "MjpegServer"
@@ -30,12 +32,18 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
     }
 
     private val clients = CopyOnWriteArrayList<Client>()
+    private val thumbs = ConcurrentHashMap<String, String>()
 
     @Volatile private var latestJpeg: ByteArray? = null
     // A standby frame shown when no live camera frame is flowing (app idle / not recording).
     // Without it a freshly-connected browser <img> stays blank-white until the first real
     // frame. Set once by the Activity; offerFrame() takes over the moment recording starts.
     @Volatile private var placeholderJpeg: ByteArray? = null
+
+    /** Register a crop thumbnail file for serving via /thumb/<key>. */
+    fun registerThumb(key: String, absPath: String) {
+        thumbs[key] = absPath
+    }
 
     /** Provide a standby JPEG shown to viewers until live frames start (and after they stop). */
     fun setPlaceholder(jpeg: ByteArray) {
@@ -95,19 +103,42 @@ class MjpegServer(port: Int) : NanoHTTPD("0.0.0.0", port) {
     fun eventClientCount(): Int = eventClients.size
 
     override fun serve(session: IHTTPSession): Response {
-        return when (session.uri) {
-            "/stream" -> serveStream()
-            "/events" -> serveEvents()
-            else -> newFixedLengthResponse(
-                Response.Status.OK, "text/html",
-                "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
-                        "<title>Qdrant Glasses</title></head>" +
-                        "<body style='margin:0;background:#0c0c0e;display:flex;flex-direction:column;" +
-                        "align-items:center;justify-content:center;height:100vh;font-family:sans-serif'>" +
-                        "<img src='/stream' style='max-width:100%;max-height:90vh;border-radius:8px'/>" +
-                        "</body></html>"
-            )
+        val uri = session.uri
+        return when {
+            uri == "/stream" -> serveStream()
+            uri == "/events" -> serveEvents()
+            uri == "/" -> serveAsset("web/index.html", "text/html")
+            uri.startsWith("/static/") -> {
+                val name = uri.removePrefix("/static/").substringBefore('?')
+                serveAsset("web/$name", mimeFor(name))
+            }
+            uri.startsWith("/thumb/") -> serveThumb(uri.removePrefix("/thumb/").substringBefore('?'))
+            else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
         }
+    }
+
+    private fun mimeFor(name: String): String = when {
+        name.endsWith(".js")  -> "application/javascript"
+        name.endsWith(".css") -> "text/css"
+        name.endsWith(".html")-> "text/html"
+        name.endsWith(".svg") -> "image/svg+xml"
+        else -> "application/octet-stream"
+    }
+
+    private fun serveAsset(path: String, mime: String): Response = try {
+        val bytes = assets.open(path).use { it.readBytes() }
+        newFixedLengthResponse(Response.Status.OK, mime, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
+    } catch (e: Exception) {
+        Log.w(TAG, "asset missing: $path (${e.message})")
+        newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
+    }
+
+    private fun serveThumb(key: String): Response {
+        val path = thumbs[key] ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "no thumb")
+        val f = java.io.File(path)
+        if (!f.exists()) return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "gone")
+        val bytes = f.readBytes()
+        return newFixedLengthResponse(Response.Status.OK, "image/jpeg", java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
     }
 
     /**
