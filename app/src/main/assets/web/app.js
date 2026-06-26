@@ -71,19 +71,30 @@ function handle(ev) {
 
 function addToRail(key, label) {
   const rail = $("rail");
+  console.log("[hud] addToRail key=", key, "label=", label, "rail?=", !!rail, "children=", rail ? rail.children.length : "N/A");
+  if (!rail) { console.error("[hud] #rail element MISSING"); return; }
   const cell = document.createElement("div");
   cell.className = "cell";
-  cell.innerHTML = `<img src="/thumb/${key}" onerror="this.classList.add('broken')"><span>${label}</span>`;
+  const img = document.createElement("img");
+  img.src = "/thumb/" + key;
+  img.onerror = () => console.warn("[hud] thumb failed to load:", img.src);
+  img.onload = () => console.log("[hud] thumb loaded:", img.src);
+  const span = document.createElement("span");
+  span.textContent = label;
+  cell.appendChild(img); cell.appendChild(span);
   rail.prepend(cell);
+  console.log("[hud] rail now has", rail.children.length, "cells");
   while (rail.children.length > RAIL_CAP) rail.removeChild(rail.lastChild);
 }
 
 function setMode(value, query) {
   $("mode-badge").textContent = value.toUpperCase();
   $("rec").classList.toggle("hidden", value !== "recording");
-  const searching = value === "search";
-  $("search-panel").classList.toggle("hidden", !searching);
-  if (searching) { $("search-query").textContent = query || ""; $("results").innerHTML = "<div class='searching'>searching…</div>"; }
+  // Search panel stays visible in the side column (reference layout); only its content changes.
+  if (value === "search") {
+    $("search-query").textContent = query || "";
+    $("results").innerHTML = "<div class='searching'>searching…</div>";
+  }
 }
 
 function renderResults(items) {
