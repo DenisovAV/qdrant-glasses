@@ -319,6 +319,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         track.bbox.left / frame.width, track.bbox.top / frame.height,
                         track.bbox.width() / frame.width, track.bbox.height() / frame.height)
                     val tid = track.trackId; val label = track.label
+                    // Mark embedded NOW (we're on inferLane). The embed is async (~hundreds of ms);
+                    // if we waited to mark until it returned, confirmedUnembedded() would re-emit this
+                    // same track on every frame in the meantime and launch a duplicate embed per frame
+                    // (~10 dupes per object). Mark up-front to claim it; the cropLane coroutine rolls it
+                    // back via unmarkEmbedded on failure so a failed embed is retried on a later sighting.
+                    trk.markEmbedded(tid)
                     viewModelScope.launch(cropLane) {
                         val embedT0 = System.currentTimeMillis()
                         try {
@@ -327,15 +333,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             val storeT0 = System.currentTimeMillis()
                             store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
                             val storeMs = System.currentTimeMillis() - storeT0
-                            // markEmbedded mutates tracker state → marshal back to inferLane (the
-                            // tracker's only legal thread). Dedup applies only on a successful store.
-                            // Bump the session counter there too (same lane) so the glasses' HUD
-                            // shows objects-indexed-this-session, not a stuck 0.
+                            // Bump the session counter on inferLane (the only lane that touches it),
+                            // only while still Recording (a late embed after stopRecording must not
+                            // bump a dead session) — guarded inside the atomic update.
                             withContext(inferLane) {
-                                trk.markEmbedded(tid)
-                                // Only count + update the HUD while still Recording. A late crop
-                                // embed finishing after stopRecording() must not bump the counter
-                                // on a dead session — guard the increment inside the atomic update.
                                 _state.update {
                                     if (it is AppState.Recording) {
                                         sessionIndexed++
@@ -352,7 +353,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             Log.i(TAG, "object stored: $label (track $tid), total=$count")
                         } catch (e: Throwable) {
                             Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
-                            // not marked embedded → retried on a later sighting
+                            // roll back the up-front mark so this track is retried on a later sighting
+                            withContext(inferLane) { trk.unmarkEmbedded(tid) }
                         } finally {
                             crop.recycle()  // crop is our own pixels; release once encoded/stored
                         }

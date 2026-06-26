@@ -74,4 +74,9 @@ class ObjectTracker(
     fun markEmbedded(trackId: Int) {
         tracks.firstOrNull { it.id == trackId }?.embedded = true
     }
+
+    /** Undo markEmbedded — e.g. when the async embed failed, so the object is retried. */
+    fun unmarkEmbedded(trackId: Int) {
+        tracks.firstOrNull { it.id == trackId }?.embedded = false
+    }
 }
