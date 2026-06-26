@@ -120,6 +120,14 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
 
     fun clientCount(): Int = clients.size
 
+    // NEVER gzip any response. NanoHTTPD's send() calls useGzipWhenAccepted() and re-enables gzip
+    // whenever the client sends Accept-Encoding: gzip (which browsers and fetch always do),
+    // overriding any per-Response setGzipEncoding(false). gzip BUFFERS small inputs and emits
+    // nothing until a block fills, so the browser's fetch/ReadableStream on /events and /stream
+    // received zero chunks — the rail/counter stayed empty in the browser while curl (no
+    // Accept-Encoding) worked. Forcing this false for the whole server fixes both live streams.
+    override fun useGzipWhenAccepted(r: Response?): Boolean = false
+
     /** One open Server-Sent-Events connection (the HUD's /events channel). */
     private val eventClients = CopyOnWriteArrayList<Client>()
 
@@ -204,6 +212,10 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
             "multipart/x-mixed-replace; boundary=$BOUNDARY",
             stream
         )
+        // CRITICAL: never gzip a live stream. NanoHTTPD gzips text-ish responses when the client
+        // sends Accept-Encoding: gzip — gzip BUFFERS small inputs and emits nothing until a block
+        // fills, so the browser's fetch/ReadableStream sees zero chunks and the stream looks dead.
+        // curl works only because it omits Accept-Encoding by default. Disable gzip here.
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "close")
         return resp
@@ -217,6 +229,10 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
         // SSE preamble (a comment line) so the client's reader opens cleanly.
         stream.offer(": connected\n\n".toByteArray())
         val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
+        // CRITICAL: never gzip SSE. text/event-stream is "text/*" so NanoHTTPD gzips it when the
+        // browser sends Accept-Encoding: gzip; gzip buffers the tiny events and the browser's
+        // fetch reader receives nothing. This is THE bug that left the rail/counter empty in the
+        // browser while curl (no Accept-Encoding) worked. Disable gzip so events flush immediately.
         resp.addHeader("Cache-Control", "no-cache, private")
         resp.addHeader("Connection", "keep-alive")
         return resp
