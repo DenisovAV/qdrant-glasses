@@ -38,7 +38,13 @@ sealed class AppState {
 
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
-    companion object { private const val TAG = "GlassesVM" }
+    companion object {
+        private const val TAG = "GlassesVM"
+        // Semantic-dedup threshold: a new crop whose nearest stored neighbor has cosine ≥ this is
+        // treated as a duplicate and not saved. High = only near-identical views dedupe (so two
+        // genuinely different objects of the same class are still both kept). Tune at rehearsal.
+        private const val DEDUP_COSINE = 0.95f
+    }
 
     private var visionEncoder: VisionEncoder? = null
     private var textEncoder: TextEncoder? = null
@@ -90,7 +96,21 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
     }
 
-    fun attachStreamer(s: tech.qdrant.glasses.stream.MjpegServer) { streamer = s }
+    fun attachStreamer(s: tech.qdrant.glasses.stream.MjpegServer) {
+        streamer = s
+        // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
+        // restart. Read objectStore lazily (it's created async); a HUD that connects before the store
+        // exists just gets an empty list and is refilled by live `stored` events as usual.
+        s.railSnapshotProvider = {
+            objectStore?.all()?.map {
+                tech.qdrant.glasses.stream.MjpegServer.RailItem(
+                    key = java.io.File(it.thumbPath).nameWithoutExtension,
+                    label = it.label,
+                    thumbPath = it.thumbPath,
+                )
+            } ?: emptyList()
+        }
+    }
 
     init {
         Log.i(TAG, "init: starting model + store loading")
@@ -130,6 +150,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         namespace = tech.qdrant.glasses.embedding.CropEncoderFactory.namespace,
                     )
                     Log.i(TAG, "object mode ready (backend=${tech.qdrant.glasses.embedding.CropEncoderFactory.backend}, dim=${cropEncoder!!.dim}), objects=${objectStore?.count()}")
+                    // The store is async (~10s); a HUD usually connected before now and got an empty
+                    // rail. Now that objects are loadable, fill any already-connected HUDs' rails.
+                    streamer?.broadcastRailSnapshot()
                 }
 
                 // Pre-warm the ambient ASR model (~290MB) off the main thread so the
@@ -316,9 +339,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 //    safely recycled below even while these cropLane coroutines are still running.
                 for (track in trk.confirmedUnembedded()) {
                     val crop = cropFrom(frame, track.bbox) ?: continue
+                    // Thumb is written LATER (in cropLane, only if this isn't a semantic duplicate),
+                    // so a deduped object never leaves a stray JPEG on disk.
                     val thumbFile = File(objectsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
-                    try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
-                    catch (_: Throwable) {}
                     val bboxStr = "%.3f,%.3f,%.3f,%.3f".format(
                         track.bbox.left / frame.width, track.bbox.top / frame.height,
                         track.bbox.width() / frame.width, track.bbox.height() / frame.height)
@@ -334,6 +357,24 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         try {
                             val vec = enc.encode(crop)
                             val embedMs = System.currentTimeMillis() - embedT0
+
+                            // Semantic dedup: if a near-identical crop is already stored, skip it.
+                            // Track-ID dedup only stops repeats within one continuous sighting; this
+                            // catches the object leaving and re-entering frame (new track) and a second
+                            // pass over the same scene. High threshold so only an almost-identical view
+                            // counts as a dupe — two genuinely different objects (even same class) stay.
+                            // We DON'T unmark the track here: this is "handled, just not stored", not a
+                            // failure, so we must not re-run this search every frame for the same track.
+                            val nearest = store.search(vec, topK = 1).firstOrNull()
+                            if (nearest != null && nearest.score >= DEDUP_COSINE) {
+                                Log.i(TAG, "dedup: skip $label (track $tid) — cos=%.3f matches \"%s\""
+                                    .format(nearest.score, nearest.label))
+                                return@launch
+                            }
+
+                            // Not a dupe → now write the thumb and store.
+                            try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
+                            catch (_: Throwable) {}
                             val storeT0 = System.currentTimeMillis()
                             store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
                             val storeMs = System.currentTimeMillis() - storeT0
