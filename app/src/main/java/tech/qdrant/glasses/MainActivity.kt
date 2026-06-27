@@ -15,8 +15,12 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.drawToBitmap
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import tech.qdrant.glasses.camera.FrameCaptureManager
 import tech.qdrant.glasses.search.VoiceSearchManager
@@ -36,6 +40,7 @@ class MainActivity : AppCompatActivity() {
         private const val LONG_PRESS_MS = 1200L     // hold this long in Idle to start recording
         private const val START_GRACE_MS = 1000L    // ignore stop-releases for this long after start
         private const val DOWN_DEBOUNCE_MS = 250L   // drop a DOWN arriving this soon after the last
+        private const val MIRROR_INTERVAL_MS = 400L  // glasses-UI → /stream snapshot cadence (idle)
     }
 
     private val viewModel: GlassesViewModel by viewModels()
@@ -177,10 +182,48 @@ class MainActivity : AppCompatActivity() {
             mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080, assets).also { it.start(10_000, false) }
             mjpeg?.setPlaceholder(buildPlaceholderJpeg())
             viewModel.attachStreamer(mjpeg!!)
+            startGlassesMirror()
             Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
             Log.i(TAG, "embed endpoint expected on :9000 — desktop: adb reverse tcp:9000 tcp:9000")
         } catch (e: Exception) {
             Log.e(TAG, "MJPEG start failed", e)
+        }
+    }
+
+    /**
+     * Mirror the GLASSES DISPLAY (the on-lens UI the wearer sees) into the MJPEG /stream while
+     * NOT recording, so the browser shows the live app screen instead of a static placeholder.
+     *
+     * The on-glasses UI is a plain Android View tree (no SurfaceView/secure flags, verified), so a
+     * timed [drawToBitmap] snapshot of the left eye captures exactly what the wearer sees — Idle,
+     * Listening (with partial transcript), Processing, and the Results screen. While Recording, the
+     * camera lane owns offerFrame(), so we pause snapshots and let live frames through.
+     *
+     * Threading: drawToBitmap MUST run on the main thread (Views aren't thread-safe); JPEG encode +
+     * offerFrame go to a background dispatcher. Each snapshot bitmap is recycled — we've been bitten
+     * by bitmap leaks → OOM before, so never let one escape.
+     */
+    private fun startGlassesMirror() {
+        lifecycleScope.launch {
+            while (true) {
+                val recording = viewModel.state.value is AppState.Recording
+                val eye = eyeLeft.getChildAt(0)
+                if (!recording && eye != null && eye.width > 0 && eye.height > 0) {
+                    // drawToBitmap on main; hand a software copy off-main for encode + send.
+                    val shot = try { eye.drawToBitmap() } catch (e: Exception) {
+                        Log.w(TAG, "mirror snapshot failed", e); null
+                    }
+                    if (shot != null) {
+                        withContext(Dispatchers.Default) {
+                            val baos = java.io.ByteArrayOutputStream()
+                            shot.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
+                            shot.recycle()
+                            mjpeg?.offerFrame(baos.toByteArray())
+                        }
+                    }
+                }
+                delay(MIRROR_INTERVAL_MS)
+            }
         }
     }
 
