@@ -12,16 +12,25 @@ interface CropEncoder : AutoCloseable {
 }
 
 /**
- * Selects the crop-embedding backend. MAC_ENDPOINT = SigLIP2 on the Mac over USB.
- * CLOUD/ON_DEVICE reserved (not built in v1).
+ * Selects the crop-embedding backend — the single switch for the two demo variants:
+ *  - MAC_ENDPOINT: SigLIP2-base over USB to the Mac (768-dim). Higher fine-grained quality;
+ *    the embedding step is NOT on the glasses.
+ *  - ON_DEVICE:    TinyCLIP-40M on the glasses (512-dim). "Everything on the glasses" is then
+ *    literally true; weaker on small objects / fine attributes.
+ *
+ * The two backends use DIFFERENT dims and DIFFERENT vector spaces, so switching requires a
+ * fresh index (clear the Qdrant Edge collection, e.g. `pm clear`) — never search vectors from
+ * one backend against an index built by the other.
+ *
+ * CLOUD is reserved (not built).
  */
 object CropEncoderFactory {
     enum class Backend { MAC_ENDPOINT, CLOUD, ON_DEVICE }
     val backend = Backend.MAC_ENDPOINT
     fun create(context: Context): CropEncoder = when (backend) {
         Backend.MAC_ENDPOINT -> MacEndpointEncoder()
-        // Fail fast rather than silently serving MAC_ENDPOINT data if these are selected.
+        Backend.ON_DEVICE -> OnDeviceCropEncoder(context)
+        // Fail fast rather than silently serving wrong-space data if this is selected.
         Backend.CLOUD -> TODO("CLOUD crop encoder not implemented in v1")
-        Backend.ON_DEVICE -> TODO("ON_DEVICE crop encoder not implemented in v1")
     }
 }
