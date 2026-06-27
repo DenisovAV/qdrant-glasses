@@ -33,4 +33,14 @@ object CropEncoderFactory {
         // Fail fast rather than silently serving wrong-space data if this is selected.
         Backend.CLOUD -> TODO("CLOUD crop encoder not implemented in v1")
     }
+
+    /**
+     * Stable per-backend name for the ObjectStore collection directory, so each variant keeps
+     * its own index on disk and switching backends needs no data wipe.
+     */
+    val namespace: String get() = when (backend) {
+        Backend.MAC_ENDPOINT -> "mac"
+        Backend.ON_DEVICE -> "ondevice"
+        Backend.CLOUD -> "cloud"
+    }
 }

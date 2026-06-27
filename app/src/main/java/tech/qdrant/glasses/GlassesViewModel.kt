@@ -124,8 +124,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     detector = tech.qdrant.glasses.detect.DetectorFactory.create(app)
                     tracker = tech.qdrant.glasses.detect.ObjectTracker(confirmSightings = 3)
                     cropEncoder = tech.qdrant.glasses.embedding.CropEncoderFactory.create(app)
-                    objectStore = tech.qdrant.glasses.storage.ObjectStore(app, dim = cropEncoder!!.dim)
-                    Log.i(TAG, "object mode ready (detector+tracker+encoder+store), objects=${objectStore?.count()}")
+                    objectStore = tech.qdrant.glasses.storage.ObjectStore(
+                        app,
+                        dim = cropEncoder!!.dim,
+                        namespace = tech.qdrant.glasses.embedding.CropEncoderFactory.namespace,
+                    )
+                    Log.i(TAG, "object mode ready (backend=${tech.qdrant.glasses.embedding.CropEncoderFactory.backend}, dim=${cropEncoder!!.dim}), objects=${objectStore?.count()}")
                 }
 
                 // Pre-warm the ambient ASR model (~290MB) off the main thread so the

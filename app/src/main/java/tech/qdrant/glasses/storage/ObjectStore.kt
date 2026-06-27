@@ -30,8 +30,21 @@ data class ObjectHit(
     val thumbPath: String,
 )
 
-/** Object memory: one Qdrant Edge collection of object crops (dense cosine vectors). */
-class ObjectStore(context: Context, private val dim: Int = OBJECT_DIM) : AutoCloseable {
+/**
+ * Object memory: one Qdrant Edge collection of object crops (dense cosine vectors).
+ *
+ * [namespace] picks the on-disk shard directory, so different crop-encoder backends keep
+ * SEPARATE collections (e.g. "mac" = SigLIP2/768-dim, "ondevice" = TinyCLIP/512-dim). This
+ * lets you flip [tech.qdrant.glasses.embedding.CropEncoderFactory.backend] and rebuild without
+ * clearing data — each variant indexes into its own collection, and you can switch back and
+ * forth comparing search quality without re-scanning. Vectors of one dim never meet a
+ * collection built for another.
+ */
+class ObjectStore(
+    context: Context,
+    private val dim: Int = OBJECT_DIM,
+    namespace: String = "default",
+) : AutoCloseable {
 
     companion object {
         private const val TAG = "ObjectStore"
@@ -42,7 +55,7 @@ class ObjectStore(context: Context, private val dim: Int = OBJECT_DIM) : AutoClo
     private val shard: EdgeShard
 
     init {
-        val dir = File(context.filesDir, "objects_shard").also { it.mkdirs() }.absolutePath
+        val dir = File(context.filesDir, "objects_shard_$namespace").also { it.mkdirs() }.absolutePath
         val config = EdgeConfig(
             vectorData = mapOf(
                 FIELD to VectorDataConfig(
