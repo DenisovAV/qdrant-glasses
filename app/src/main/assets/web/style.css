@@ -1,17 +1,28 @@
 * { box-sizing: border-box; }
-body { margin: 0; background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-ui, sans-serif; }
-#topbar { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid #1d1d22; }
+/* Fit the whole HUD to exactly one screen (demo on a projector — no page scroll).
+   html/body fill the viewport; #grid takes the remaining height under the topbar and
+   never overflows; only the rail scrolls, inside itself. */
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body { background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; }
+#topbar { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid #1d1d22; }
 .brand { letter-spacing: 1px; } .brand b { color: #d6232f; }
 .sep, .sub { color: #8a8a92; } .sub { font-size: 13px; }
 .badge { margin-left: auto; font-size: 12px; padding: 3px 10px; border: 1px solid #2a2a30; border-radius: 12px; color: #b8b8c0; }
-/* Reference layout: wide left column (feed + memory rail), narrow right side (search). */
-#grid { display: grid; grid-template-columns: 1fr 420px; gap: 14px; padding: 14px; align-items: start; }
-#left-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-#side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+/* Reference layout: wide left column (feed + memory rail), narrow right side (search).
+   flex:1 + min-height:0 makes the grid take the leftover viewport height and lets its
+   children shrink (the min-height:0 is the key flexbox bit — without it children refuse
+   to shrink below content size and the page overflows). */
+#grid { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 1fr 420px; gap: 14px; padding: 14px; }
+#left-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; }
+#side { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; }
 .panel { background: #131316; border: 1px solid #1d1d22; border-radius: 10px; padding: 12px; }
 .panel-title { font-size: 12px; letter-spacing: .5px; color: #9a9aa2; margin-bottom: 8px; display: flex; gap: 8px; align-items: center; }
+/* Feed panel keeps its natural height; the memory panel below it takes the rest and scrolls. */
+#feed-panel { flex: 0 0 auto; }
+#memory-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 #feed-wrap { position: relative; line-height: 0; }
-#feed { width: 100%; border-radius: 6px; display: block; }
+/* Cap the video so feed + rail fit one screen; contain keeps aspect, no crop. */
+#feed { width: 100%; max-height: 52vh; object-fit: contain; border-radius: 6px; display: block; }
 #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 .rec { color: #ff5252; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
 .rec .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff5252; animation: blink 1s infinite; }
@@ -19,7 +30,12 @@ body { margin: 0; background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-seri
 .hidden { display: none !important; }
 #ticker { margin-top: 10px; font-size: 12px; color: #8a8a92; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 #ticker b { color: #15c46a; }
-#rail, #results { display: flex; flex-wrap: wrap; gap: 8px; max-height: 70vh; overflow-y: auto; }
+/* Rail fills the leftover height of the memory panel and scrolls INSIDE itself (flex:1 +
+   min-height:0), so growing memory never pushes the page past one screen. Results in the
+   side column likewise scroll within their panel. align-content:flex-start keeps cells
+   packed at the top instead of stretching to fill. */
+#rail { flex: 1 1 auto; min-height: 0; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; overflow-y: auto; }
+#results { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; max-height: calc(100vh - 140px); overflow-y: auto; }
 .cell { width: 92px; }
 .cell img { width: 92px; height: 92px; object-fit: cover; border-radius: 6px; background: #1d1d22; }
 .cell img.broken { visibility: hidden; }
