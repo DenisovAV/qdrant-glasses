@@ -87,6 +87,14 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     // frame. Set once by the Activity; offerFrame() takes over the moment recording starts.
     @Volatile private var placeholderJpeg: ByteArray? = null
 
+    /** One already-stored object, replayed into the rail when a HUD connects. */
+    data class RailItem(val key: String, val label: String, val thumbPath: String)
+
+    // Supplies the objects already in memory so a freshly-connected /events client rebuilds its
+    // rail instead of starting empty (fixes: rail blank after an app/browser restart). Set by the
+    // Activity to point at ObjectStore.all(); each item's thumb is registered for /thumb/<key>.
+    @Volatile var railSnapshotProvider: (() -> List<RailItem>)? = null
+
     /** Register a crop thumbnail file for serving via /thumb/<key>. */
     fun registerThumb(key: String, absPath: String) {
         thumbs[key] = absPath
@@ -143,6 +151,26 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     }
 
     fun eventClientCount(): Int = eventClients.size
+
+    /**
+     * Push the current object memory into EVERY connected HUD's rail. Called once the ObjectStore
+     * finishes its (async, ~10s) init, because a browser typically connects before the store is
+     * ready — at connect time the snapshot is empty, so we resend here to fill those early clients.
+     * Late clients (connecting after the store is ready) get theirs via [serveEvents]'s replay.
+     */
+    fun broadcastRailSnapshot() {
+        val items = railSnapshotProvider?.invoke() ?: return
+        if (items.isEmpty() || eventClients.isEmpty()) return
+        val count = items.size.toLong()
+        for (it in items) thumbs[it.key] = it.thumbPath
+        for (c in eventClients) {
+            if (!c.alive) { eventClients.remove(c); continue }
+            for (it in items) {
+                c.stream.offer("data: ${HudEvents.storedEvent(it.key, it.label, count)}\n\n".toByteArray())
+            }
+        }
+        Log.i(TAG, "broadcast rail snapshot: $count objects → ${eventClients.size} HUD(s)")
+    }
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -228,6 +256,17 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
         Log.i(TAG, "event client connected (${eventClients.size} total)")
         // SSE preamble (a comment line) so the client's reader opens cleanly.
         stream.offer(": connected\n\n".toByteArray())
+        // Replay objects already in memory into THIS client's stream so the rail isn't empty after
+        // an app/browser restart. Registering each thumb makes /thumb/<key> resolve. Sent only to
+        // the connecting client (not broadcast) so reconnecting one HUD doesn't disturb others.
+        railSnapshotProvider?.invoke()?.let { items ->
+            val count = items.size.toLong()
+            for (it in items) {
+                thumbs[it.key] = it.thumbPath
+                stream.offer("data: ${HudEvents.storedEvent(it.key, it.label, count)}\n\n".toByteArray())
+            }
+            Log.i(TAG, "replayed $count stored objects to new HUD")
+        }
         val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
         // CRITICAL: never gzip SSE. text/event-stream is "text/*" so NanoHTTPD gzips it when the
         // browser sends Accept-Encoding: gzip; gzip buffers the tiny events and the browser's

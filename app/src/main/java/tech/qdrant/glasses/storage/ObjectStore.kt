@@ -16,8 +16,10 @@ import tech.qdrant.edge.ffi.Query
 import tech.qdrant.edge.ffi.QueryRequest
 import tech.qdrant.edge.ffi.ScoredPoint
 import tech.qdrant.edge.ffi.ScoringQuery
+import tech.qdrant.edge.ffi.ScrollRequest
 import tech.qdrant.edge.ffi.Vector
 import tech.qdrant.edge.ffi.WithPayload
+import tech.qdrant.edge.ffi.WithVector
 import java.io.File
 import java.util.UUID
 
@@ -110,17 +112,37 @@ class ObjectStore(
         return hits
     }
 
-    private fun toHit(p: ScoredPoint): ObjectHit {
+    private fun toHit(p: ScoredPoint): ObjectHit = toHit(p.id, p.payload ?: "{}", p.score)
+
+    private fun toHit(id: PointId?, payload: String, score: Float = 0f): ObjectHit {
         // A single malformed payload must not crash the whole result list.
-        val o = try { JSONObject(p.payload ?: "{}") } catch (_: Throwable) { JSONObject() }
+        val o = try { JSONObject(payload) } catch (_: Throwable) { JSONObject() }
         return ObjectHit(
-            id = (p.id as? PointId.Uuid)?.value ?: "",
-            score = p.score,
+            id = (id as? PointId.Uuid)?.value ?: "",
+            score = score,
             label = o.optString("label"),
             bbox = o.optString("bbox"),
             timestampMs = o.optLong("timestamp_ms"),
             thumbPath = o.optString("thumb_path"),
         )
+    }
+
+    /**
+     * Every stored object, oldest-first — used to rebuild the browser rail when a HUD connects so a
+     * fresh app/browser start shows the objects already in memory (not an empty rail). Scroll with
+     * no filter and no vectors (payload only), then sort by timestamp so the rail restores in the
+     * order things were seen.
+     */
+    fun all(limit: Int = 500): List<ObjectHit> {
+        val resp = shard.scroll(ScrollRequest(
+            offset = null, limit = limit.toULong(), filter = null,
+            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+            orderBy = null,
+        ))
+        return resp.records
+            .map { rec -> toHit(rec.id, rec.payload ?: "{}") }
+            .sortedBy { it.timestampMs }
+            .also { Log.i(TAG, "all(): ${it.size} stored objects") }
     }
 
     fun count(): Long = shard.count(CountRequest(filter = null, exact = true)).toLong()

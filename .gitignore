@@ -60,3 +60,4 @@ app/src/main/assets/bge/
 # VAD + Moonshine offline ASR models — distribute separately
 app/src/main/assets/vad/
 app/src/main/assets/moonshine/
+_unused_models/
