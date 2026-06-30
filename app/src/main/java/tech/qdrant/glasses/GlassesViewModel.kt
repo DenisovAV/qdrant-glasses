@@ -41,9 +41,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val TAG = "GlassesVM"
         // Semantic-dedup threshold: a new crop whose nearest stored neighbor has cosine ≥ this is
-        // treated as a duplicate and not saved. High = only near-identical views dedupe (so two
-        // genuinely different objects of the same class are still both kept). Tune at rehearsal.
-        private const val DEDUP_COSINE = 0.95f
+        // treated as a duplicate and not saved. SigLIP2 crops of the SAME object across frames
+        // (slightly different angle/bbox) land around 0.88–0.93, not 0.97+, so 0.95 let visible
+        // duplicates (two cups, the same person) slip through. 0.90 catches near-identical views
+        // while still keeping genuinely different objects apart. The dedup-check log prints the
+        // real nearest-neighbor cosine per object so this can be tuned on data at rehearsal.
+        private const val DEDUP_COSINE = 0.90f
     }
 
     private var visionEncoder: VisionEncoder? = null
@@ -366,6 +369,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             // We DON'T unmark the track here: this is "handled, just not stored", not a
                             // failure, so we must not re-run this search every frame for the same track.
                             val nearest = store.search(vec, topK = 1).firstOrNull()
+                            // DIAGNOSTIC: log the nearest-neighbor cosine for EVERY new object (not
+                            // just skips) so we can see the real distribution on a live scene and
+                            // tune DEDUP_COSINE on data instead of guessing.
+                            Log.i(TAG, "dedup-check: $label (track $tid) nearest cos=%.3f (\"%s\") threshold=%.2f"
+                                .format(nearest?.score ?: -1f, nearest?.label ?: "—", DEDUP_COSINE))
                             if (nearest != null && nearest.score >= DEDUP_COSINE) {
                                 Log.i(TAG, "dedup: skip $label (track $tid) — cos=%.3f matches \"%s\""
                                     .format(nearest.score, nearest.label))
