@@ -47,6 +47,8 @@ android {
     androidResources {
         noCompress += "onnx"
         noCompress += "tflite"
+        noCompress += "bin"   // qai-hub QNN context binary — extracted to disk for ORT QNN EP
+        noCompress += "data"  // ONNX external weights (yolov8_det.data) — read from disk by ORT
         noCompress += "txt"   // sherpa tokens.txt is mmap'd natively, must stay uncompressed
         // Keep the legacy whole-frame CLIP weights (~945MB) and the old Kaldi graph OUT of the
         // APK: OBJECTS mode never loads them (crop embedding runs on the Mac), and bundling them
