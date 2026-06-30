@@ -15,8 +15,14 @@ import java.nio.ByteOrder
  * Input [1,640,640,3] f32 NHWC /255. Outputs: boxes[1,8400,4] f32 (xyxy 640-grid),
  * scores[1,8400] f32, class_idx[1,8400] u8. Decoded by YoloDecoder.
  */
-class YoloDetector(context: Context) : ObjectDetector {
-    private val session = LiteRtSession(context, ASSET, Accelerator.GPU).also { Log.i(TAG, "YOLO detector on GPU") }
+class YoloDetector(
+    context: Context,
+    asset: String = ASSET,
+    accelerator: Accelerator = Accelerator.GPU,
+    npuQuantized: Boolean = false,
+) : ObjectDetector {
+    private val session = LiteRtSession(context, asset, accelerator, npuQuantized = npuQuantized)
+        .also { Log.i(TAG, "YOLO detector: asset=$asset accelerator=$accelerator quantized=$npuQuantized") }
     private val decoder = YoloDecoder()
     private val inputBuf = ByteBuffer.allocateDirect(1 * SIZE * SIZE * 3 * 4).order(ByteOrder.nativeOrder())
     private val boxes = Array(1) { Array(N) { FloatArray(4) } }

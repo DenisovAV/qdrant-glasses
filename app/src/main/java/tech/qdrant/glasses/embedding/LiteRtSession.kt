@@ -33,6 +33,10 @@ internal class LiteRtSession(
     context: Context,
     assetPath: String,
     accelerator: Accelerator,
+    // HTP precision for the NPU path. FP16 is correct for an fp32 .tflite run as fp16; a model
+    // that's already INT8-quantized (qai-hub w8a8) MUST use QUANTIZED — forcing FP16 on it makes
+    // QNN validate every Conv2d as fp16 and fail with op-validation 3110 (incorrect Value -1).
+    npuQuantized: Boolean = false,
 ) : AutoCloseable {
     private val delegate: Delegate?       // null for CPU (XNNPACK, no delegate)
     val interpreter: Interpreter
@@ -41,7 +45,7 @@ internal class LiteRtSession(
         delegate = when (accelerator) {
             Accelerator.CPU -> null
             Accelerator.GPU -> createGpuDelegate(assetPath)
-            Accelerator.NPU -> createNpuDelegate(context, assetPath)
+            Accelerator.NPU -> createNpuDelegate(context, assetPath, npuQuantized)
         }
         val options = Interpreter.Options().apply {
             if (delegate != null) {
@@ -66,16 +70,19 @@ internal class LiteRtSession(
         return GpuDelegate(opts)
     }
 
-    private fun createNpuDelegate(context: Context, assetPath: String): QnnDelegate {
+    private fun createNpuDelegate(context: Context, assetPath: String, quantized: Boolean): QnnDelegate {
         // checkCapability is conservative (like GPU's CompatibilityList, which reported
         // false yet the delegate worked). Try creating the HTP delegate directly; the
         // constructor throws if it genuinely can't init, and we fail-fast on that.
         val fp16Ok = QnnDelegate.checkCapability(QnnDelegate.Capability.HTP_RUNTIME_FP16)
-        Log.i(TAG, "QNN HTP fp16Capability=$fp16Ok version=${QnnDelegate.getVersion()?.joinToString(".")} — attempting HTP anyway")
-        // fp32 .tflite run as fp16 on the Hexagon HTP — no INT8 quantization needed.
+        // QUANTIZED for an INT8 (w8a8) model, FP16 for an fp32 model run as fp16. Using FP16 on an
+        // INT8 graph fails op-validation 3110 on every Conv2d (QNN reads int8 weights as fp16).
+        val precision = if (quantized) QnnDelegate.Options.HtpPrecision.HTP_PRECISION_QUANTIZED
+                        else QnnDelegate.Options.HtpPrecision.HTP_PRECISION_FP16
+        Log.i(TAG, "QNN HTP precision=$precision fp16Capability=$fp16Ok version=${QnnDelegate.getVersion()?.joinToString(".")} — attempting HTP")
         val opts = QnnDelegate.Options().apply {
             setBackendType(QnnDelegate.Options.BackendType.HTP_BACKEND)
-            setHtpPrecision(QnnDelegate.Options.HtpPrecision.HTP_PRECISION_FP16)
+            setHtpPrecision(precision)
             setHtpPerformanceMode(QnnDelegate.Options.HtpPerformanceMode.HTP_PERFORMANCE_BURST)
             setHtpUseConvHmx(QnnDelegate.Options.HtpUseConvHmx.HTP_CONV_HMX_ON)
             setSkelLibraryDir(context.applicationInfo.nativeLibraryDir)
