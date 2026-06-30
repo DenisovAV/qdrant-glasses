@@ -19,14 +19,32 @@ import java.util.concurrent.LinkedBlockingQueue
  * notify-only — it doesn't push bytes). With a queue, each message → one read → one chunk → one
  * immediate socket flush, for one byte or one megabyte, any number of writers.
  */
-private class MessageStream : InputStream() {
+private class MessageStream(private val maxQueued: Int = 4) : InputStream() {
     private val queue = LinkedBlockingQueue<ByteArray>()
     private val poison = ByteArray(0)
     @Volatile private var closed = false
     private var current: ByteArray? = null
     private var pos = 0
+    // True once writes have backed up past maxQueued — i.e. the reader (the browser, via
+    // NanoHTTPD's socket) has stopped draining, so this client is effectively dead.
+    @Volatile var stalled = false; private set
 
-    fun offer(bytes: ByteArray) { if (!closed) queue.offer(bytes) }
+    /**
+     * Offer one message. The queue is BOUNDED: a live MJPEG/SSE viewer only ever needs the
+     * freshest frame, so if the reader falls behind (slow client, or a browser tab that closed
+     * without us getting a socket exception) we DROP the oldest queued messages instead of growing
+     * the queue forever. Unbounded growth was the bug: dead clients accumulated multi-MB backlogs,
+     * broadcast wasted time writing into them, and live viewers got stuttery bursts of stale frames
+     * (or nothing). Past a hard cap we mark the client stalled so the server can evict it.
+     */
+    fun offer(bytes: ByteArray) {
+        if (closed) return
+        queue.offer(bytes)
+        // Drop oldest while over the soft cap (keep the stream fresh, not backlogged).
+        while (queue.size > maxQueued) { queue.poll() ?: break }
+        // Way over even after dropping → reader is gone; flag for eviction.
+        if (queue.size >= maxQueued) stalled = true
+    }
 
     override fun read(): Int {
         val one = ByteArray(1); val n = read(one, 0, 1)
@@ -121,7 +139,14 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
         // One whole multipart part = one queued message = one contiguous chunk.
         val part = header + jpeg + "\r\n".toByteArray()
         for (c in clients) {
-            if (!c.alive) { clients.remove(c); continue }
+            // Evict clients whose reader has gone (socket closed without us getting an exception):
+            // their queue backs up and stays stalled. Without this they accumulate forever and
+            // slow/clog the broadcast for live viewers — the cause of "stream stops showing".
+            if (!c.alive || c.stream.stalled) {
+                c.stream.close(); clients.remove(c)
+                Log.i(TAG, "evicted dead stream client (${clients.size} left)")
+                continue
+            }
             c.stream.offer(part)
         }
     }
@@ -221,7 +246,9 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
      * a writer thread feeds. Each registered Client receives [offerFrame] writes.
      */
     private fun serveStream(): Response {
-        val stream = MessageStream()
+        // Small queue: a video viewer only wants the freshest frame, so drop-oldest keeps latency
+        // low and a stalled (closed) client is detected fast and evicted.
+        val stream = MessageStream(maxQueued = 3)
         val client = Client(stream)
         clients.add(client)
         Log.i(TAG, "client connected (${clients.size} total)")
@@ -250,7 +277,10 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     }
 
     private fun serveEvents(): Response {
-        val stream = MessageStream()
+        // Larger queue: SSE events (stored/tick) are rare but must NOT be dropped (a dropped
+        // `stored` loses an object from the rail). A big cap means stalled only trips on a truly
+        // dead reader, not on a burst of legitimate events.
+        val stream = MessageStream(maxQueued = 256)
         val client = Client(stream)
         eventClients.add(client)
         Log.i(TAG, "event client connected (${eventClients.size} total)")
