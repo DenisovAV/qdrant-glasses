@@ -30,13 +30,27 @@ class YoloQnnDetector(context: Context) : ObjectDetector {
     private val session: OrtSession
     private val decoder = YoloDecoder()
     private val classInt = IntArray(N)
+    // Per-inference latency goes to a FILE, not logcat: the RayNeo camera floods logcat
+    // (IS_ALGO) and evicts our lines before they can be read. The file survives that, the
+    // recording hang, and buffer rotation — just `adb pull` / `run-as cat` it afterwards.
+    private val latencyFile = File(context.filesDir, "npu_latency.csv")
+    private var nInfer = 0
+    private var sumInfer = 0L
 
     init {
-        val onnx = extractAsset(context, "$DIR/$ONNX")
-        // The QDQ .onnx references its weights as ONNX external data (yolov8_det.data) by a path
-        // relative to the .onnx, so it must be extracted alongside it.
-        extractAsset(context, "$DIR/$DATA")
+        latencyFile.appendText("=== session ${System.currentTimeMillis()} backend=QNN_HTP ===\n")
         val ctxCache = File(context.filesDir, "yolov8_det_ctx.onnx")
+        val cached = ctxCache.exists()
+        val modelPath = if (cached) {
+            // Second+ launch: load the already-compiled EPContext model directly (it carries the
+            // SoC-correct HTP context; ORT errors if you ask it to RE-generate over an existing one).
+            ctxCache.absolutePath
+        } else {
+            // First launch: extract the SoC-agnostic QDQ model (+ its external .data weights) and
+            // let ORT compile the HTP context for THIS SoC, caching it to ctxCache.
+            extractAsset(context, "$DIR/$DATA")
+            extractAsset(context, "$DIR/$ONNX").absolutePath
+        }
         val opts = OrtSession.SessionOptions().apply {
             // QNN HTP backend. backend_path resolves libQnnHtp.so from the app's native lib dir
             // (qnn-runtime 2.45, incl. the V73 HTP skel for the AR1).
@@ -44,29 +58,37 @@ class YoloQnnDetector(context: Context) : ObjectDetector {
                 "backend_path" to "libQnnHtp.so",
                 "htp_performance_mode" to "burst",
             ))
-            // Compile the HTP context on-device (SoC-correct) and cache it next to the model, so
-            // only the first launch pays the graph-preparation cost.
-            addConfigEntry("ep.context_enable", "1")
-            addConfigEntry("ep.context_file_path", ctxCache.absolutePath)
+            if (!cached) {
+                // Generate + cache the on-device context only when we don't have one yet.
+                addConfigEntry("ep.context_enable", "1")
+                addConfigEntry("ep.context_file_path", ctxCache.absolutePath)
+            }
         }
         val t0 = System.currentTimeMillis()
-        session = env.createSession(onnx.absolutePath, opts)
-        Log.i(TAG, "YOLO-QNN session created (ORT QNN EP, on-device HTP compile) in ${System.currentTimeMillis() - t0}ms")
+        session = env.createSession(modelPath, opts)
+        Log.i(TAG, "YOLO-QNN session created (cached=$cached) in ${System.currentTimeMillis() - t0}ms")
     }
 
     override fun detect(bitmap: Bitmap): List<Detection> {
         val resized = Bitmap.createScaledBitmap(bitmap, SIZE, SIZE, true)
-        // NHWC uint8: raw RGB bytes, 0..255 (graph normalizes internally).
+        // NCHW uint8: the qai-hub QDQ graph expects [1,3,640,640] (channel-planar), raw 0..255
+        // (the graph bakes /255). Fill three contiguous planes R,G,B — NOT interleaved RGB.
         val px = IntArray(SIZE * SIZE).also { resized.getPixels(it, 0, SIZE, 0, 0, SIZE, SIZE) }
-        val buf = ByteBuffer.allocateDirect(SIZE * SIZE * 3)
-        for (p in px) {
-            buf.put((p shr 16 and 0xFF).toByte()); buf.put((p shr 8 and 0xFF).toByte()); buf.put((p and 0xFF).toByte())
-        }
+        val plane = SIZE * SIZE
+        val buf = ByteBuffer.allocateDirect(3 * plane)
+        for (p in px) buf.put((p shr 16 and 0xFF).toByte())   // R plane
+        for (p in px) buf.put((p shr 8 and 0xFF).toByte())    // G plane
+        for (p in px) buf.put((p and 0xFF).toByte())          // B plane
         buf.rewind()
-        val input = OnnxTensor.createTensor(env, buf, longArrayOf(1, SIZE.toLong(), SIZE.toLong(), 3), OnnxJavaType.UINT8)
+        val input = OnnxTensor.createTensor(env, buf, longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong()), OnnxJavaType.UINT8)
         val t0 = System.currentTimeMillis()
         val out = input.use { session.run(mapOf("image" to it)) }
-        Log.i(TAG, "YOLO-QNN inference=${System.currentTimeMillis() - t0}ms")
+        val ms = System.currentTimeMillis() - t0
+        // Persist to file (logcat-proof) with a running summary every 10 frames.
+        nInfer++; sumInfer += ms
+        latencyFile.appendText("$ms\n")
+        if (nInfer % 10 == 0) latencyFile.appendText("# n=$nInfer mean=${sumInfer / nInfer}ms (last=$ms)\n")
+        Log.i(TAG, "YOLO-QNN inference=${ms}ms")
 
         return out.use { r ->
             // Dequantize uint8 outputs: real = (u8 - zero_point) * scale.
