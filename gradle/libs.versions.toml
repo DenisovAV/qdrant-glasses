@@ -5,10 +5,10 @@ coreKtx = "1.18.0"
 appcompat = "1.7.1"
 lifecycle = "2.10.0"
 camerax = "1.5.3"
-onnxruntime = "1.25.0"
+onnxruntime = "1.26.0"   # -qnn variant (superset of -android): bundles the QNN EP for HTP
 coroutines = "1.11.0"
 litert = "1.4.0"
-qnn = "2.34.0"
+qnn = "2.45.0"           # must be >= the QAIRT version of the qai-hub context binary (2.45)
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -20,7 +20,7 @@ activity-ktx = { group = "androidx.activity", name = "activity-ktx", version = "
 camerax-core = { group = "androidx.camera", name = "camera-core", version.ref = "camerax" }
 camerax-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "camerax" }
 camerax-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
-onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
+onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android-qnn", version.ref = "onnxruntime" }
 coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
 litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version.ref = "litert" }
