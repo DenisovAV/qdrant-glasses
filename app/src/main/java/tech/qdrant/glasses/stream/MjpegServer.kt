@@ -84,7 +84,7 @@ private class MessageStream(private val maxQueued: Int = 4) : InputStream() {
  * gets whatever the most recent frame is (no per-client queue — newest wins, lowest
  * latency, which is what a live demo wants).
  */
-class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.0.0", port) {
+class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.0.0", port), FrameSink {
 
     companion object {
         private const val TAG = "MjpegServer"
@@ -111,10 +111,13 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     // Supplies the objects already in memory so a freshly-connected /events client rebuilds its
     // rail instead of starting empty (fixes: rail blank after an app/browser restart). Set by the
     // Activity to point at ObjectStore.all(); each item's thumb is registered for /thumb/<key>.
-    @Volatile var railSnapshotProvider: (() -> List<RailItem>)? = null
+    @Volatile override var railSnapshotProvider: (() -> List<RailItem>)? = null
+
+    /** FrameSink: stop the NanoHTTPD server (symmetry with MjpegPusher.close()). */
+    override fun close() = stop()
 
     /** Register a crop thumbnail file for serving via /thumb/<key>. */
-    fun registerThumb(key: String, absPath: String) {
+    override fun registerThumb(key: String, absPath: String) {
         thumbs[key] = absPath
     }
 
@@ -126,7 +129,7 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     }
 
     /** Called from the camera thread with each freshly-encoded JPEG frame. */
-    fun offerFrame(jpeg: ByteArray) {
+    override fun offerFrame(jpeg: ByteArray) {
         latestJpeg = jpeg
         broadcast(jpeg)
     }
@@ -165,7 +168,7 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     private val eventClients = CopyOnWriteArrayList<Client>()
 
     /** Fan out one SSE event line to every connected HUD. Safe to call from any thread. */
-    fun pushEvent(line: String) {
+    override fun pushEvent(line: String) {
         if (eventClients.isEmpty()) return
         // One complete SSE event = one queued message = one HTTP chunk = one socket flush.
         val payload = "data: $line\n\n".toByteArray()
@@ -183,7 +186,7 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
      * ready — at connect time the snapshot is empty, so we resend here to fill those early clients.
      * Late clients (connecting after the store is ready) get theirs via [serveEvents]'s replay.
      */
-    fun broadcastRailSnapshot() {
+    override fun broadcastRailSnapshot() {
         val items = railSnapshotProvider?.invoke() ?: return
         if (items.isEmpty() || eventClients.isEmpty()) return
         val count = items.size.toLong()

@@ -118,12 +118,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // frame and the queue never builds. AtomicBoolean = the camera thread sets, the lane clears.
     private val streamBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val inferBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-    @Volatile private var streamer: tech.qdrant.glasses.stream.MjpegServer? = null  // set by MainActivity
+    @Volatile private var streamer: tech.qdrant.glasses.stream.FrameSink? = null  // set by MainActivity
     private val objectsDir by lazy {
         File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
     }
 
-    fun attachStreamer(s: tech.qdrant.glasses.stream.MjpegServer) {
+    fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) {
         streamer = s
         // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
         // restart. Read objectStore lazily (it's created async); a HUD that connects before the store
@@ -147,7 +147,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 store = VisionMemoryStore(app)
                 Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
                 store?.dumpAll()  // DIAG: log the whole base at startup
-                retriever = store?.let { tech.qdrant.glasses.search.MomentRetriever(it) }
+                // retriever is created below (OBJECTS mode) with the encoder's own vision gate;
+                // LEGACY mode falls back to the default gate.
 
                 // The whole-frame CLIP encoders (~945MB of on-device weights) are LEGACY-only:
                 // in OBJECTS mode crop embedding runs on the Mac (SigLIP2), so these models are
@@ -176,6 +177,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         dim = cropEncoder!!.dim,
                         namespace = tech.qdrant.glasses.embedding.CropEncoderFactory.namespace,
                     )
+                    // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
+                    // TinyCLIP have different cosine scales, so an absent query returns nothing).
+                    retriever = store?.let {
+                        tech.qdrant.glasses.search.MomentRetriever(it, visionMinScore = cropEncoder!!.visionMinScore)
+                    }
                     Log.i(TAG, "object mode ready (backend=${tech.qdrant.glasses.embedding.CropEncoderFactory.backend}, dim=${cropEncoder!!.dim}), objects=${objectStore?.count()}")
                     // The store is async (~10s); a HUD usually connected before now and got an empty
                     // rail. Now that objects are loadable, fill any already-connected HUDs' rails.

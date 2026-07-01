@@ -179,14 +179,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun startStreamer() {
         try {
-            mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080, assets).also { it.start(10_000, false) }
-            mjpeg?.setPlaceholder(buildPlaceholderJpeg())
-            viewModel.attachStreamer(mjpeg!!)
-            startGlassesMirror()
-            Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
-            Log.i(TAG, "embed endpoint expected on :9000 — desktop: adb reverse tcp:9000 tcp:9000")
+            if (tech.qdrant.glasses.Config.WIRELESS) {
+                // Wireless: push frames OUTBOUND to the Mac relay (no cable). No on-glasses server,
+                // no UI mirror/placeholder (those are MjpegServer niceties) — the relay serves the
+                // browser from the pushed frames.
+                val pusher = tech.qdrant.glasses.stream.MjpegPusher(tech.qdrant.glasses.Config.MAC_BASE_URL)
+                viewModel.attachStreamer(pusher)
+                Log.i(TAG, "WIRELESS: pushing frames to ${tech.qdrant.glasses.Config.MAC_BASE_URL}/push_frame ; open ${tech.qdrant.glasses.Config.MAC_BASE_URL}/stream")
+            } else {
+                mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080, assets).also { it.start(10_000, false) }
+                mjpeg?.setPlaceholder(buildPlaceholderJpeg())
+                viewModel.attachStreamer(mjpeg!!)
+                startGlassesMirror()
+                Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
+            }
+            Log.i(TAG, "embed endpoint expected on :9000")
         } catch (e: Exception) {
-            Log.e(TAG, "MJPEG start failed", e)
+            Log.e(TAG, "streamer start failed", e)
         }
     }
 
