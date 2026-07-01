@@ -26,6 +26,14 @@ class MacEndpointEncoder(
     override val dim: Int = 768,
     private val baseUrl: String = "http://localhost:9000",
 ) : CropEncoder {
+    // Calibrated for SigLIP2 (Mac endpoint) — its text↔image cosine scale is ~2× LOWER than
+    // TinyCLIP's. Measured on a room frame: relevant text (laptop) ~0.10, "a room" ~0.08;
+    // irrelevant (kitchen when absent) ~0.015, elephant ~0.02. Object CROPS (denser than a full
+    // frame) score higher than that — a real crop match ("my phone"→cell phone) logged ~0.14.
+    // 0.12 sits above the irrelevant floor and below real crop matches, so an absent query
+    // ("kitchen") returns nothing instead of surfacing the nearest junk. TinyCLIP's 0.20 gate was
+    // for a different modality-gap scale and rejected everything on SigLIP2.
+    override val visionMinScore: Float = 0.12f
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)

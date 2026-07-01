@@ -24,6 +24,9 @@ import android.graphics.Bitmap
  */
 class OnDeviceCropEncoder(context: Context) : CropEncoder {
     override val dim: Int = 512
+    // TinyCLIP-40M's original calibration (see MomentRetriever history): real-but-small object
+    // ~0.20, background ~0.19. Kept as this model's gate.
+    override val visionMinScore: Float = 0.20f
 
     private val vision = TinyClipVisionEncoder(context)
     private val text = TinyClipTextEncoder(context)

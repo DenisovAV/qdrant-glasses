@@ -20,7 +20,12 @@ data class MomentCard(
  * image is an instant, a transcript covers its utterance), count as one moment with
  * summed strength (double-confirmed ranks first). See [spansOverlap].
  */
-class MomentRetriever(private val store: VisionMemoryStore) {
+class MomentRetriever(
+    private val store: VisionMemoryStore,
+    // Per-encoder vision gate (see CropEncoder.visionMinScore). Defaults to the TinyCLIP value for
+    // LEGACY mode / callers that don't supply one.
+    private val visionMinScore: Float = VISION_MIN_SCORE,
+) {
     companion object {
         private const val TAG = "MomentRetriever"
         // Calibrated from on-device DIAG (TinyCLIP-40M). Absolute CLIP cosine sits in
@@ -41,7 +46,7 @@ class MomentRetriever(private val store: VisionMemoryStore) {
         val heard = store.searchHeard(bgeVec)
         val keyword = store.keywordHits(queryText)
 
-        val visionOk = vision.firstOrNull()?.let { it.score >= VISION_MIN_SCORE } == true
+        val visionOk = vision.firstOrNull()?.let { it.score >= visionMinScore } == true
         val heardMargin = if (heard.size >= 2) heard[0].score - heard[1].score
                           else if (heard.size == 1) 1f else 0f
         val heardOk = keyword.isNotEmpty() || heardMargin >= HEARD_MIN_MARGIN
@@ -50,7 +55,7 @@ class MomentRetriever(private val store: VisionMemoryStore) {
 
         val cards = ArrayList<MomentCard>()
         if (visionOk) {
-            vision.takeWhile { it.score >= VISION_MIN_SCORE }.take(MAX_CARDS).forEach {
+            vision.takeWhile { it.score >= visionMinScore }.take(MAX_CARDS).forEach {
                 cards.add(MomentCard(it.frame, fromVision = true, fromHeard = false, strength = it.score))
             }
         }
