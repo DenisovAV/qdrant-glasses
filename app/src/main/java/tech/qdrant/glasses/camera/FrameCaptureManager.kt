@@ -38,10 +38,10 @@ class FrameCaptureManager(
     private val forceSaveIntervalMs = 12000L
     // Once past the interval gate, don't pay toBitmap+scale at full camera fps while
     // Sampling cap. Was 150ms (~6 FPS) when detection cost ~149ms on the GPU. With the NPU
-    // detector at ~8ms, detect+draw+compress is ~30ms, so 50ms (~20 FPS) gives a smooth stream
+    // detector at ~8ms, detect+draw+compress is ~30ms, so 33ms (~30 FPS) gives a smooth stream
     // without starving the inferLane.
     private var lastAnalysisMs = 0L
-    private val analyzeIntervalMs = 50L
+    private val analyzeIntervalMs = 33L
 
     // Baseline for dedupe = the last ACCEPTED frame. Comparing against the last
     // ANALYZED frame degenerates to frame-vs-33ms-ago (always similar), so a gradual
