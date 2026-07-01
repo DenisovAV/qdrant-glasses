@@ -31,7 +31,7 @@ class FrameCaptureManager(
         // Rotation applied to the sensor frame. The sensor is 640x480 landscape; the demo wants
         // landscape on the projector, so we do NOT honor the sensor's 90° rotation. 0 = native
         // landscape; set 180 if the image is upside-down.
-        private const val STREAM_ROTATION = 0
+        private const val STREAM_ROTATION = 90
     }
 
     private val executor = Executors.newSingleThreadExecutor()
