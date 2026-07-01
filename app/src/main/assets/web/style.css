@@ -12,7 +12,8 @@ body { background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-u
    flex:1 + min-height:0 makes the grid take the leftover viewport height and lets its
    children shrink (the min-height:0 is the key flexbox bit — without it children refuse
    to shrink below content size and the page overflows). */
-#grid { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 1fr 420px; gap: 14px; padding: 14px; }
+/* Left column (feed + memory) narrower; right SEARCH column wider so results have room. */
+#grid { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 1fr 560px; gap: 14px; padding: 14px; }
 #left-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; }
 #side { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; }
 .panel { background: #131316; border: 1px solid #1d1d22; border-radius: 10px; padding: 12px; }
@@ -20,9 +21,11 @@ body { background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-u
 /* Feed panel keeps its natural height; the memory panel below it takes the rest and scrolls. */
 #feed-panel { flex: 0 0 auto; }
 #memory-panel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-#feed-wrap { position: relative; line-height: 0; }
-/* Cap the video so feed + rail fit one screen; contain keeps aspect, no crop. */
-#feed { width: 100%; max-height: 52vh; object-fit: contain; border-radius: 6px; display: block; }
+/* Fixed-height frame so the portrait video can FILL it (cover crops the overflow). */
+#feed-wrap { position: relative; line-height: 0; height: 52vh; overflow: hidden; border-radius: 6px; }
+/* The RayNeo camera shoots portrait; cover fills the wide feed panel edge-to-edge and crops the
+   top/bottom of the portrait frame (center of the scene is kept) instead of letterboxing it. */
+#feed { width: 100%; height: 100%; object-fit: cover; display: block; }
 #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 .rec { color: #ff5252; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
 .rec .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff5252; animation: blink 1s infinite; }
