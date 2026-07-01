@@ -51,6 +51,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // (~30-40ms → smooth ~25 FPS). Height is derived from the frame's aspect ratio at runtime.
         private const val STREAM_WIDTH = 640
         private const val STREAM_QUALITY = 60
+        // Fraction of the bbox size to add as context padding on EACH side when cropping an object
+        // (0.20 = grow the box 20% left/right/top/bottom). Enough context to disambiguate the object
+        // and give the embedder scene cues, without letting the background dominate the crop.
+        private const val CROP_PADDING = 0.20f
     }
 
     private var visionEncoder: VisionEncoder? = null
@@ -107,6 +111,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // boxes. Immutable List + @Volatile ref = lock-free. Boxes lag the video by ~1 detect cycle
     // (~110ms); the tracker smooths positions so the lag is imperceptible.
     @Volatile private var latestDetections: List<tech.qdrant.glasses.detect.Detection> = emptyList()
+    // Backpressure: the camera pushes ~30 FPS but streamLane/inferLane are slower. Without a gate,
+    // every camera frame launches a coroutine and they QUEUE UP unboundedly → the browser sees
+    // frames seconds old (latency creeps to ~1s) and detection lags. These flags drop a new frame
+    // for a lane that's still busy with the previous one, so each lane always works the FRESHEST
+    // frame and the queue never builds. AtomicBoolean = the camera thread sets, the lane clears.
+    private val streamBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val inferBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var streamer: tech.qdrant.glasses.stream.MjpegServer? = null  // set by MainActivity
     private val objectsDir by lazy {
         File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
@@ -330,7 +341,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
         // STREAM LANE: encode THIS frame with the LAST-known boxes, right now, independent of the
         // detect pipeline. Downscale to STREAM_WIDTH + JPEG Q60 keeps encode ~30-40ms → ~25 FPS.
-        streamer?.let { s ->
+        // Backpressure: if the previous frame is still encoding, DROP this one (recycle + skip) so
+        // frames don't queue and the stream stays real-time instead of drifting seconds behind.
+        val streamHandled = streamer != null && streamBusy.compareAndSet(false, true)
+        if (streamHandled) {
+            val s = streamer!!
             val dets = latestDetections   // volatile read — at most ~1 detect cycle stale
             viewModelScope.launch(streamLane) {
                 try {
@@ -353,13 +368,22 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     } finally { if (scaled !== streamCopy) scaled.recycle() }
                 } catch (e: Throwable) {
                     Log.w(TAG, "stream frame failed: ${e.message}")
-                } finally { streamCopy.recycle() }
+                } finally { streamCopy.recycle(); streamBusy.set(false) }
             }
-        } ?: streamCopy.recycle()   // no streamer → don't leak the copy
+        } else {
+            streamCopy.recycle()   // no streamer, or lane busy → drop this frame's copy
+        }
 
         // DETECT LANE: full detect → track → publish boxes → embed, at its own (slower) rate.
+        // Backpressure (same as stream): if detection is still busy, drop this frame so the tracker
+        // always sees the freshest frame and no backlog builds up behind a slow detect.
+        if (!inferBusy.compareAndSet(false, true)) { frame.recycle(); return }
         viewModelScope.launch(inferLane) {
             try {
+                // Re-check state HERE, not just at onObjectFrame entry. When the user stops
+                // recording, a frame already dispatched here would keep detecting and STORING objects
+                // in Idle. Bail before touching the tracker/store (finally still recycles + releases).
+                if (_state.value !is AppState.Recording) return@launch
                 val t0 = System.currentTimeMillis()
                 val detections = try { det.detect(frame) } catch (e: Throwable) {
                     Log.e(TAG, "detect failed", e); return@launch
@@ -448,15 +472,22 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 frame.recycle()  // our snapshot; crops were already copied out above
+                inferBusy.set(false)  // release the lane so the next camera frame can be detected
             }
         }
     }
 
     private fun cropFrom(frame: Bitmap, box: android.graphics.RectF): Bitmap? {
-        val l = box.left.toInt().coerceIn(0, frame.width - 1)
-        val t = box.top.toInt().coerceIn(0, frame.height - 1)
-        val r = box.right.toInt().coerceIn(l + 1, frame.width)
-        val b = box.bottom.toInt().coerceIn(t + 1, frame.height)
+        // Grow the box by CROP_PADDING of its own size on each side so the crop carries some
+        // surrounding CONTEXT (a cup on a table, not a cup in a void). Context helps both the
+        // SigLIP/CLIP embedding (richer scene semantics → better search) and the rail thumbnail
+        // (more recognizable). Clamped to the frame so the padding never runs off the edge.
+        val padX = box.width() * CROP_PADDING
+        val padY = box.height() * CROP_PADDING
+        val l = (box.left - padX).toInt().coerceIn(0, frame.width - 1)
+        val t = (box.top - padY).toInt().coerceIn(0, frame.height - 1)
+        val r = (box.right + padX).toInt().coerceIn(l + 1, frame.width)
+        val b = (box.bottom + padY).toInt().coerceIn(t + 1, frame.height)
         return try { Bitmap.createBitmap(frame, l, t, r - l, b - t) } catch (_: Throwable) { null }
     }
 
