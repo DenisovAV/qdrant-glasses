@@ -28,6 +28,10 @@ class FrameCaptureManager(
         // sensor (~1728x2304); downscale to this so detection/stream/crops stay fast. ~960 keeps
         // enough detail for detection + a crisp browser stream while the JPEG stays tens of KB.
         private const val MAX_EDGE = 960
+        // Rotation applied to the sensor frame. The sensor is 640x480 landscape; the demo wants
+        // landscape on the projector, so we do NOT honor the sensor's 90° rotation. 0 = native
+        // landscape; set 180 if the image is upside-down.
+        private const val STREAM_ROTATION = 0
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -60,8 +64,21 @@ class FrameCaptureManager(
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             cameraProvider = future.get()
+            // Ask the camera for a SMALL resolution via the modern ResolutionSelector (the
+            // deprecated setTargetResolution was ignored by RayNeo → full 4MP sensor, whose
+            // toBitmap+rotate+scale is the pipeline bottleneck). ResolutionStrategy with
+            // FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER lets camera2 pick the nearest supported size
+            // ≤640×480 if it honors it; if RayNeo still forces 4MP, analyzeFrame's downscale still
+            // handles it (just slower). Measured via the `camera: raw=` log.
+            val resSelector = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    androidx.camera.core.resolutionselector.ResolutionStrategy(
+                        Size(640, 480),
+                        androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                    )
+                ).build()
             val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(640, 480))
+                .setResolutionSelector(resSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
             analysis.setAnalyzer(executor) { proxy -> analyzeFrame(proxy) }
@@ -104,10 +121,15 @@ class FrameCaptureManager(
             }
             lastAnalysisMs = nowMs
             val raw = proxy.toBitmap()
-            val rotation = proxy.imageInfo.rotationDegrees
-            if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} rotation=$rotation passthrough=$passthrough")
-            // RayNeo ignores setTargetResolution and delivers the FULL sensor (~1728x2304 = 4MP).
-            // Rotating a 4MP bitmap and THEN scaling it was two full 4MP pixel passes (~300ms/frame),
+            // The sensor delivers 640x480 (landscape). CameraX's imageInfo.rotationDegrees=90 would
+            // rotate it to 480x640 PORTRAIT — but the demo needs LANDSCAPE (wide) for the projector.
+            // So we force STREAM_ROTATION instead of honoring the sensor rotation. 0 = keep the
+            // native landscape frame; flip to 180 if it comes out upside-down. (The AR glasses aren't
+            // a phone, so the sensor's "up" is arbitrary — pick what looks right in the browser.)
+            val rotation = STREAM_ROTATION
+            if (framesAnalyzed == 1) Log.i(TAG, "camera: raw=${raw.width}x${raw.height} sensorRot=${proxy.imageInfo.rotationDegrees} usedRot=$rotation passthrough=$passthrough")
+            // ResolutionSelector now yields a small 640x480 frame, so rotate+scale is cheap. Fold
+            // rotate + any downscale into ONE Matrix pass (was two full-frame passes on the 4MP sensor),
             // which capped the whole pipeline at ~2 FPS. Fold rotate + downscale into ONE Matrix so a
             // single createBitmap produces the small, upright frame directly — one pass, no 4MP
             // intermediate. That's the real FPS win (the sensor-size processing was the bottleneck,
