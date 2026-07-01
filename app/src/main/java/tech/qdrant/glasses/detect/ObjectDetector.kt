@@ -23,7 +23,7 @@ interface ObjectDetector : AutoCloseable {
  */
 object DetectorFactory {
     enum class Backend { MEDIAPIPE, YOLO, YOLO_NPU, YOLO_QNN_EP }
-    val backend = Backend.YOLO_QNN_EP      // int8 YOLO on Hexagon NPU, 8ms median (14x faster than GPU) — fast enough to drive a smooth high-FPS stream.
+    val backend = Backend.YOLO_QNN_EP
     fun create(context: Context): ObjectDetector = when (backend) {
         Backend.MEDIAPIPE -> MediaPipeDetector(context)
         Backend.YOLO -> YoloDetector(context)
