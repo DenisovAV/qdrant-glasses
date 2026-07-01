@@ -47,6 +47,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // while still keeping genuinely different objects apart. The dedup-check log prints the
         // real nearest-neighbor cosine per object so this can be tuned on data at rehearsal.
         private const val DEDUP_COSINE = 0.90f
+        // Browser stream is downscaled from the ~960px detection frame to keep JPEG encode cheap
+        // (~30-40ms → smooth ~25 FPS). Height is derived from the frame's aspect ratio at runtime.
+        private const val STREAM_WIDTH = 640
+        private const val STREAM_QUALITY = 60
     }
 
     private var visionEncoder: VisionEncoder? = null
@@ -94,6 +98,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // inferLane (the tracker's only legal thread) after a successful embed+upsert.
     @OptIn(ExperimentalCoroutinesApi::class)
     private val cropLane = Dispatchers.IO.limitedParallelism(1)
+    // Stream lane: JPEG-compress + offerFrame ONLY, decoupled from detection so the video stream
+    // runs at its own (fast) rate instead of being serialized behind the ~110ms detect pipeline on
+    // inferLane. CPU-bound (Default, not IO), single-thread to keep MJPEG frames in order.
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val streamLane = Dispatchers.Default.limitedParallelism(1)
+    // Latest detections, published by inferLane after trk.update, read by streamLane to overlay
+    // boxes. Immutable List + @Volatile ref = lock-free. Boxes lag the video by ~1 detect cycle
+    // (~110ms); the tracker smooths positions so the lag is imperceptible.
+    @Volatile private var latestDetections: List<tech.qdrant.glasses.detect.Detection> = emptyList()
     @Volatile private var streamer: tech.qdrant.glasses.stream.MjpegServer? = null  // set by MainActivity
     private val objectsDir by lazy {
         File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
@@ -304,12 +317,47 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val store = objectStore ?: return
         val enc = cropEncoder ?: return
         // The camera RECYCLES `bitmap` the instant this callback returns (KEEP_ONLY_LATEST +
-        // proxy.close() in the analyzer's finally). All real work runs async on inferLane, by
-        // which time `bitmap` is dead → "Can't copy a recycled bitmap". Take an independent
-        // snapshot synchronously here and own it ourselves; recycle the snapshot when done.
-        val frame = try { bitmap.copy(Bitmap.Config.ARGB_8888, false) } catch (e: Throwable) {
-            Log.w(TAG, "frame snapshot failed: ${e.message}"); return
+        // proxy.close() in the analyzer's finally). Take TWO independent snapshots synchronously:
+        // one owned by the stream lane, one by the detect lane. Each lane recycles its own — no
+        // bitmap is shared across threads. streamCopy is mutable (true) so we can draw boxes onto
+        // the downscaled copy in place.
+        val streamCopy = try { bitmap.copy(Bitmap.Config.ARGB_8888, true) } catch (e: Throwable) {
+            Log.w(TAG, "streamCopy failed: ${e.message}"); return
         }
+        val frame = try { bitmap.copy(Bitmap.Config.ARGB_8888, false) } catch (e: Throwable) {
+            streamCopy.recycle(); Log.w(TAG, "frame snapshot failed: ${e.message}"); return
+        }
+
+        // STREAM LANE: encode THIS frame with the LAST-known boxes, right now, independent of the
+        // detect pipeline. Downscale to STREAM_WIDTH + JPEG Q60 keeps encode ~30-40ms → ~25 FPS.
+        streamer?.let { s ->
+            val dets = latestDetections   // volatile read — at most ~1 detect cycle stale
+            viewModelScope.launch(streamLane) {
+                try {
+                    val aspect = streamCopy.height.toFloat() / streamCopy.width
+                    val sh = maxOf(1, (STREAM_WIDTH * aspect).toInt())
+                    // createScaledBitmap(...,true) filter=true gives a smooth, MUTABLE bitmap we own.
+                    val scaled = Bitmap.createScaledBitmap(streamCopy, STREAM_WIDTH, sh, true)
+                    try {
+                        // Boxes are in the ORIGINAL frame's pixel space; scale them to the stream size.
+                        val sx = STREAM_WIDTH.toFloat() / streamCopy.width
+                        val sy = sh.toFloat() / streamCopy.height
+                        val scaledDets = if (dets.isEmpty()) dets else dets.map {
+                            it.copy(bbox = android.graphics.RectF(
+                                it.bbox.left * sx, it.bbox.top * sy, it.bbox.right * sx, it.bbox.bottom * sy))
+                        }
+                        tech.qdrant.glasses.stream.drawBoxesInPlace(scaled, scaledDets)
+                        val baos = java.io.ByteArrayOutputStream()
+                        scaled.compress(Bitmap.CompressFormat.JPEG, STREAM_QUALITY, baos)
+                        s.offerFrame(baos.toByteArray())
+                    } finally { if (scaled !== streamCopy) scaled.recycle() }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "stream frame failed: ${e.message}")
+                } finally { streamCopy.recycle() }
+            }
+        } ?: streamCopy.recycle()   // no streamer → don't leak the copy
+
+        // DETECT LANE: full detect → track → publish boxes → embed, at its own (slower) rate.
         viewModelScope.launch(inferLane) {
             try {
                 val t0 = System.currentTimeMillis()
@@ -318,25 +366,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val detMs = System.currentTimeMillis() - t0
                 val tracks = trk.update(detections)
+                latestDetections = detections   // publish for the stream lane (volatile write)
                 Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
-                // 1) Stream the frame with boxes BAKED IN. Drawing boxes on-device into the JPEG
-                //    is reliable — the browser renders MJPEG natively, no SSE/canvas needed (the
-                //    SSE box channel didn't deliver through NanoHTTPD's chunked pipe in browsers).
-                streamer?.let { s ->
-                    try {
-                        // drawBoxes returns a NEW mutable bitmap — recycle it after compress or it
-                        // leaks ~2-3MB/sec (every streamed frame) → OOM.
-                        val boxed = tech.qdrant.glasses.stream.drawBoxes(frame, detections)
-                        try {
-                            val baos = java.io.ByteArrayOutputStream()
-                            boxed.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                            s.offerFrame(baos.toByteArray())
-                        } finally { boxed.recycle() }
-                    } catch (e: Throwable) { Log.w(TAG, "stream frame failed: ${e.message}") }
-                }
-
-                // 2) Embed newly-confirmed objects on cropLane (network — must not block detection).
+                // Embed newly-confirmed objects on cropLane (network — must not block detection).
                 //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
                 //    cropFrom() copies pixels out of `frame` synchronously, so the snapshot can be
                 //    safely recycled below even while these cropLane coroutines are still running.

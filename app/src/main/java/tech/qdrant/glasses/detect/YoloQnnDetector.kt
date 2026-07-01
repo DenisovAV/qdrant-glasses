@@ -30,6 +30,10 @@ class YoloQnnDetector(context: Context) : ObjectDetector {
     private val session: OrtSession
     private val decoder = YoloDecoder()
     private val classInt = IntArray(N)
+    // Pre-allocated dequant outputs — reused every frame instead of allocating 8400 FloatArray(4)
+    // objects per call (that was heavy GC churn at ~9 detect/sec). Mirrors YoloDetector's approach.
+    private val boxesF = Array(1) { Array(N) { FloatArray(4) } }
+    private val scoresF = Array(1) { FloatArray(N) }
     // Per-inference latency goes to a FILE, not logcat: the RayNeo camera floods logcat
     // (IS_ALGO) and evicts our lines before they can be read. The file survives that, the
     // recording hang, and buffer rotation — just `adb pull` / `run-as cat` it afterwards.
@@ -95,10 +99,18 @@ class YoloQnnDetector(context: Context) : ObjectDetector {
             val boxesU8 = (r.get("boxes").get().value as Array<Array<ByteArray>>)[0]      // [8400][4]
             val scoresU8 = (r.get("scores").get().value as Array<ByteArray>)[0]           // [8400]
             val clsU8 = (r.get("class_idx").get().value as Array<ByteArray>)[0]           // [8400]
-            val boxes = Array(1) { Array(N) { i -> FloatArray(4) { j -> ((boxesU8[i][j].toInt() and 0xFF) - BOX_ZP) * BOX_SCALE } } }
-            val scores = Array(1) { FloatArray(N) { i -> (scoresU8[i].toInt() and 0xFF) * SCORE_SCALE } }
-            for (i in 0 until N) classInt[i] = clsU8[i].toInt() and 0xFF
-            decoder.decode(boxes, scores, classInt, modelSize = SIZE, frameW = bitmap.width, frameH = bitmap.height)
+            // Fill pre-allocated arrays (no per-frame heap churn).
+            for (i in 0 until N) {
+                val b = boxesU8[i]
+                val bf = boxesF[0][i]
+                bf[0] = ((b[0].toInt() and 0xFF) - BOX_ZP) * BOX_SCALE
+                bf[1] = ((b[1].toInt() and 0xFF) - BOX_ZP) * BOX_SCALE
+                bf[2] = ((b[2].toInt() and 0xFF) - BOX_ZP) * BOX_SCALE
+                bf[3] = ((b[3].toInt() and 0xFF) - BOX_ZP) * BOX_SCALE
+                scoresF[0][i] = (scoresU8[i].toInt() and 0xFF) * SCORE_SCALE
+                classInt[i] = clsU8[i].toInt() and 0xFF
+            }
+            decoder.decode(boxesF, scoresF, classInt, modelSize = SIZE, frameW = bitmap.width, frameH = bitmap.height)
         }
     }
 
