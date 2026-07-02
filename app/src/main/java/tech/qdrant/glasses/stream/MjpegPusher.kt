@@ -65,10 +65,43 @@ class MjpegPusher(private val relayBaseUrl: String) : FrameSink {
         })
     }
 
-    // Phase 2 (full HUD relay): push thumb JPEGs + replay the rail on connect. The spike proves
-    // video first, so these are no-ops for now.
-    override fun registerThumb(key: String, absPath: String) {}
-    override fun broadcastRailSnapshot() {}
+    /**
+     * Ship the crop JPEG bytes to the Mac so it can serve /thumb/<key> (the Mac has no access to
+     * the glasses filesystem — [absPath] is only valid on-device). Fire-and-forget, same as
+     * offerFrame/pushEvent: a dropped thumb just leaves one rail card broken, not fatal.
+     */
+    override fun registerThumb(key: String, absPath: String) {
+        val bytes = try { java.io.File(absPath).readBytes() } catch (e: Exception) {
+            Log.w(TAG, "registerThumb: read failed for $absPath: ${e.message}"); return
+        }
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("thumb", "$key.jpg", bytes.toRequestBody(jpegType))
+            .build()
+        val req = Request.Builder().url("$relayBaseUrl/push_thumb/$key").post(body).build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { Log.w(TAG, "push_thumb: ${e.message}") }
+            override fun onResponse(call: Call, response: Response) { response.close() }
+        })
+    }
+
+    /**
+     * The glasses are a CLIENT — they can't know when a browser opens /events on the Mac. So
+     * instead of replaying per-connection (which is the Mac's job, since only it has connections),
+     * push the whole known rail ONCE via ordinary `stored` events. The Mac remembers the latest
+     * `stored` event per id (a dict, not just a fan-out queue) and replays that dict to every new
+     * /events client — see embed_server.py's _rail_state. Called once from GlassesViewModel.init
+     * after objectStore finishes loading (~10s), which is the only place the full set is known.
+     */
+    override fun broadcastRailSnapshot() {
+        val items = railSnapshotProvider?.invoke() ?: return
+        if (items.isEmpty()) return
+        val count = items.size.toLong()
+        for (it in items) {
+            registerThumb(it.key, it.thumbPath)
+            pushEvent(HudEvents.storedEvent(it.key, it.label, count))
+        }
+        Log.i(TAG, "broadcastRailSnapshot: pushed $count objects to relay")
+    }
 
     override fun close() {
         client.dispatcher.executorService.shutdown()
