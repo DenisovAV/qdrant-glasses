@@ -50,6 +50,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: FrameCaptureManager
     private lateinit var voiceManager: VoiceSearchManager
     private var mjpeg: tech.qdrant.glasses.stream.MjpegServer? = null
+    // The active frame sink (MjpegServer wired, or MjpegPusher wireless). The UI mirror pushes here.
+    private var sink: tech.qdrant.glasses.stream.FrameSink? = null
 
     // Button gesture model (RayNeo action button, keyCode 289).
     //   IDLE:      long press — fires WHILE HELD at LONG_PRESS_MS (the original feel; you
@@ -180,19 +182,22 @@ class MainActivity : AppCompatActivity() {
     private fun startStreamer() {
         try {
             if (tech.qdrant.glasses.Config.WIRELESS) {
-                // Wireless: push frames OUTBOUND to the Mac relay (no cable). No on-glasses server,
-                // no UI mirror/placeholder (those are MjpegServer niceties) — the relay serves the
-                // browser from the pushed frames.
-                val pusher = tech.qdrant.glasses.stream.MjpegPusher(tech.qdrant.glasses.Config.MAC_BASE_URL)
-                viewModel.attachStreamer(pusher)
-                Log.i(TAG, "WIRELESS: pushing frames to ${tech.qdrant.glasses.Config.MAC_BASE_URL}/push_frame ; open ${tech.qdrant.glasses.Config.MAC_BASE_URL}/stream")
+                // Wireless: push frames OUTBOUND to the Mac relay (no cable). The glasses aren't a
+                // server; the Mac relay serves the browser from the pushed frames.
+                sink = tech.qdrant.glasses.stream.MjpegPusher(tech.qdrant.glasses.Config.MAC_BASE_URL)
+                viewModel.attachStreamer(sink!!)
+                Log.i(TAG, "WIRELESS: pushing frames to ${tech.qdrant.glasses.Config.MAC_BASE_URL}/push_frame ; open ${tech.qdrant.glasses.Config.MAC_BASE_URL}/")
             } else {
                 mjpeg = tech.qdrant.glasses.stream.MjpegServer(8080, assets).also { it.start(10_000, false) }
                 mjpeg?.setPlaceholder(buildPlaceholderJpeg())
+                sink = mjpeg
                 viewModel.attachStreamer(mjpeg!!)
-                startGlassesMirror()
                 Log.i(TAG, "MJPEG on :8080 — desktop: adb forward tcp:8080 tcp:8080 ; open http://localhost:8080/stream")
             }
+            // Mirror the glasses UI into the stream while Idle — in BOTH modes now (wireless pushes
+            // the mirror to the Mac relay, so the browser shows the live app screen, not a static
+            // placeholder, before recording starts).
+            startGlassesMirror()
             Log.i(TAG, "embed endpoint expected on :9000")
         } catch (e: Exception) {
             Log.e(TAG, "streamer start failed", e)
@@ -227,7 +232,7 @@ class MainActivity : AppCompatActivity() {
                             val baos = java.io.ByteArrayOutputStream()
                             shot.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
                             shot.recycle()
-                            mjpeg?.offerFrame(baos.toByteArray())
+                            sink?.offerFrame(baos.toByteArray())
                         }
                     }
                 }

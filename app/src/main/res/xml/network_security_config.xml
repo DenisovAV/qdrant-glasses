@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- The crop-embedding endpoint is the user's own Mac, reached over USB via
-         `adb reverse tcp:9000` as http://localhost:9000 — plain HTTP, no TLS.
-         Android 9+ blocks cleartext by default, so allow it for loopback only.
-         Everything else stays cleartext-forbidden. -->
+    <!-- The Mac serves crop-embedding AND (wireless mode) the MJPEG/HUD relay over plain HTTP.
+         WIRED: localhost via `adb reverse tcp:9000`. WIRELESS: the Mac's LAN IP on the demo
+         router (FRITZ!Box, 192.168.178.x). Android 9+ blocks cleartext by default; allow it for
+         loopback + the demo LAN. Everything else stays cleartext-forbidden. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>
+        <!-- Mac LAN IP for the wireless demo (see Config.MAC_BASE_URL). -->
+        <domain includeSubdomains="false">192.168.1.100</domain>
     </domain-config>
 </network-security-config>
