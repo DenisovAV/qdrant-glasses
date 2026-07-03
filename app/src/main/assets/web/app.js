@@ -5,41 +5,39 @@ let frameDim = [640, 480];
 let tracks = new Map(); // id -> {cur:{x,y,w,h}, target:{x,y,w,h}, label}
 
 console.log("[hud] app.js loaded; feed=", !!feed, "overlay=", !!overlay, "ctx=", !!octx);
+// DEBUG: mirror browser steps to the Mac so they're inspectable in /tmp/relay_debug.log
+// (the browser console isn't readable from the shell). Fire-and-forget.
+function blog(msg) { try { fetch("/browser_log", { method: "POST", body: msg }); } catch (e) {} }
+blog("app.js loaded, feed=" + !!feed);
 
-// Read /events as a fetch stream and parse the SSE "data: ...\n\n" frames ourselves.
-// EventSource on some browsers buffers NanoHTTPD's chunked pipe and never fires onmessage,
-// even though the bytes are flowing — fetch+ReadableStream delivers chunks as they arrive.
+// Consume events by POLLING short plain fetches (the reliable path). A long-lived streaming
+// fetch/EventSource to the uvicorn relay never resolves in some browsers (the promise hangs with
+// bytes flowing), but SHORT fetches resolve fine — same reason the video works as a plain <img>,
+// not a JS stream. So we GET /poll?since=<cursor> every 500ms: it returns all events after the
+// cursor (and the full rail snapshot on the first poll), then we advance the cursor.
 let _evCount = 0;
-async function streamEvents() {
-  while (true) {
-    try {
-      const resp = await fetch("/events", { headers: { "Accept": "text/event-stream" } });
-      console.log("[hud] /events connected, status", resp.status);
-      const reader = resp.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) { console.warn("[hud] /events closed, reconnecting"); break; }
-        buf += dec.decode(value, { stream: true });
-        let i;
-        while ((i = buf.indexOf("\n\n")) >= 0) {
-          const frame = buf.slice(0, i); buf = buf.slice(i + 2);
-          const line = frame.split("\n").find((l) => l.startsWith("data:"));
-          if (!line) continue;                       // skip ": connected" comments
-          const json = line.slice(5).trim();
-          try {
-            const ev = JSON.parse(json);
-            if (_evCount++ < 5 || ev.t !== "boxes") console.log("[hud] event", ev.t, ev.count != null ? "count=" + ev.count : "");
-            handle(ev);
-          } catch (err) { console.error("[hud] handle failed:", err, "raw:", json); }
-        }
+let _pollCursor = -1;   // -1 = first poll → server also replays the rail snapshot
+async function pollEvents() {
+  try {
+    const r = await fetch("/poll?since=" + _pollCursor + "&t=" + Date.now());
+    if (r.ok) {
+      const data = await r.json();
+      if (_pollCursor === -1) blog("poll: first poll ok, " + data.events.length + " events");
+      _pollCursor = data.cursor;
+      for (const line of data.events) {
+        try {
+          const ev = JSON.parse(line);
+          if (_evCount++ < 5 || ev.t !== "boxes") console.log("[hud] event", ev.t, ev.count != null ? "count=" + ev.count : "");
+          if (ev.t !== "boxes") blog("event t=" + ev.t + (ev.label ? " label=" + ev.label : "") + (ev.count != null ? " count=" + ev.count : ""));
+          handle(ev);
+        } catch (err) { console.error("[hud] parse failed:", err, "raw:", line); }
       }
-    } catch (err) { console.warn("[hud] /events error, retrying in 1s", err); }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
+    }
+  } catch (err) { console.warn("[hud] poll error", err); }
+  setTimeout(pollEvents, 500);
 }
-streamEvents();
+blog("pollEvents starting");
+pollEvents();
 
 function handle(ev) {
   if (ev.t === "boxes") {
