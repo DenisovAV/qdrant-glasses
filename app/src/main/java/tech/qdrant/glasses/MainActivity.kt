@@ -328,9 +328,22 @@ class MainActivity : AppCompatActivity() {
                     is AppState.Idle -> showInBothEyes {
                         IdleView(this@MainActivity).also { it.updateCount(viewModel.frameCount()) }
                     }
-                    is AppState.Recording -> showInBothEyes {
-                        RecordingView(this@MainActivity).also {
-                            it.update(state.indexed, state.elapsedSeconds)
+                    is AppState.Recording -> {
+                        // Recording ticks every second; recreating both eye views each tick
+                        // churned hwui display lists until RenderThread hit a native crash
+                        // (SIGSEGV in RenderNode::deleteDisplayList after ~50 min). Reuse the
+                        // live views like Listening does.
+                        val leftView = eyeLeft.getChildAt(0)
+                        val rightView = eyeRight.getChildAt(0)
+                        if (leftView is RecordingView && rightView is RecordingView) {
+                            leftView.update(state.indexed, state.elapsedSeconds)
+                            rightView.update(state.indexed, state.elapsedSeconds)
+                        } else {
+                            showInBothEyes {
+                                RecordingView(this@MainActivity).also {
+                                    it.update(state.indexed, state.elapsedSeconds)
+                                }
+                            }
                         }
                     }
                     is AppState.Listening -> {
