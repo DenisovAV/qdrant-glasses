@@ -51,4 +51,18 @@ object CropEncoderFactory {
         Backend.ON_DEVICE -> "ondevice"
         Backend.CLOUD -> "cloud"
     }
+
+    /**
+     * Minimum cosine score for a voice-search hit to be shown. Text→image cosine distributions
+     * differ per encoder (modality gap), so the gate is per-backend. SigLIP2 calibration from
+     * rehearsal: absent objects → 0.084 ("keys") … 0.099 ("cup"); present → 0.118 ("what is
+     * laptop") … 0.128 ("laptop"). The scale is compressed and the bands nearly touch — 0.11 is
+     * the midpoint of the observed gap. Phrasing shifts scores (~0.01): rehearse the exact stage
+     * queries. Below the gate = "nothing found", not junk cards.
+     */
+    val searchGate: Float get() = when (backend) {
+        Backend.MAC_ENDPOINT -> 0.08f
+        Backend.ON_DEVICE -> 0.25f
+        Backend.CLOUD -> 0.12f
+    }
 }

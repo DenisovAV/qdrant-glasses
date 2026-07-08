@@ -55,6 +55,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // (0.20 = grow the box 20% left/right/top/bottom). Enough context to disambiguate the object
         // and give the embedder scene cues, without letting the background dominate the crop.
         private const val CROP_PADDING = 0.20f
+        // The THUMBNAIL gets much wider context than the embed crop: the memory card should show
+        // WHERE the object is (the cup on that corner of the desk), not a tight cutout. Kept
+        // separate from CROP_PADDING so the search-score calibration (gates, dedup) is unaffected.
+        private const val THUMB_PADDING = 1.20f
     }
 
     private var visionEncoder: VisionEncoder? = null
@@ -405,6 +409,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 //    safely recycled below even while these cropLane coroutines are still running.
                 for (track in trk.confirmedUnembedded()) {
                     val crop = cropFrom(frame, track.bbox) ?: continue
+                    // Separate, wider crop for the visible thumbnail (see THUMB_PADDING). Copied
+                    // out of `frame` synchronously, same as `crop`.
+                    val thumbCrop = cropFrom(frame, track.bbox, THUMB_PADDING) ?: crop
                     // Thumb is written LATER (in cropLane, only if this isn't a semantic duplicate),
                     // so a deduped object never leaves a stray JPEG on disk.
                     val thumbFile = File(objectsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
@@ -431,7 +438,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             // counts as a dupe — two genuinely different objects (even same class) stay.
                             // We DON'T unmark the track here: this is "handled, just not stored", not a
                             // failure, so we must not re-run this search every frame for the same track.
+                            val dedupT0 = System.currentTimeMillis()
                             val nearest = store.search(vec, topK = 1).firstOrNull()
+                            val dedupSearchMs = System.currentTimeMillis() - dedupT0
                             // DIAGNOSTIC: log the nearest-neighbor cosine for EVERY new object (not
                             // just skips) so we can see the real distribution on a live scene and
                             // tune DEDUP_COSINE on data instead of guessing.
@@ -443,8 +452,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                                 return@launch
                             }
 
-                            // Not a dupe → now write the thumb and store.
-                            try { FileOutputStream(thumbFile).use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
+                            // Not a dupe → now write the thumb (wide-context crop) and store.
+                            try { FileOutputStream(thumbFile).use { thumbCrop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
                             catch (_: Throwable) {}
                             val storeT0 = System.currentTimeMillis()
                             store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
@@ -466,7 +475,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             streamer?.registerThumb(key, thumbFile.absolutePath)
                             streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.storedEvent(key, label, count))
                             streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.tickEvent(detMs, embedMs, storeMs, count))
-                            Log.i(TAG, "object stored: $label (track $tid), total=$count")
+                            Log.i(TAG, "object stored: $label (track $tid), total=$count (embed=${embedMs}ms qsearch=${dedupSearchMs}ms upsert=${storeMs}ms)")
                         } catch (e: Throwable) {
                             Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
                             // roll back the up-front mark so this track is retried on a later sighting
@@ -483,13 +492,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun cropFrom(frame: Bitmap, box: android.graphics.RectF): Bitmap? {
-        // Grow the box by CROP_PADDING of its own size on each side so the crop carries some
+    private fun cropFrom(frame: Bitmap, box: android.graphics.RectF, padding: Float = CROP_PADDING): Bitmap? {
+        // Grow the box by `padding` of its own size on each side so the crop carries some
         // surrounding CONTEXT (a cup on a table, not a cup in a void). Context helps both the
         // SigLIP/CLIP embedding (richer scene semantics → better search) and the rail thumbnail
         // (more recognizable). Clamped to the frame so the padding never runs off the edge.
-        val padX = box.width() * CROP_PADDING
-        val padY = box.height() * CROP_PADDING
+        val padX = box.width() * padding
+        val padY = box.height() * padding
         val l = (box.left - padX).toInt().coerceIn(0, frame.width - 1)
         val t = (box.top - padY).toInt().coerceIn(0, frame.height - 1)
         val r = (box.right + padX).toInt().coerceIn(l + 1, frame.width)
@@ -529,13 +538,44 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             if (appMode == AppMode.OBJECTS) {
                 val cropEnc = cropEncoder ?: run { _state.value = AppState.Idle; return@launch }
                 val objStore = objectStore ?: run { _state.value = AppState.Idle; return@launch }
+                // Strip question boilerplate before embedding: SigLIP2's text→crop scale is
+                // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
+                // enough to dip under the gate. Search on the object phrase, display the full query.
+                val searchPhrase = query.lowercase()
+                    .replace(Regex("^(where\\s+(is|are)|what\\s+(is|are)|when\\s+(is|are)|that\\s+is|this\\s+is|find|show\\s+me|look\\s+for|search\\s+for)\\s+"), "")
+                    .replace(Regex("^(my|the|a|an)\\s+"), "")
+                    .trim().ifBlank { query }
+                if (searchPhrase != query.lowercase()) Log.i(TAG, "query normalized: \"$query\" → \"$searchPhrase\"")
                 val t0 = System.currentTimeMillis()
-                val qvec = try { cropEnc.encodeText(query) } catch (e: Throwable) {
+                val qvec = try { cropEnc.encodeText(searchPhrase) } catch (e: Throwable) {
                     Log.e(TAG, "query embed failed", e); _state.value = AppState.Idle; return@launch
                 }
                 val encMs = System.currentTimeMillis() - t0
-                val hits = objStore.search(qvec, topK = 5)
-                Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms hits=${hits.size}")
+                val searchT0 = System.currentTimeMillis()
+                // Per-encoder score gate: without it an absent-object query ("keys" when no keys
+                // were ever stored) surfaces junk top-5 around 0.09 — worse than saying "nothing".
+                val gate = tech.qdrant.glasses.embedding.CropEncoderFactory.searchGate
+                val allHits = objStore.search(qvec, topK = 5)
+                // Hybrid acceptance: cosine gate OR detector-label word match. SigLIP2's text→crop
+                // scale is compressed AND environment-sensitive (the same "cell phone" query scored
+                // 0.117 at home but 0.095-0.106 at the venue against a darker/farther crop), so an
+                // absolute gate alone drops real matches. If a query word literally names the stored
+                // label ("phone" ⊂ "cell phone"), the object is what was asked for — show it.
+                val qTokens = searchPhrase.split(Regex("\\W+")).filter { it.length > 2 }.toSet()
+                fun labelMatch(label: String): Boolean {
+                    val lTokens = label.lowercase().split(Regex("\\W+")).filter { it.length > 2 }
+                    // Equality or containment either way: "smartphone" ⊃ "phone" ⊂ "cell phone",
+                    // "cups" ⊃ "cup". Min length 4 for containment to avoid junk substrings.
+                    return lTokens.any { lt ->
+                        qTokens.any { qt ->
+                            qt == lt || (lt.length >= 4 && qt.contains(lt)) || (qt.length >= 4 && lt.contains(qt))
+                        }
+                    }
+                }
+                val hits = allHits.filter { it.score >= gate || labelMatch(it.label) }
+                val searchMs = System.currentTimeMillis() - searchT0
+                Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms search=${searchMs}ms " +
+                    "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
                 val resultItems = hits.map { h ->
                     val key = java.io.File(h.thumbPath).nameWithoutExtension
                     streamer?.registerThumb(key, h.thumbPath)
