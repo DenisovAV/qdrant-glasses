@@ -55,7 +55,8 @@ android {
         // bloats the APK to ~1.8GB → ~94s flaky USB installs. The files stay on disk (gitignored),
         // so flipping appMode back to LEGACY only needs them re-included here. bge/ and detect/
         // models are matched by path and stay in. Pattern segments are colon-separated globs.
-        ignoreAssetsPattern = "clip-vision-int8.onnx:clip-text-int8.onnx:clip-vision.tflite:clip-text.tflite:tinyclip-int8.onnx:model"
+        // tinyclip-int8.onnx (~86MB) is IN: Backend.ON_DEVICE needs it on the glasses.
+        ignoreAssetsPattern = "clip-vision-int8.onnx:clip-text-int8.onnx:clip-vision.tflite:clip-text.tflite:model"
     }
 
     packaging {
