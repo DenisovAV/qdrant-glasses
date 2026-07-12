@@ -24,6 +24,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import tech.qdrant.glasses.camera.FrameCaptureManager
 import tech.qdrant.glasses.search.VoiceSearchManager
+import tech.qdrant.glasses.ui.ErrorView
 import tech.qdrant.glasses.ui.IdleView
 import tech.qdrant.glasses.ui.ListeningView
 import tech.qdrant.glasses.ui.LoadingView
@@ -362,6 +363,7 @@ class MainActivity : AppCompatActivity() {
                             it.showCards(state.query, state.cards)
                         }
                     }
+                    is AppState.Error -> showInBothEyes { ErrorView(this@MainActivity, state.reason) }
                 }
             }
         }

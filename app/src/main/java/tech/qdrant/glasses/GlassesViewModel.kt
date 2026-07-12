@@ -34,6 +34,9 @@ sealed class AppState {
     data class Listening(val partial: String = "") : AppState()
     data class Processing(val query: String) : AppState()
     data class Results(val query: String, val cards: List<tech.qdrant.glasses.search.MomentCard>) : AppState()
+    /** Startup failed (model/store/detector init). Shown on the lens so a failure is visible
+     *  instead of a permanent Loading hang. `reason` aids on-device diagnosis. */
+    data class Error(val reason: String) : AppState()
 }
 
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
@@ -200,8 +203,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
                 Log.i(TAG, "init: all components ready → Idle")
                 _state.value = AppState.Idle
-            } catch (e: Exception) {
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // normal scope teardown — never show it as a failure
+            } catch (e: Throwable) {
+                // Catch Throwable, not Exception: a missing HTP/vendor .so surfaces as an
+                // UnsatisfiedLinkError (an Error, not an Exception) and would otherwise kill the
+                // coroutine silently, leaving the app stuck on Loading forever with no signal.
                 Log.e(TAG, "init: FAILED", e)
+                _state.value = AppState.Error(e.message ?: e.javaClass.simpleName)
             }
         }
     }

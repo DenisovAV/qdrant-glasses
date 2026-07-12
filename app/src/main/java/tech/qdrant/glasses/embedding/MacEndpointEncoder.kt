@@ -65,7 +65,15 @@ class MacEndpointEncoder(
             val payload = (resp.body ?: throw IOException("embed: empty response body")).string()
             try {
                 val arr: JSONArray = JSONObject(payload).getJSONArray("vector")
-                return FloatArray(arr.length()) { arr.getDouble(it).toFloat() }
+                val vec = FloatArray(arr.length()) { arr.getDouble(it).toFloat() }
+                // Guard the vector DB before this vector can be upserted or used for dedup search.
+                // A truncated response, or a swapped/restarted model on the Mac (different dim), or
+                // a NaN/Inf would otherwise silently corrupt the collection — cosine over a bad
+                // vector yields garbage scores with no error. Fail as a retryable IOException (this
+                // class's contract) so the track stays un-embedded and retries on a later sighting.
+                if (vec.size != dim) throw IOException("embed: expected $dim dims, got ${vec.size}")
+                if (vec.any { !it.isFinite() }) throw IOException("embed: non-finite value in vector")
+                return vec
             } catch (e: JSONException) {
                 throw IOException("embed: malformed response", e)
             }
