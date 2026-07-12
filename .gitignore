@@ -43,6 +43,10 @@ diag_audio.*
 # Model weights — large binaries, kept out of git (distribute separately)
 *.onnx
 *.tflite
+# EXCEPTION: the YOLOv8 detector GRAPH is only 292KB (the 12MB weights live in the
+# tracked .data file next to it). ONNX external-data needs BOTH files at runtime, so the
+# default YOLO_QNN_EP detector — and thus a fresh-clone build — is unbootable without it.
+!app/src/main/assets/detect/qnn/yolov8_det.onnx
 app/src/main/assets/model/
 models/
 
