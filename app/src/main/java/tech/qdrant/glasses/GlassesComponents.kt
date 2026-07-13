@@ -40,6 +40,7 @@ class GlassesComponents(
     companion object {
         private const val TAG = "GlassesComponents"
 
+        /** Runs on: IO (called from GlassesViewModel's init, inside viewModelScope.launch(Dispatchers.IO)). */
         fun load(app: Application, mode: AppMode): GlassesComponents {
             Log.d(TAG, "load: opening VisionMemoryStore")
             val store = VisionMemoryStore(app)
@@ -114,7 +115,11 @@ class GlassesComponents(
         }
     }
 
-    /** Exact close order preserved from the former `onCleared` cascade. */
+    /**
+     * Runs on: main (called from GlassesViewModel.onCleared).
+     *
+     * Exact close order preserved from the former `onCleared` cascade.
+     */
     override fun close() {
         visionEncoder?.close()
         textEncoder?.close()

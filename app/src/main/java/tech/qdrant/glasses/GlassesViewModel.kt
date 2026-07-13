@@ -29,7 +29,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<AppState> = session.state
 
     private val imagesDir = File(app.filesDir, "images").also { it.mkdirs() }
-    private val thumbsDir = File(app.filesDir, "thumbnails").also { it.mkdirs() }
 
     // TFLite Interpreter.run is NOT thread-safe, and EdgeShard's thread-safety is
     // unverified — serialize ALL inference + store work on one lane. A late ambient

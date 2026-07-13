@@ -21,9 +21,10 @@ class AppStateHolder {
     val isRecording: Boolean get() = _state.value is AppState.Recording   // Runs on: any thread
 
     fun setLoading() { _state.value = AppState.Loading }                  // Runs on: any thread
-    fun setIdle() { _state.value = AppState.Idle }
-    fun setError(reason: String) { _state.value = AppState.Error(reason) }
-    fun setProcessing(query: String) { _state.value = AppState.Processing(query) }
+    fun setIdle() { _state.value = AppState.Idle }                        // Runs on: any thread
+    fun setError(reason: String) { _state.value = AppState.Error(reason) }  // Runs on: any thread
+    fun setProcessing(query: String) { _state.value = AppState.Processing(query) }  // Runs on: any thread
+    /** Runs on: any thread. */
     fun setResults(query: String, cards: List<tech.qdrant.glasses.search.MomentCard>) {
         _state.value = AppState.Results(query, cards)
     }
@@ -33,7 +34,7 @@ class AppStateHolder {
         if (s is AppState.Listening) _state.value = AppState.Listening(text)
         else if (s is AppState.Processing && s.query == "...") _state.value = AppState.Processing(text)
     }
-    fun onVoiceStopped() { if (_state.value is AppState.Listening) _state.value = AppState.Processing("...") }
+    fun onVoiceStopped() { if (_state.value is AppState.Listening) _state.value = AppState.Processing("...") }  // Runs on: main
 
     private fun elapsedSeconds() = (System.currentTimeMillis() - recordingStartMs) / 1000
 
