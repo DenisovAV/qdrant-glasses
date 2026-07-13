@@ -33,6 +33,47 @@ data class ObjectHit(
 )
 
 /**
+ * Typed mirror of the JSON payload stored alongside each vector in the object shard.
+ *
+ * Keys and defaults are byte-identical to the inline `JSONObject` this replaced, so existing
+ * on-disk records (written before this type existed) read back unchanged: [fromJson] mirrors the
+ * `optString`/`optLong` defaults (empty string / 0) for any missing key.
+ *
+ * `internal` (not `private`) only so [ObjectPayloadTest] can exercise it directly.
+ */
+internal data class ObjectPayload(
+    val label: String,
+    val bbox: String,
+    val timestampMs: Long,
+    val trackId: Int,
+    val thumbPath: String,
+    val caption: String,
+) {
+    fun toJson(): String = JSONObject()
+        .put("label", label)
+        .put("bbox", bbox)
+        .put("timestamp_ms", timestampMs)
+        .put("track_id", trackId)
+        .put("thumb_path", thumbPath)
+        .put("caption", caption)
+        .toString()
+
+    companion object {
+        fun fromJson(s: String): ObjectPayload {
+            val o = try { JSONObject(s) } catch (_: Throwable) { JSONObject() }
+            return ObjectPayload(
+                label = o.optString("label"),
+                bbox = o.optString("bbox"),
+                timestampMs = o.optLong("timestamp_ms"),
+                trackId = o.optInt("track_id"),
+                thumbPath = o.optString("thumb_path"),
+                caption = o.optString("caption"),
+            )
+        }
+    }
+}
+
+/**
  * Object memory: one Qdrant Edge collection of object crops (dense cosine vectors).
  *
  * [namespace] picks the on-disk shard directory, so different crop-encoder backends keep
@@ -86,14 +127,14 @@ class ObjectStore(
     ): String = synchronized(lock) {
         val id = UUID.randomUUID().toString()
         // caption reserved (empty) for a later hybrid upgrade.
-        val payload = JSONObject()
-            .put("label", label)
-            .put("bbox", bbox)
-            .put("timestamp_ms", timestampMs)
-            .put("track_id", trackId)
-            .put("thumb_path", thumbPath)
-            .put("caption", "")
-            .toString()
+        val payload = ObjectPayload(
+            label = label,
+            bbox = bbox,
+            timestampMs = timestampMs,
+            trackId = trackId,
+            thumbPath = thumbPath,
+            caption = "",
+        ).toJson()
         val named = Vector.Named(mapOf(FIELD to NamedVector.Dense(vector.toList())))
         shard.update(UpdateOperation.upsertPoints(listOf(
             Point(id = PointId.Uuid(id), vector = named, payload = payload)
@@ -120,15 +161,16 @@ class ObjectStore(
     private fun toHit(p: ScoredPoint): ObjectHit = toHit(p.id, p.payload ?: "{}", p.score)
 
     private fun toHit(id: PointId?, payload: String, score: Float = 0f): ObjectHit {
-        // A single malformed payload must not crash the whole result list.
-        val o = try { JSONObject(payload) } catch (_: Throwable) { JSONObject() }
+        // A single malformed payload must not crash the whole result list (fromJson falls back
+        // to an empty JSONObject internally, same as the previous inline try/catch here).
+        val p = ObjectPayload.fromJson(payload)
         return ObjectHit(
             id = (id as? PointId.Uuid)?.value ?: "",
             score = score,
-            label = o.optString("label"),
-            bbox = o.optString("bbox"),
-            timestampMs = o.optLong("timestamp_ms"),
-            thumbPath = o.optString("thumb_path"),
+            label = p.label,
+            bbox = p.bbox,
+            timestampMs = p.timestampMs,
+            thumbPath = p.thumbPath,
         )
     }
 
