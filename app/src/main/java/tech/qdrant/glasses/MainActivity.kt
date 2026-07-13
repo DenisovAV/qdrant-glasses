@@ -176,7 +176,10 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "setupCamera")
         // Object mode is the active mode: deliver every analyzed frame (passthrough) so the
         // detector/tracker get continuous frames. The legacy CLIP dedup gate is bypassed.
-        cameraManager = FrameCaptureManager(this, passthrough = true) { bitmap -> viewModel.onFrame(bitmap) }
+        cameraManager = FrameCaptureManager(
+            this, passthrough = true,
+            onError = { e -> viewModel.reportFatal("camera: ${e.message ?: e.javaClass.simpleName}") },
+        ) { bitmap -> viewModel.onFrame(bitmap) }
         cameraManager.start(this)
     }
 

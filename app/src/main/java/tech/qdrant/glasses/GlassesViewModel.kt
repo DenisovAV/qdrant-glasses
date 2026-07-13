@@ -313,6 +313,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
 
+    /** Surface a fatal runtime failure (e.g. camera bind) as the error screen, same as an init failure. */
+    fun reportFatal(reason: String) { _state.value = AppState.Error(reason) }
+
     fun onFrame(bitmap: Bitmap) {
         // OBJECTS mode snapshots the frame into independent copies inside onObjectFrame and never
         // touches `bitmap` after that returns; FrameCaptureManager does NOT recycle it (only

@@ -20,6 +20,9 @@ class FrameCaptureManager(
     // the 3s interval gate and the SSIM dedup — object tracking needs frame continuity, and
     // near-identical frames are exactly what keeps a track alive between distinct objects.
     private val passthrough: Boolean = false,
+    // Invoked if the camera fails to bind (future.get()/bindToLifecycle throw on the main
+    // executor). Default no-op; MainActivity wires it to a fatal error state.
+    private val onError: (Throwable) -> Unit = {},
     private val onFrame: (Bitmap) -> Unit
 ) {
     companion object {
@@ -63,6 +66,7 @@ class FrameCaptureManager(
         Log.i(TAG, "start: binding camera")
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
+          try {
             cameraProvider = future.get()
             // Ask the camera for a SMALL resolution via the modern ResolutionSelector (the
             // deprecated setTargetResolution was ignored by RayNeo → full 4MP sensor, whose
@@ -84,6 +88,11 @@ class FrameCaptureManager(
             analysis.setAnalyzer(executor) { proxy -> analyzeFrame(proxy) }
             cameraProvider?.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
             Log.i(TAG, "start: camera bound OK")
+          } catch (e: Throwable) {
+            // future.get()/bindToLifecycle failure otherwise propagates uncaught on the main
+            // executor — a crash or a silently dead camera. Surface it as a fatal error state.
+            Log.e(TAG, "start: camera bind FAILED", e); onError(e)
+          }
         }, ContextCompat.getMainExecutor(context))
     }
 
