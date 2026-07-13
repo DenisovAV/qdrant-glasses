@@ -112,26 +112,26 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // frame and the queue never builds. AtomicBoolean = the camera thread sets, the lane clears.
     private val streamBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val inferBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-    @Volatile private var streamer: tech.qdrant.glasses.stream.FrameSink? = null  // set by MainActivity
     private val objectsDir by lazy {
         File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
     }
 
-    fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) {
-        streamer = s
-        // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
-        // restart. Read objectStore lazily (it's created async); a HUD that connects before the store
-        // exists just gets an empty list and is refilled by live `stored` events as usual.
-        s.railSnapshotProvider = {
-            objectStore?.all()?.map {
-                tech.qdrant.glasses.stream.MjpegServer.RailItem(
-                    key = java.io.File(it.thumbPath).nameWithoutExtension,
-                    label = it.label,
-                    thumbPath = it.thumbPath,
-                )
-            } ?: emptyList()
-        }
-    }
+    // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
+    // restart. Read objectStore lazily (it's created async); a HUD that connects before the store
+    // exists just gets an empty list and is refilled by live `stored` events as usual.
+    // NOTE: reads the current `objectStore` field directly — swap to `components?.objectStore` in
+    // Task 5 once `components` exists.
+    private val hud = tech.qdrant.glasses.stream.HudPublisher(railItems = {
+        objectStore?.all()?.map {
+            tech.qdrant.glasses.stream.MjpegServer.RailItem(
+                key = java.io.File(it.thumbPath).nameWithoutExtension,
+                label = it.label,
+                thumbPath = it.thumbPath,
+            )
+        } ?: emptyList()
+    })
+
+    fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) = hud.attach(s)
 
     init {
         Log.i(TAG, "init: starting model + store loading")
@@ -179,7 +179,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     Log.i(TAG, "object mode ready (backend=${tech.qdrant.glasses.embedding.CropEncoderFactory.backend}, dim=${cropEncoder!!.dim}), objects=${objectStore?.count()}")
                     // The store is async (~10s); a HUD usually connected before now and got an empty
                     // rail. Now that objects are loadable, fill any already-connected HUDs' rails.
-                    streamer?.broadcastRailSnapshot()
+                    hud.broadcastRailSnapshot()
                 }
 
                 // Pre-warm the ambient ASR model (~290MB) off the main thread so the first
@@ -221,7 +221,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         synchronized(recentFrames) { recentFrames.clear() }
         Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
         _state.value = AppState.Recording(0L, 0L)
-        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
+        hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
 
         encodeWorker = viewModelScope.launch(inferLane) {
             for ((file, bitmap) in encodeQueue) {
@@ -297,7 +297,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         ambient?.stop()
         ambient = null
         _state.value = AppState.Idle
-        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
+        hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
 
     /** Surface a fatal runtime failure (e.g. camera bind) as the error screen, same as an init failure. */
@@ -364,9 +364,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // detect pipeline. Downscale to STREAM_WIDTH + JPEG Q60 keeps encode ~30-40ms → ~25 FPS.
         // Backpressure: if the previous frame is still encoding, DROP this one (recycle + skip) so
         // frames don't queue and the stream stays real-time instead of drifting seconds behind.
-        val streamHandled = streamer != null && streamBusy.compareAndSet(false, true)
+        val streamHandled = hud.sinkOrNull != null && streamBusy.compareAndSet(false, true)
         if (streamHandled) {
-            val s = streamer!!
+            val s = hud.sinkOrNull!!
             val dets = latestDetections   // volatile read — at most ~1 detect cycle stale
             viewModelScope.launch(streamLane) {
                 try {
@@ -392,7 +392,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 } finally { streamCopy.recycle(); streamBusy.set(false) }
             }
         } else {
-            streamCopy.recycle()   // no streamer, or lane busy → drop this frame's copy
+            streamCopy.recycle()   // no HUD client, or lane busy → drop this frame's copy
         }
 
         // DETECT LANE: full detect → track → publish boxes → embed, at its own (slower) rate.
@@ -491,9 +491,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             val count = store.count()
                             val key = thumbFile.nameWithoutExtension
-                            streamer?.registerThumb(key, thumbFile.absolutePath)
-                            streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.storedEvent(key, label, count))
-                            streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.tickEvent(detMs, embedMs, storeMs, count))
+                            hud.registerThumb(key, thumbFile.absolutePath)
+                            hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.storedEvent(key, label, count))
+                            hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.tickEvent(detMs, embedMs, storeMs, count))
                             Log.i(TAG, "object stored: $label (track $tid), total=$count (embed=${embedMs}ms qsearch=${dedupSearchMs}ms upsert=${storeMs}ms)")
                         } catch (e: Throwable) {
                             Log.w(TAG, "embed failed for $label (track $tid), will retry: ${e.message}")
@@ -556,7 +556,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val query = text.trim()
         if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); _state.value = AppState.Idle; return }
         _state.value = AppState.Processing(query)
-        streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
+        hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
                 val cropEnc = cropEncoder ?: run { _state.value = AppState.Idle; return@launch }
@@ -588,10 +588,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
                 val resultItems = hits.map { h ->
                     val key = java.io.File(h.thumbPath).nameWithoutExtension
-                    streamer?.registerThumb(key, h.thumbPath)
+                    hud.registerThumb(key, h.thumbPath)
                     tech.qdrant.glasses.stream.HudEvents.ResultItem(key, h.label, h.score)
                 }
-                streamer?.pushEvent(tech.qdrant.glasses.stream.HudEvents.resultsEvent(resultItems))
+                hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.resultsEvent(resultItems))
                 val cards = hits.map { h ->
                     tech.qdrant.glasses.search.MomentCard(
                         frame = MemoryFrame(
