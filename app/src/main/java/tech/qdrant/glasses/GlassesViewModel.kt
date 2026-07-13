@@ -7,14 +7,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import tech.qdrant.glasses.legacy.LegacyMomentPipeline
 import tech.qdrant.glasses.storage.MemoryFrame
 import java.io.File
 import java.io.FileOutputStream
@@ -52,15 +51,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     private val imagesDir = File(app.filesDir, "images").also { it.mkdirs() }
     private val thumbsDir = File(app.filesDir, "thumbnails").also { it.mkdirs() }
-    private var savedCount = 0L      // frames captured (internal log only)
-    private var encodeQueue = Channel<Pair<File, Bitmap>>(Channel.UNLIMITED)
-    private var encodeWorker: Job? = null
-    private val recentFrames = ArrayDeque<Pair<String, Long>>()  // (imagePath, t_ms), newest last
-    private val recentFramesMax = 64
-    // Reject transcript↔frame associations farther apart than this — a "nearest" frame
-    // from minutes ago (camera stalled / session boundary) is worse than no frame.
-    private val maxFrameAssocMs = 30_000L
-    private var ambient: tech.qdrant.glasses.search.AmbientTranscriber? = null
 
     // TFLite Interpreter.run is NOT thread-safe, and EdgeShard's thread-safety is
     // unverified — serialize ALL inference + store work on one lane. A late ambient
@@ -116,6 +106,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     @Volatile private var components: GlassesComponents? = null
 
+    // Quarantine for the dormant appMode == LEGACY path (Task 6). Constructed only when
+    // appMode == LEGACY (mirrors GlassesComponents' "nullable by mode, never by timing" rule) —
+    // in the shipped OBJECTS config this stays null and every legacy?.xxx() call below is a no-op.
+    @Volatile private var legacy: LegacyMomentPipeline? = null
+
     init {
         Log.i(TAG, "init: starting model + store loading")
         viewModelScope.launch(Dispatchers.IO) {
@@ -131,7 +126,17 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // rails. (perception/searcher construction moves here in Tasks 7-8.)
                     hud.broadcastRailSnapshot()
                 }
-                // legacy (ambient transcriber) construction moves here in Task 6.
+                if (appMode == AppMode.LEGACY) {
+                    legacy = LegacyMomentPipeline(
+                        scope = viewModelScope,
+                        inferLane = inferLane,
+                        isRecording = { session.isRecording },
+                        onMemoryIndexed = { session.onMemoryIndexed() },
+                        imagesDir = imagesDir,
+                        components = { components },
+                        app = app,
+                    )
+                }
 
                 Log.i(TAG, "init: all components ready → Idle")
                 session.setIdle()
@@ -154,61 +159,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             Log.w(TAG, "startRecording ignored: not Idle (state=${session.state.value::class.simpleName})")
             return
         }
-        savedCount = 0L
-        encodeQueue = Channel(Channel.UNLIMITED)
-        // Fresh session — frames of the previous session must not become "nearest"
-        // for this session's first transcripts.
-        synchronized(recentFrames) { recentFrames.clear() }
         Log.i(TAG, "startRecording: indexed=${components?.store?.count() ?: 0}")
         session.beginRecording(viewModelScope)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
-
-        encodeWorker = viewModelScope.launch(inferLane) {
-            for ((file, bitmap) in encodeQueue) {
-                val enc = components?.visionEncoder ?: continue
-                val db  = components?.store ?: continue
-                try {
-                    val timestampMs = file.nameWithoutExtension.removePrefix("frame_").toLongOrNull()
-                        ?: System.currentTimeMillis()
-                    val vector = enc.encode(bitmap)
-                    db.storeImage(file.absolutePath, vector, timestampMs)
-                    session.onMemoryIndexed()
-                    val indexedNow = (session.state.value as? AppState.Recording)?.indexed ?: 0L
-                    Log.d(TAG, "indexed frame ($indexedNow this session, total=${db.count()})")
-                } catch (e: Exception) {
-                    Log.e(TAG, "encode/store frame failed, dropping ${file.name}", e)
-                }
-            }
-        }
-
-        // Heard channel (ambient transcription → text embed → store) is LEGACY-only: OBJECTS mode
-        // has no textEncoder, so every segment is dropped at the guard below. Spinning up the
-        // Sherpa VAD+ASR mic pipeline in OBJECTS is pure power/thermal waste, so gate it to LEGACY.
-        ambient = if (appMode == AppMode.LEGACY) tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
-            viewModelScope.launch(inferLane) {
-                val enc = components?.textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
-                val db = components?.store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
-                val mid = (tStart + tEnd) / 2
-                // The speech is valuable on its own (the heard channel searches transcripts);
-                // a frame is only an "episode cover". On a static scene the frame-dedup drops
-                // near-identical frames, so recentFrames can be empty for this window — store
-                // the transcript anyway with an empty image_path rather than losing the speech.
-                val nearest = nearestFramePath(mid)
-                if (nearest.isEmpty()) Log.d(TAG, "ambient: no nearby frame (deduped?), storing transcript without a cover")
-                try {
-                    val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
-                    val bge = components?.bgeEncoder?.encode(text) ?: run {
-                        Log.d(TAG, "ambient drop: bge not ready"); return@launch
-                    }
-                    db.storeTranscript(text, vec, bge, tStart, tEnd, nearest)
-                    session.onMemoryIndexed()
-                    Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
-                } catch (e: Exception) {
-                    // An encoder/FFI throw must not kill the recording session.
-                    Log.e(TAG, "ambient segment failed, dropping \"${text.take(40)}\"", e)
-                }
-            }
-        }.also { it.start() } else null   // OBJECTS: no heard channel → ambient stays null
+        legacy?.onRecordingStarted()
     }
 
     fun stopRecording() {
@@ -219,11 +173,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             Log.w(TAG, "stopRecording ignored: not Recording (state=${current::class.simpleName})")
             return
         }
-        encodeQueue.close()
         val elapsed = session.endRecording()
-        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} (captured frames=$savedCount) total=${components?.store?.count()}")
-        ambient?.stop()
-        ambient = null
+        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} total=${components?.store?.count()}")
+        legacy?.onRecordingStopped()
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
 
@@ -239,25 +191,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             try { onObjectFrame(bitmap) } finally { bitmap.recycle() }
             return
         }
-        if (session.state.value !is AppState.Recording) return
-        val timestampMs = System.currentTimeMillis()
-        val file = File(imagesDir, "frame_$timestampMs.jpg")
-        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 70, it) }
-        savedCount++
-        synchronized(recentFrames) {
-            recentFrames.addLast(file.absolutePath to timestampMs)
-            while (recentFrames.size > recentFramesMax) recentFrames.removeFirst()
-        }
-        Log.d(TAG, "frame captured: $savedCount (queued for indexing)")
-        encodeQueue.trySend(file to bitmap)
-    }
-
-    private fun nearestFramePath(midMs: Long): String {
-        synchronized(recentFrames) {
-            val best = recentFrames.minByOrNull { kotlin.math.abs(it.second - midMs) } ?: return ""
-            // A frame minutes away is a wrong memory, not a near one — reject it.
-            return if (kotlin.math.abs(best.second - midMs) <= maxFrameAssocMs) best.first else ""
-        }
+        legacy?.onFrame(bitmap)
     }
 
     /**
@@ -520,31 +454,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 session.setResults(query, cards)
                 return@launch
             }
-            val enc = components?.textEncoder ?: return@launch
-            val db  = components?.store ?: return@launch
-            try {
-                val t0 = System.currentTimeMillis()
-                val clipVec = enc.encode(query)
-                val bgeVec = components?.bgeEncoder?.encode(query)
-                val ret = components?.retriever
-                if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); session.setIdle(); return@launch }
-                val encMs = System.currentTimeMillis() - t0
-                val cards = ret.retrieve(query, clipVec, bgeVec)
-                Log.i(TAG, "onVoiceResult: encode=${encMs}ms cards=${cards.size}")
-                // Enrich each hit with speech that OVERLAPS its frame in time, so even an
-                // image hit shows "what was said here" — and a long utterance surfaces on
-                // every frame it spanned, not just the one nearest its midpoint.
-                val enriched = cards.map { c ->
-                    c.copy(frame = c.frame.copy(
-                        nearbyTranscripts = db.transcriptsOverlappingFrame(c.frame.timestampMs)
-                            .filter { it != c.frame.transcript }
-                    ))
-                }
-                session.setResults(query, enriched)
-            } catch (e: Exception) {
-                Log.e(TAG, "search failed for \"$text\"", e)
-                session.setIdle()
-            }
+            val cards = legacy?.search(query)
+            if (cards != null) session.setResults(query, cards) else session.setIdle()
         }
     }
 
@@ -564,7 +475,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         Log.i(TAG, "onCleared: releasing resources")
-        ambient?.destroy()
+        legacy?.destroyAmbient()
         // viewModelScope is already cancelled, but cancellation is cooperative — a worker
         // may still be INSIDE a native call (TFLite run / Qdrant FFI). Closing the
         // interpreter/shard under it is a native crash, not an exception. Give in-flight
