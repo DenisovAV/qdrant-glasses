@@ -468,10 +468,18 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             }
 
                             // Not a dupe → now write the thumb (wide-context crop) and store.
-                            try { FileOutputStream(thumbFile).use { thumbCrop.compress(Bitmap.CompressFormat.JPEG, 85, it) } }
-                            catch (_: Throwable) {}
+                            // If the write fails, log it (don't swallow) and persist an EMPTY
+                            // thumb_path so the stored object doesn't point at a file that was never
+                            // written (which showed as a permanently broken rail card with no trace).
+                            val thumbOk = try {
+                                FileOutputStream(thumbFile).use { thumbCrop.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+                                true
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "thumb write failed for $label (track $tid): ${e.message}"); false
+                            }
                             val storeT0 = System.currentTimeMillis()
-                            store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid, thumbFile.absolutePath)
+                            store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid,
+                                if (thumbOk) thumbFile.absolutePath else "")
                             val storeMs = System.currentTimeMillis() - storeT0
                             // Bump the session counter on inferLane (the only lane that touches it),
                             // only while still Recording (a late embed after stopRecording must not
