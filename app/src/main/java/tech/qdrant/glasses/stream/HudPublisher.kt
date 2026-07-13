@@ -19,7 +19,4 @@ class HudPublisher(private val railItems: () -> List<MjpegServer.RailItem>) {
     fun pushEvent(line: String) { sink?.pushEvent(line) }                  // Runs on: any thread
     fun registerThumb(key: String, path: String) { sink?.registerThumb(key, path) }  // cropLane/inferLane
     fun broadcastRailSnapshot() { sink?.broadcastRailSnapshot() }          // Runs on: init (IO)
-
-    // TEMPORARY: consumed only by GlassesViewModel.onObjectFrame until Task 7 moves that block; delete then.
-    internal val sinkOrNull: FrameSink? get() = sink
 }
