@@ -17,12 +17,15 @@ object Config {
 
     /**
      * Mac relay/embed base URL. Overridable WITHOUT a rebuild for venue networks (stage hotspot):
-     *   adb shell setprop debug.qdrant.relay http://172.20.10.2:9000
-     * Empty/unset property → compiled-in default. Read once at startup (app restart applies it).
+     *   adb shell setprop persist.qdrant.relay http://172.20.10.2:9000
+     * persist.* survives reboots (debug.* does NOT — a glasses reboot silently reverted the app
+     * to the compiled-in home IP mid-rehearsal, twice). debug.qdrant.relay still works as a
+     * volatile override and wins over persist. Read once at startup (app restart applies it).
      */
     val MAC_BASE_URL: String = runCatching {
         val get = Class.forName("android.os.SystemProperties")
             .getMethod("get", String::class.java, String::class.java)
-        (get.invoke(null, "debug.qdrant.relay", "") as String).ifBlank { DEFAULT_MAC_BASE_URL }
+        fun prop(name: String) = (get.invoke(null, name, "") as String)
+        prop("debug.qdrant.relay").ifBlank { prop("persist.qdrant.relay") }.ifBlank { DEFAULT_MAC_BASE_URL }
     }.getOrDefault(DEFAULT_MAC_BASE_URL)
 }

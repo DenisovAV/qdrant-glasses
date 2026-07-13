@@ -320,6 +320,12 @@ class MainActivity : AppCompatActivity() {
         eyeRight.addView(makeView())
     }
 
+    // PEAK SHAVING, lesson learned the hard way: DO NOT power-cycle the camera around voice
+    // search. Camera stop/start is a hardware power transition with an inrush spike, and placing
+    // it at mic-open / results-render made UVLO brownouts WORSE (died on the 1st search instead
+    // of the 3rd). The camera stays on continuously; the only shaving left is skipping mirror
+    // JPEG+TX during Processing (pure work reduction, no hardware transients) — see the mirror
+    // loop below.
     private fun observeState() {
         lifecycleScope.launch {
             viewModel.state.collect { state ->

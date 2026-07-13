@@ -48,6 +48,7 @@ adb -s "$SERIAL" shell am force-stop tech.qdrant.glasses
 adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_mac files/objects_shard_ondevice files/object_thumbs'" 2>/dev/null || true
 echo "glasses memory wiped"
 
+adb -s "$SERIAL" shell setprop persist.qdrant.relay "$RELAY"
 adb -s "$SERIAL" shell setprop debug.qdrant.relay "$RELAY"
 adb -s "$SERIAL" shell svc wifi enable
 # UVLO guard: Battery Saver auto-clears while CHARGING and does not come back on unplug,

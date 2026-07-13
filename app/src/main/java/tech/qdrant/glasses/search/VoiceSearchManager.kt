@@ -43,6 +43,13 @@ class VoiceSearchManager(
     private val useAndroidStt = android.speech.SpeechRecognizer.isRecognitionAvailable(context)
     @Volatile private var androidSttActive = false
 
+    init {
+        // Warm the system recognizer at construction (app start, calm moment): the first real
+        // search otherwise pays service bind + model load + audio power-up inside its own peak —
+        // on battery that cold-start transient stacks onto embed+render and risks UVLO.
+        if (useAndroidStt) androidStt.warmUp()
+    }
+
     // True only when a key is configured AND the device currently has internet.
     // Wrapped in try/catch so a connectivity check failure can never break listening —
     // worst case we fall back to VOSK.

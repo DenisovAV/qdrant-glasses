@@ -28,7 +28,10 @@ adb -s "$SERIAL" shell am force-stop tech.qdrant.glasses
 adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_mac files/objects_shard_ondevice files/object_thumbs'" 2>/dev/null || true
 echo "glasses memory wiped"
 
-# 3) Bring the app back and prove both sides are empty.
+# 3) Re-point the relay property (setprop does NOT survive a reboot — a glasses
+# reboot silently reverts the app to the compiled-in home IP) and bring the app back.
+IP=$(ipconfig getifaddr en0 2>/dev/null || true)
+[ -n "$IP" ] && adb -s "$SERIAL" shell setprop persist.qdrant.relay "http://$IP:$PORT" && adb -s "$SERIAL" shell setprop debug.qdrant.relay "http://$IP:$PORT"
 adb -s "$SERIAL" shell am start -n tech.qdrant.glasses/.MainActivity >/dev/null
 RAIL=$(curl -s "http://localhost:$PORT/poll?since=-1")
 echo "relay rail after wipe: $RAIL"
