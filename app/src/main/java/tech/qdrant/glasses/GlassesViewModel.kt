@@ -9,11 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -58,15 +54,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     private var retriever: tech.qdrant.glasses.search.MomentRetriever? = null
     private var store: VisionMemoryStore? = null
 
-    private val _state = MutableStateFlow<AppState>(AppState.Loading)
-    val state: StateFlow<AppState> = _state
+    // Sole owner of AppState + the recording session counter/clock (Task 4). GlassesViewModel
+    // keeps the legal-transition GUARDS (only-from-Idle / only-from-Recording) at its entry
+    // points; the holder itself enforces nothing.
+    private val session = AppStateHolder()
+    val state: StateFlow<AppState> = session.state
 
     private val imagesDir = File(app.filesDir, "images").also { it.mkdirs() }
     private val thumbsDir = File(app.filesDir, "thumbnails").also { it.mkdirs() }
-    private var recordingStartMs = 0L
-    private var timerJob: Job? = null
     private var savedCount = 0L      // frames captured (internal log only)
-    private var sessionIndexed = 0L  // HUD: memories actually INDEXED this session (frames + transcripts)
     private var encodeQueue = Channel<Pair<File, Bitmap>>(Channel.UNLIMITED)
     private var encodeWorker: Job? = null
     private val recentFrames = ArrayDeque<Pair<String, Long>>()  // (imagePath, t_ms), newest last
@@ -192,7 +188,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 Log.i(TAG, "init: all components ready → Idle")
-                _state.value = AppState.Idle
+                session.setIdle()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e   // normal scope teardown — never show it as a failure
             } catch (e: Throwable) {
@@ -200,7 +196,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 // UnsatisfiedLinkError (an Error, not an Exception) and would otherwise kill the
                 // coroutine silently, leaving the app stuck on Loading forever with no signal.
                 Log.e(TAG, "init: FAILED", e)
-                _state.value = AppState.Error(e.message ?: e.javaClass.simpleName)
+                session.setError(e.message ?: e.javaClass.simpleName)
             }
         }
     }
@@ -208,19 +204,17 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     fun startRecording() {
         // Only start from Idle — never while a query STT is active (Listening/Processing/
         // Results), or the ambient recognizer would fight the query recognizer for the mic.
-        if (_state.value !is AppState.Idle) {
-            Log.w(TAG, "startRecording ignored: not Idle (state=${_state.value::class.simpleName})")
+        if (session.state.value !is AppState.Idle) {
+            Log.w(TAG, "startRecording ignored: not Idle (state=${session.state.value::class.simpleName})")
             return
         }
-        recordingStartMs = System.currentTimeMillis()
         savedCount = 0L
-        sessionIndexed = 0L
         encodeQueue = Channel(Channel.UNLIMITED)
         // Fresh session — frames of the previous session must not become "nearest"
         // for this session's first transcripts.
         synchronized(recentFrames) { recentFrames.clear() }
         Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
-        _state.value = AppState.Recording(0L, 0L)
+        session.beginRecording(viewModelScope)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
 
         encodeWorker = viewModelScope.launch(inferLane) {
@@ -232,22 +226,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         ?: System.currentTimeMillis()
                     val vector = enc.encode(bitmap)
                     db.storeImage(file.absolutePath, vector, timestampMs)
-                    sessionIndexed++
-                    val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-                    _state.update { if (it is AppState.Recording) AppState.Recording(sessionIndexed, elapsed) else it }
-                    Log.d(TAG, "indexed frame ($sessionIndexed this session, total=${db.count()})")
+                    session.onMemoryIndexed()
+                    val indexedNow = (session.state.value as? AppState.Recording)?.indexed ?: 0L
+                    Log.d(TAG, "indexed frame ($indexedNow this session, total=${db.count()})")
                 } catch (e: Exception) {
                     Log.e(TAG, "encode/store frame failed, dropping ${file.name}", e)
                 }
-            }
-        }
-
-        timerJob?.cancel()
-        timerJob = viewModelScope.launch {
-            while (isActive) {
-                delay(1000)
-                val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-                _state.update { if (it is AppState.Recording) it.copy(elapsedSeconds = elapsed) else it }
             }
         }
 
@@ -271,9 +255,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         Log.d(TAG, "ambient drop: bge not ready"); return@launch
                     }
                     db.storeTranscript(text, vec, bge, tStart, tEnd, nearest)
-                    sessionIndexed++
-                    val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-                    _state.update { if (it is AppState.Recording) AppState.Recording(sessionIndexed, elapsed) else it }
+                    session.onMemoryIndexed()
                     Log.d(TAG, "ambient segment stored: \"${text.take(40)}\"")
                 } catch (e: Exception) {
                     // An encoder/FFI throw must not kill the recording session.
@@ -286,22 +268,21 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     fun stopRecording() {
         // Symmetric to the startRecording guard: never force-Idle a live query flow
         // (Listening/Processing/Results) whose recognizer still holds the mic.
-        if (_state.value !is AppState.Recording) {
-            Log.w(TAG, "stopRecording ignored: not Recording (state=${_state.value::class.simpleName})")
+        val current = session.state.value
+        if (current !is AppState.Recording) {
+            Log.w(TAG, "stopRecording ignored: not Recording (state=${current::class.simpleName})")
             return
         }
-        timerJob?.cancel(); timerJob = null
         encodeQueue.close()
-        val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-        Log.i(TAG, "stopRecording: ${elapsed}s indexed=$sessionIndexed (captured frames=$savedCount) total=${store?.count()}")
+        val elapsed = session.endRecording()
+        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} (captured frames=$savedCount) total=${store?.count()}")
         ambient?.stop()
         ambient = null
-        _state.value = AppState.Idle
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
 
     /** Surface a fatal runtime failure (e.g. camera bind) as the error screen, same as an init failure. */
-    fun reportFatal(reason: String) { _state.value = AppState.Error(reason) }
+    fun reportFatal(reason: String) { session.setError(reason) }
 
     fun onFrame(bitmap: Bitmap) {
         // OBJECTS mode snapshots the frame into independent copies inside onObjectFrame and never
@@ -312,7 +293,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             try { onObjectFrame(bitmap) } finally { bitmap.recycle() }
             return
         }
-        if (_state.value !is AppState.Recording) return
+        if (session.state.value !is AppState.Recording) return
         val timestampMs = System.currentTimeMillis()
         val file = File(imagesDir, "frame_$timestampMs.jpg")
         FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 70, it) }
@@ -344,7 +325,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
      * state and may only be mutated there.
      */
     fun onObjectFrame(bitmap: Bitmap) {
-        if (_state.value !is AppState.Recording) return
+        if (session.state.value !is AppState.Recording) return
         val det = detector ?: return
         val trk = tracker ?: return
         val store = objectStore ?: return
@@ -404,7 +385,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 // Re-check state HERE, not just at onObjectFrame entry. When the user stops
                 // recording, a frame already dispatched here would keep detecting and STORING objects
                 // in Idle. Bail before touching the tracker/store (finally still recycles + releases).
-                if (_state.value !is AppState.Recording) return@launch
+                if (session.state.value !is AppState.Recording) return@launch
                 val t0 = System.currentTimeMillis()
                 val detections = try { det.detect(frame) } catch (e: Throwable) {
                     Log.e(TAG, "detect failed", e); return@launch
@@ -481,13 +462,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             // only while still Recording (a late embed after stopRecording must not
                             // bump a dead session) — guarded inside the atomic update.
                             withContext(inferLane) {
-                                _state.update {
-                                    if (it is AppState.Recording) {
-                                        sessionIndexed++
-                                        val elapsed = (System.currentTimeMillis() - recordingStartMs) / 1000
-                                        AppState.Recording(sessionIndexed, elapsed)
-                                    } else it
-                                }
+                                session.onMemoryIndexed()
                             }
                             val count = store.count()
                             val key = thumbFile.nameWithoutExtension
@@ -531,22 +506,16 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun startListening() {
         Log.i(TAG, "startListening: waiting for voice input")
-        _state.value = AppState.Listening()
+        session.startListening()
     }
 
     fun onVoiceReady() {
         Log.i(TAG, "onVoiceReady: mic open")
     }
 
-    fun onVoicePartial(text: String) {
-        val s = _state.value
-        if (s is AppState.Listening) _state.value = AppState.Listening(text)
-        else if (s is AppState.Processing && s.query == "...") _state.value = AppState.Processing(text)
-    }
+    fun onVoicePartial(text: String) { session.onVoicePartial(text) }
 
-    fun onVoiceStopped() {
-        if (_state.value is AppState.Listening) _state.value = AppState.Processing("...")
-    }
+    fun onVoiceStopped() { session.onVoiceStopped() }
 
     fun onVoiceResult(text: String) {
         Log.i(TAG, "onVoiceResult: query=\"$text\"")
@@ -554,13 +523,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // query. Encoding "" still yields a vector that can scrape a stray frame past the
         // (low) vision gate, so guard at the source and just return to Idle.
         val query = text.trim()
-        if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); _state.value = AppState.Idle; return }
-        _state.value = AppState.Processing(query)
+        if (query.length < 2) { Log.i(TAG, "onVoiceResult: empty/too-short query, skipping search"); session.setIdle(); return }
+        session.setProcessing(query)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
-                val cropEnc = cropEncoder ?: run { _state.value = AppState.Idle; return@launch }
-                val objStore = objectStore ?: run { _state.value = AppState.Idle; return@launch }
+                val cropEnc = cropEncoder ?: run { session.setIdle(); return@launch }
+                val objStore = objectStore ?: run { session.setIdle(); return@launch }
                 // Strip question boilerplate before embedding: SigLIP2's text→crop scale is
                 // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
                 // enough to dip under the gate. Search on the object phrase, display the full query.
@@ -568,7 +537,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 if (searchPhrase != query.lowercase()) Log.i(TAG, "query normalized: \"$query\" → \"$searchPhrase\"")
                 val t0 = System.currentTimeMillis()
                 val qvec = try { cropEnc.encodeText(searchPhrase) } catch (e: Throwable) {
-                    Log.e(TAG, "query embed failed", e); _state.value = AppState.Idle; return@launch
+                    Log.e(TAG, "query embed failed", e); session.setIdle(); return@launch
                 }
                 val encMs = System.currentTimeMillis() - t0
                 val searchT0 = System.currentTimeMillis()
@@ -602,7 +571,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         fromVision = true, fromHeard = false, strength = h.score,
                     )
                 }
-                _state.value = AppState.Results(query, cards)
+                session.setResults(query, cards)
                 return@launch
             }
             val enc = textEncoder ?: return@launch
@@ -612,7 +581,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 val clipVec = enc.encode(query)
                 val bgeVec = bgeEncoder?.encode(query)
                 val ret = retriever
-                if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); _state.value = AppState.Idle; return@launch }
+                if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); session.setIdle(); return@launch }
                 val encMs = System.currentTimeMillis() - t0
                 val cards = ret.retrieve(query, clipVec, bgeVec)
                 Log.i(TAG, "onVoiceResult: encode=${encMs}ms cards=${cards.size}")
@@ -625,10 +594,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             .filter { it != c.frame.transcript }
                     ))
                 }
-                _state.value = AppState.Results(query, enriched)
+                session.setResults(query, enriched)
             } catch (e: Exception) {
                 Log.e(TAG, "search failed for \"$text\"", e)
-                _state.value = AppState.Idle
+                session.setIdle()
             }
         }
     }
@@ -639,12 +608,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")
-        _state.value = AppState.Idle
+        session.setIdle()
     }
 
     fun backToIdle() {
         Log.d(TAG, "backToIdle")
-        _state.value = AppState.Idle
+        session.setIdle()
     }
 
     override fun onCleared() {
