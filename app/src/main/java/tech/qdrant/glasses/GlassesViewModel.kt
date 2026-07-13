@@ -27,18 +27,6 @@ import tech.qdrant.glasses.storage.VisionMemoryStore
 import java.io.File
 import java.io.FileOutputStream
 
-sealed class AppState {
-    object Loading : AppState()
-    object Idle : AppState()
-    data class Recording(val indexed: Long, val elapsedSeconds: Long) : AppState()
-    data class Listening(val partial: String = "") : AppState()
-    data class Processing(val query: String) : AppState()
-    data class Results(val query: String, val cards: List<tech.qdrant.glasses.search.MomentCard>) : AppState()
-    /** Startup failed (model/store/detector init). Shown on the lens so a failure is visible
-     *  instead of a permanent Loading hang. `reason` aids on-device diagnosis. */
-    data class Error(val reason: String) : AppState()
-}
-
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
@@ -97,7 +85,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     private val inferLane = Dispatchers.Default.limitedParallelism(1)
 
     // ---- Object mode -------------------------------------------------------------------
-    enum class AppMode { LEGACY, OBJECTS }
     private val appMode = AppMode.OBJECTS   // flip to LEGACY for the old whole-frame path
 
     private var detector: tech.qdrant.glasses.detect.ObjectDetector? = null
