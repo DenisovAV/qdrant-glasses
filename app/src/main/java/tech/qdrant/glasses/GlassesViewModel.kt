@@ -15,11 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import tech.qdrant.glasses.embedding.EncoderFactory
-import tech.qdrant.glasses.embedding.TextEncoder
-import tech.qdrant.glasses.embedding.VisionEncoder
 import tech.qdrant.glasses.storage.MemoryFrame
-import tech.qdrant.glasses.storage.VisionMemoryStore
 import java.io.File
 import java.io.FileOutputStream
 
@@ -47,12 +43,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // separate from CROP_PADDING so the search-score calibration (gates, dedup) is unaffected.
         private const val THUMB_PADDING = 1.20f
     }
-
-    private var visionEncoder: VisionEncoder? = null
-    private var textEncoder: TextEncoder? = null
-    private var bgeEncoder: tech.qdrant.glasses.embedding.BgeTextEncoder? = null
-    private var retriever: tech.qdrant.glasses.search.MomentRetriever? = null
-    private var store: VisionMemoryStore? = null
 
     // Sole owner of AppState + the recording session counter/clock (Task 4). GlassesViewModel
     // keeps the legal-transition GUARDS (only-from-Idle / only-from-Recording) at its entry
@@ -83,10 +73,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Object mode -------------------------------------------------------------------
     private val appMode = AppMode.OBJECTS   // flip to LEGACY for the old whole-frame path
 
-    private var detector: tech.qdrant.glasses.detect.ObjectDetector? = null
-    private var tracker: tech.qdrant.glasses.detect.ObjectTracker? = null
-    private var cropEncoder: tech.qdrant.glasses.embedding.CropEncoder? = null
-    private var objectStore: tech.qdrant.glasses.storage.ObjectStore? = null
     // Crop embedding is a network call (Mac endpoint). It runs on its OWN single-thread lane
     // so a slow embed never blocks detection on inferLane. markEmbedded is marshalled BACK to
     // inferLane (the tracker's only legal thread) after a successful embed+upsert.
@@ -113,12 +99,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
-    // restart. Read objectStore lazily (it's created async); a HUD that connects before the store
-    // exists just gets an empty list and is refilled by live `stored` events as usual.
-    // NOTE: reads the current `objectStore` field directly — swap to `components?.objectStore` in
-    // Task 5 once `components` exists.
+    // restart. Read components?.objectStore lazily (it's created async, inside GlassesComponents);
+    // a HUD that connects before components exists just gets an empty list and is refilled by
+    // live `stored` events as usual.
     private val hud = tech.qdrant.glasses.stream.HudPublisher(railItems = {
-        objectStore?.all()?.map {
+        components?.objectStore?.all()?.map {
             tech.qdrant.glasses.stream.MjpegServer.RailItem(
                 key = java.io.File(it.thumbPath).nameWithoutExtension,
                 label = it.label,
@@ -129,63 +114,24 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) = hud.attach(s)
 
+    @Volatile private var components: GlassesComponents? = null
+
     init {
         Log.i(TAG, "init: starting model + store loading")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                Log.d(TAG, "init: opening VisionMemoryStore")
-                store = VisionMemoryStore(app)
-                Log.d(TAG, "init: VisionMemoryStore OK, stored frames=${store?.count()}")
-                store?.dumpAll()  // DIAG: log the whole base at startup
-                // retriever is created below (OBJECTS mode) with the encoder's own vision gate;
-                // LEGACY mode falls back to the default gate.
-
-                // The whole-frame CLIP encoders (~945MB of on-device weights) are LEGACY-only:
-                // in OBJECTS mode crop embedding runs on the Mac (SigLIP2), so these models are
-                // never used — and are excluded from the APK via androidResources.ignoreAssetsPattern.
-                // Loading must therefore be gated by mode too: touching a missing asset here would
-                // throw and the init try/catch would never reach Idle.
-                if (appMode == AppMode.LEGACY) {
-                    Log.d(TAG, "init: loading vision encoder [${EncoderFactory.backend}]")
-                    visionEncoder = EncoderFactory.createVision(app)
-                    Log.d(TAG, "init: vision encoder OK")
-
-                    Log.d(TAG, "init: loading text encoder [${EncoderFactory.backend}]")
-                    textEncoder = EncoderFactory.createText(app)
-                    Log.d(TAG, "init: text encoder OK")
-                }
-
-                bgeEncoder = tech.qdrant.glasses.embedding.BgeTextEncoder(app)
-                Log.d(TAG, "init: bge encoder OK")
-
+                // Loading order (store → LEGACY encoders → bge → OBJECTS detector/tracker/crop/
+                // objectStore/retriever → LEGACY ASR pre-warm) and per-mode nullability live in
+                // GlassesComponents.load; it THROWS on failure (caught below, same as before).
+                val c = GlassesComponents.load(app, appMode)
+                components = c
                 if (appMode == AppMode.OBJECTS) {
-                    detector = tech.qdrant.glasses.detect.DetectorFactory.create(app)
-                    tracker = tech.qdrant.glasses.detect.ObjectTracker(confirmSightings = 3)
-                    cropEncoder = tech.qdrant.glasses.embedding.CropEncoderFactory.create(app)
-                    objectStore = tech.qdrant.glasses.storage.ObjectStore(
-                        app,
-                        dim = cropEncoder!!.dim,
-                        namespace = tech.qdrant.glasses.embedding.CropEncoderFactory.namespace,
-                    )
-                    // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
-                    // TinyCLIP have different cosine scales, so an absent query returns nothing).
-                    retriever = store?.let {
-                        tech.qdrant.glasses.search.MomentRetriever(it, visionMinScore = cropEncoder!!.visionMinScore)
-                    }
-                    Log.i(TAG, "object mode ready (backend=${tech.qdrant.glasses.embedding.CropEncoderFactory.backend}, dim=${cropEncoder!!.dim}), objects=${objectStore?.count()}")
-                    // The store is async (~10s); a HUD usually connected before now and got an empty
-                    // rail. Now that objects are loadable, fill any already-connected HUDs' rails.
+                    // The store is async (~10s); a HUD usually connected before now and got an
+                    // empty rail. Now that objects are loadable, fill any already-connected HUDs'
+                    // rails. (perception/searcher construction moves here in Tasks 7-8.)
                     hud.broadcastRailSnapshot()
                 }
-
-                // Pre-warm the ambient ASR model (~290MB) off the main thread so the first
-                // recording doesn't block the UI loading it. ensureLoaded is idempotent +
-                // @Synchronized, so AmbientTranscriber.start() becomes a warm cache hit. Only
-                // LEGACY uses the heard channel — in OBJECTS mode ambient segments are dropped (no
-                // textEncoder), so loading the model there is ~290MB of wasted RAM. Gate to LEGACY.
-                if (appMode == AppMode.LEGACY) {
-                    tech.qdrant.glasses.search.SherpaVadAsr.ensureLoaded(app)
-                }
+                // legacy (ambient transcriber) construction moves here in Task 6.
 
                 Log.i(TAG, "init: all components ready → Idle")
                 session.setIdle()
@@ -213,14 +159,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // Fresh session — frames of the previous session must not become "nearest"
         // for this session's first transcripts.
         synchronized(recentFrames) { recentFrames.clear() }
-        Log.i(TAG, "startRecording: indexed=${store?.count() ?: 0}")
+        Log.i(TAG, "startRecording: indexed=${components?.store?.count() ?: 0}")
         session.beginRecording(viewModelScope)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
 
         encodeWorker = viewModelScope.launch(inferLane) {
             for ((file, bitmap) in encodeQueue) {
-                val enc = visionEncoder ?: continue
-                val db  = store ?: continue
+                val enc = components?.visionEncoder ?: continue
+                val db  = components?.store ?: continue
                 try {
                     val timestampMs = file.nameWithoutExtension.removePrefix("frame_").toLongOrNull()
                         ?: System.currentTimeMillis()
@@ -240,8 +186,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         // Sherpa VAD+ASR mic pipeline in OBJECTS is pure power/thermal waste, so gate it to LEGACY.
         ambient = if (appMode == AppMode.LEGACY) tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
             viewModelScope.launch(inferLane) {
-                val enc = textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
-                val db = store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
+                val enc = components?.textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
+                val db = components?.store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
                 val mid = (tStart + tEnd) / 2
                 // The speech is valuable on its own (the heard channel searches transcripts);
                 // a frame is only an "episode cover". On a static scene the frame-dedup drops
@@ -251,7 +197,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 if (nearest.isEmpty()) Log.d(TAG, "ambient: no nearby frame (deduped?), storing transcript without a cover")
                 try {
                     val vec = enc.encode(text.take(300))  // CLIP truncates ~77 tokens; cap chars
-                    val bge = bgeEncoder?.encode(text) ?: run {
+                    val bge = components?.bgeEncoder?.encode(text) ?: run {
                         Log.d(TAG, "ambient drop: bge not ready"); return@launch
                     }
                     db.storeTranscript(text, vec, bge, tStart, tEnd, nearest)
@@ -275,7 +221,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         }
         encodeQueue.close()
         val elapsed = session.endRecording()
-        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} (captured frames=$savedCount) total=${store?.count()}")
+        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} (captured frames=$savedCount) total=${components?.store?.count()}")
         ambient?.stop()
         ambient = null
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
@@ -326,10 +272,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun onObjectFrame(bitmap: Bitmap) {
         if (session.state.value !is AppState.Recording) return
-        val det = detector ?: return
-        val trk = tracker ?: return
-        val store = objectStore ?: return
-        val enc = cropEncoder ?: return
+        val det = components?.detector ?: return
+        val trk = components?.tracker ?: return
+        val store = components?.objectStore ?: return
+        val enc = components?.cropEncoder ?: return
         // onFrame recycles `bitmap` the instant this returns, so take TWO independent snapshots
         // synchronously: one owned by the stream lane, one by the detect lane. Each lane recycles
         // its own — no bitmap is shared across threads. streamCopy is mutable (true) so we can draw
@@ -528,8 +474,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
-                val cropEnc = cropEncoder ?: run { session.setIdle(); return@launch }
-                val objStore = objectStore ?: run { session.setIdle(); return@launch }
+                val cropEnc = components?.cropEncoder ?: run { session.setIdle(); return@launch }
+                val objStore = components?.objectStore ?: run { session.setIdle(); return@launch }
                 // Strip question boilerplate before embedding: SigLIP2's text→crop scale is
                 // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
                 // enough to dip under the gate. Search on the object phrase, display the full query.
@@ -574,13 +520,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 session.setResults(query, cards)
                 return@launch
             }
-            val enc = textEncoder ?: return@launch
-            val db  = store ?: return@launch
+            val enc = components?.textEncoder ?: return@launch
+            val db  = components?.store ?: return@launch
             try {
                 val t0 = System.currentTimeMillis()
                 val clipVec = enc.encode(query)
-                val bgeVec = bgeEncoder?.encode(query)
-                val ret = retriever
+                val bgeVec = components?.bgeEncoder?.encode(query)
+                val ret = components?.retriever
                 if (bgeVec == null || ret == null) { Log.w(TAG, "retriever not ready"); session.setIdle(); return@launch }
                 val encMs = System.currentTimeMillis() - t0
                 val cards = ret.retrieve(query, clipVec, bgeVec)
@@ -603,8 +549,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun frameCount(): Long =
-        if (appMode == AppMode.OBJECTS) objectStore?.count() ?: 0L
-        else store?.count() ?: 0L
+        components?.let { if (appMode == AppMode.OBJECTS) it.objectStore?.count() else it.store.count() } ?: 0L
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")
@@ -629,12 +574,6 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 viewModelScope.coroutineContext.job.children.forEach { it.join() }
             } ?: Log.w(TAG, "onCleared: in-flight work didn't drain in 800ms, closing anyway")
         }
-        visionEncoder?.close()
-        textEncoder?.close()
-        bgeEncoder?.close()
-        store?.close()
-        detector?.close()
-        cropEncoder?.close()
-        objectStore?.close()
+        components?.close()
     }
 }
