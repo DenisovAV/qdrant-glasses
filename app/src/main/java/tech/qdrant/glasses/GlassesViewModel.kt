@@ -195,11 +195,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     streamer?.broadcastRailSnapshot()
                 }
 
-                // Pre-warm the ambient ASR model (~290MB) off the main thread so the
-                // first recording doesn't block the UI loading it. ensureLoaded is
-                // idempotent + @Synchronized, so AmbientTranscriber.start() becomes a
-                // warm cache hit. Soft: a failure here just disables ambient transcription.
-                tech.qdrant.glasses.search.SherpaVadAsr.ensureLoaded(app)
+                // Pre-warm the ambient ASR model (~290MB) off the main thread so the first
+                // recording doesn't block the UI loading it. ensureLoaded is idempotent +
+                // @Synchronized, so AmbientTranscriber.start() becomes a warm cache hit. Only
+                // LEGACY uses the heard channel — in OBJECTS mode ambient segments are dropped (no
+                // textEncoder), so loading the model there is ~290MB of wasted RAM. Gate to LEGACY.
+                if (appMode == AppMode.LEGACY) {
+                    tech.qdrant.glasses.search.SherpaVadAsr.ensureLoaded(app)
+                }
 
                 Log.i(TAG, "init: all components ready → Idle")
                 _state.value = AppState.Idle
@@ -261,7 +264,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        ambient = tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
+        // Heard channel (ambient transcription → text embed → store) is LEGACY-only: OBJECTS mode
+        // has no textEncoder, so every segment is dropped at the guard below. Spinning up the
+        // Sherpa VAD+ASR mic pipeline in OBJECTS is pure power/thermal waste, so gate it to LEGACY.
+        ambient = if (appMode == AppMode.LEGACY) tech.qdrant.glasses.search.AmbientTranscriber(getApplication()) { text, tStart, tEnd ->
             viewModelScope.launch(inferLane) {
                 val enc = textEncoder ?: run { Log.d(TAG, "ambient drop: textEncoder not ready"); return@launch }
                 val db = store ?: run { Log.d(TAG, "ambient drop: store not ready"); return@launch }
@@ -287,7 +293,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     Log.e(TAG, "ambient segment failed, dropping \"${text.take(40)}\"", e)
                 }
             }
-        }.also { it.start() }  // offline Google engine has no model-load gate — always startable
+        }.also { it.start() } else null   // OBJECTS: no heard channel → ambient stays null
     }
 
     fun stopRecording() {
