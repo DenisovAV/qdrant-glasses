@@ -14,7 +14,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import tech.qdrant.glasses.legacy.LegacyMomentPipeline
 import tech.qdrant.glasses.pipeline.PerceptionPipeline
-import tech.qdrant.glasses.storage.MemoryFrame
 import java.io.File
 
 class GlassesViewModel(app: Application) : AndroidViewModel(app) {
@@ -77,6 +76,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // `components?.detector ?: return` gave.
     @Volatile private var perception: PerceptionPipeline? = null
 
+    // OBJECTS voice search, extracted verbatim in Task 8 (returns an Outcome; the VM maps it to
+    // AppState). Constructed only when appMode == OBJECTS, alongside `perception` — same
+    // "nullable by mode, never by timing" lifecycle.
+    @Volatile private var searcher: tech.qdrant.glasses.search.ObjectSearcher? = null
+
     init {
         Log.i(TAG, "init: starting model + store loading")
         viewModelScope.launch(Dispatchers.IO) {
@@ -94,9 +98,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         onMemoryIndexed = { session.onMemoryIndexed() },
                         objectThumbsDir = objectsDir,
                     )
+                    searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
                     // The store is async (~10s); a HUD usually connected before now and got an
                     // empty rail. Now that objects are loadable, fill any already-connected HUDs'
-                    // rails. (searcher construction moves here in Task 8.)
+                    // rails.
                     hud.broadcastRailSnapshot()
                 }
                 if (appMode == AppMode.LEGACY) {
@@ -191,50 +196,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
-                val cropEnc = components?.cropEncoder ?: run { session.setIdle(); return@launch }
-                val objStore = components?.objectStore ?: run { session.setIdle(); return@launch }
-                // Strip question boilerplate before embedding: SigLIP2's text→crop scale is
-                // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
-                // enough to dip under the gate. Search on the object phrase, display the full query.
-                val searchPhrase = tech.qdrant.glasses.search.searchPhrase(query)
-                if (searchPhrase != query.lowercase()) Log.i(TAG, "query normalized: \"$query\" → \"$searchPhrase\"")
-                val t0 = System.currentTimeMillis()
-                val qvec = try { cropEnc.encodeText(searchPhrase) } catch (e: Throwable) {
-                    Log.e(TAG, "query embed failed", e); session.setIdle(); return@launch
+                when (val o = searcher!!.search(query)) {
+                    is tech.qdrant.glasses.search.ObjectSearcher.Outcome.Success -> session.setResults(query, o.cards)
+                    tech.qdrant.glasses.search.ObjectSearcher.Outcome.Unavailable -> session.setIdle()
                 }
-                val encMs = System.currentTimeMillis() - t0
-                val searchT0 = System.currentTimeMillis()
-                // Per-encoder score gate: without it an absent-object query ("keys" when no keys
-                // were ever stored) surfaces junk top-5 around 0.09 — worse than saying "nothing".
-                val gate = tech.qdrant.glasses.embedding.CropEncoderFactory.searchGate
-                val allHits = objStore.search(qvec, topK = 5)
-                // Hybrid acceptance: cosine gate OR detector-label word match. SigLIP2's text→crop
-                // scale is compressed AND environment-sensitive (the same "cell phone" query scored
-                // 0.117 at home but 0.095-0.106 at the venue against a darker/farther crop), so an
-                // absolute gate alone drops real matches. If a query word literally names the stored
-                // label ("phone" ⊂ "cell phone"), the object is what was asked for — show it.
-                val qTokens = tech.qdrant.glasses.search.queryTokens(searchPhrase)
-                val hits = allHits.filter { it.score >= gate || tech.qdrant.glasses.search.labelMatchesQuery(it.label, qTokens) }
-                val searchMs = System.currentTimeMillis() - searchT0
-                Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms search=${searchMs}ms " +
-                    "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
-                val resultItems = hits.map { h ->
-                    val key = java.io.File(h.thumbPath).nameWithoutExtension
-                    hud.registerThumb(key, h.thumbPath)
-                    tech.qdrant.glasses.stream.HudEvents.ResultItem(key, h.label, h.score)
-                }
-                hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.resultsEvent(resultItems))
-                val cards = hits.map { h ->
-                    tech.qdrant.glasses.search.MomentCard(
-                        frame = MemoryFrame(
-                            id = h.id, score = h.score, imagePath = h.thumbPath,
-                            timestampMs = h.timestampMs, tEndMs = h.timestampMs,
-                            type = "object", transcript = h.label,
-                        ),
-                        fromVision = true, fromHeard = false, strength = h.score,
-                    )
-                }
-                session.setResults(query, cards)
                 return@launch
             }
             val cards = legacy?.search(query)
