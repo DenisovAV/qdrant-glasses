@@ -48,6 +48,7 @@ class TinyClipVisionEncoder(context: Context) : VisionEncoder {
     override fun encode(bitmap: Bitmap): FloatArray {
         val resized = Bitmap.createScaledBitmap(bitmap, IMG, IMG, true)
         val tensor = OnnxTensor.createTensor(env, bitmapToTensor(resized), longArrayOf(1, 3, IMG.toLong(), IMG.toLong()))
+        if (resized !== bitmap) resized.recycle()   // pixels copied into the tensor; free the scaled copy
         val t1 = System.currentTimeMillis()
         val results = tensor.use {
             session.run(mapOf("pixel_values" to it, "input_ids" to dummyIds, "attention_mask" to dummyMask))

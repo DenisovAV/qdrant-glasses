@@ -78,6 +78,7 @@ class YoloQnnDetector(context: Context) : ObjectDetector {
         // NCHW uint8: the qai-hub QDQ graph expects [1,3,640,640] (channel-planar), raw 0..255
         // (the graph bakes /255). Fill three contiguous planes R,G,B — NOT interleaved RGB.
         val px = IntArray(SIZE * SIZE).also { resized.getPixels(it, 0, SIZE, 0, 0, SIZE, SIZE) }
+        if (resized !== bitmap) resized.recycle()   // pixels copied into `px`; free the scaled copy
         val plane = SIZE * SIZE
         val buf = ByteBuffer.allocateDirect(3 * plane)
         for (p in px) buf.put((p shr 16 and 0xFF).toByte())   // R plane

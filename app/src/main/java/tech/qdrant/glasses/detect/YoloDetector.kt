@@ -33,6 +33,7 @@ class YoloDetector(
     override fun detect(bitmap: Bitmap): List<Detection> {
         val resized = Bitmap.createScaledBitmap(bitmap, SIZE, SIZE, true)
         val px = IntArray(SIZE * SIZE).also { resized.getPixels(it, 0, SIZE, 0, 0, SIZE, SIZE) }
+        if (resized !== bitmap) resized.recycle()   // pixels copied into `px`; free the scaled copy
         val fb = inputBuf.asFloatBuffer()
         for (i in px.indices) { val p = px[i]; val o = i * 3
             fb.put(o, (p shr 16 and 0xFF) / 255f); fb.put(o + 1, (p shr 8 and 0xFF) / 255f); fb.put(o + 2, (p and 0xFF) / 255f) }

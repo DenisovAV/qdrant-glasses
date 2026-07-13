@@ -308,7 +308,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onFrame(bitmap: Bitmap) {
-        if (appMode == AppMode.OBJECTS) { onObjectFrame(bitmap); return }
+        // OBJECTS mode snapshots the frame into independent copies inside onObjectFrame and never
+        // touches `bitmap` after that returns; FrameCaptureManager does NOT recycle it (only
+        // proxy.close()), so recycle it here or the ~2-3MB frame leaks to GC every call (~30fps).
+        // LEGACY hands `bitmap` to an async encode queue below, so it must NOT be recycled here.
+        if (appMode == AppMode.OBJECTS) {
+            try { onObjectFrame(bitmap) } finally { bitmap.recycle() }
+            return
+        }
         if (_state.value !is AppState.Recording) return
         val timestampMs = System.currentTimeMillis()
         val file = File(imagesDir, "frame_$timestampMs.jpg")
@@ -346,11 +353,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         val trk = tracker ?: return
         val store = objectStore ?: return
         val enc = cropEncoder ?: return
-        // The camera RECYCLES `bitmap` the instant this callback returns (KEEP_ONLY_LATEST +
-        // proxy.close() in the analyzer's finally). Take TWO independent snapshots synchronously:
-        // one owned by the stream lane, one by the detect lane. Each lane recycles its own — no
-        // bitmap is shared across threads. streamCopy is mutable (true) so we can draw boxes onto
-        // the downscaled copy in place.
+        // onFrame recycles `bitmap` the instant this returns, so take TWO independent snapshots
+        // synchronously: one owned by the stream lane, one by the detect lane. Each lane recycles
+        // its own — no bitmap is shared across threads. streamCopy is mutable (true) so we can draw
+        // boxes onto the downscaled copy in place.
         val streamCopy = try { bitmap.copy(Bitmap.Config.ARGB_8888, true) } catch (e: Throwable) {
             Log.w(TAG, "streamCopy failed: ${e.message}"); return
         }
@@ -491,6 +497,10 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                             withContext(inferLane) { trk.unmarkEmbedded(tid) }
                         } finally {
                             crop.recycle()  // crop is our own pixels; release once encoded/stored
+                            // thumbCrop is a separate wide-context copy that leaked on both the store
+                            // and dedup-skip paths. It aliases `crop` when the wider cropFrom returned
+                            // null (the `?: crop` fallback), so guard against a double free.
+                            if (thumbCrop !== crop) thumbCrop.recycle()
                         }
                     }
                 }

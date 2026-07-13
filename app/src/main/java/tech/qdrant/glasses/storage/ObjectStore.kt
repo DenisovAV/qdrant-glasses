@@ -55,6 +55,11 @@ class ObjectStore(
     }
 
     private val shard: EdgeShard
+    // The native EdgeShard's thread-safety is unverified and this store is touched concurrently:
+    // dedup search + upsert on cropLane, the voice-query search on inferLane, and all()/rail
+    // snapshots from the MjpegServer HTTP threads. Serialize every native call through one monitor
+    // (reentrant, so close() may call count()).
+    private val lock = Any()
 
     init {
         val dir = File(context.filesDir, "objects_shard_$namespace").also { it.mkdirs() }.absolutePath
@@ -78,7 +83,7 @@ class ObjectStore(
         timestampMs: Long,
         trackId: Int,
         thumbPath: String,
-    ): String {
+    ): String = synchronized(lock) {
         val id = UUID.randomUUID().toString()
         // caption reserved (empty) for a later hybrid upgrade.
         val payload = JSONObject()
@@ -95,10 +100,10 @@ class ObjectStore(
         )))
         shard.flush()
         Log.d(TAG, "upsert: id=$id label=\"$label\" bbox=$bbox ts=$timestampMs")
-        return id
+        id
     }
 
-    fun search(vector: FloatArray, topK: Int = 5): List<ObjectHit> {
+    fun search(vector: FloatArray, topK: Int = 5): List<ObjectHit> = synchronized(lock) {
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
             query = ScoringQuery.Vector(Query.Nearest(vector = vector.toList(), using = FIELD)),
@@ -109,7 +114,7 @@ class ObjectStore(
         val hits = results.map { p -> toHit(p) }
         Log.i(TAG, "search: topK=$topK returned=${hits.size} " +
             hits.take(3).joinToString { "%.3f \"%s\"".format(it.score, it.label.take(20)) })
-        return hits
+        hits
     }
 
     private fun toHit(p: ScoredPoint): ObjectHit = toHit(p.id, p.payload ?: "{}", p.score)
@@ -133,21 +138,21 @@ class ObjectStore(
      * no filter and no vectors (payload only), then sort by timestamp so the rail restores in the
      * order things were seen.
      */
-    fun all(limit: Int = 500): List<ObjectHit> {
+    fun all(limit: Int = 500): List<ObjectHit> = synchronized(lock) {
         val resp = shard.scroll(ScrollRequest(
             offset = null, limit = limit.toULong(), filter = null,
             withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
             orderBy = null,
         ))
-        return resp.records
+        resp.records
             .map { rec -> toHit(rec.id, rec.payload ?: "{}") }
             .sortedBy { it.timestampMs }
             .also { Log.i(TAG, "all(): ${it.size} stored objects") }
     }
 
-    fun count(): Long = shard.count(CountRequest(filter = null, exact = true)).toLong()
+    fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }
 
-    override fun close() {
+    override fun close() = synchronized(lock) {
         // Always release the native shard even if the diagnostic count throws.
         runCatching { Log.i(TAG, "close: total objects=${count()}") }
         shard.close()
