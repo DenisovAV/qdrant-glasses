@@ -564,10 +564,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 // Strip question boilerplate before embedding: SigLIP2's text→crop scale is
                 // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
                 // enough to dip under the gate. Search on the object phrase, display the full query.
-                val searchPhrase = query.lowercase()
-                    .replace(Regex("^(where\\s+(is|are)|what\\s+(is|are)|when\\s+(is|are)|that\\s+is|this\\s+is|find|show\\s+me|look\\s+for|search\\s+for)\\s+"), "")
-                    .replace(Regex("^(my|the|a|an)\\s+"), "")
-                    .trim().ifBlank { query }
+                val searchPhrase = tech.qdrant.glasses.search.searchPhrase(query)
                 if (searchPhrase != query.lowercase()) Log.i(TAG, "query normalized: \"$query\" → \"$searchPhrase\"")
                 val t0 = System.currentTimeMillis()
                 val qvec = try { cropEnc.encodeText(searchPhrase) } catch (e: Throwable) {
@@ -584,18 +581,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 // 0.117 at home but 0.095-0.106 at the venue against a darker/farther crop), so an
                 // absolute gate alone drops real matches. If a query word literally names the stored
                 // label ("phone" ⊂ "cell phone"), the object is what was asked for — show it.
-                val qTokens = searchPhrase.split(Regex("\\W+")).filter { it.length > 2 }.toSet()
-                fun labelMatch(label: String): Boolean {
-                    val lTokens = label.lowercase().split(Regex("\\W+")).filter { it.length > 2 }
-                    // Equality or containment either way: "smartphone" ⊃ "phone" ⊂ "cell phone",
-                    // "cups" ⊃ "cup". Min length 4 for containment to avoid junk substrings.
-                    return lTokens.any { lt ->
-                        qTokens.any { qt ->
-                            qt == lt || (lt.length >= 4 && qt.contains(lt)) || (qt.length >= 4 && lt.contains(qt))
-                        }
-                    }
-                }
-                val hits = allHits.filter { it.score >= gate || labelMatch(it.label) }
+                val qTokens = tech.qdrant.glasses.search.queryTokens(searchPhrase)
+                val hits = allHits.filter { it.score >= gate || tech.qdrant.glasses.search.labelMatchesQuery(it.label, qTokens) }
                 val searchMs = System.currentTimeMillis() - searchT0
                 Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms search=${searchMs}ms " +
                     "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
