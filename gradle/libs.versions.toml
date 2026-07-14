@@ -5,7 +5,18 @@ coreKtx = "1.18.0"
 appcompat = "1.7.1"
 lifecycle = "2.10.0"
 camerax = "1.5.3"
-onnxruntime = "1.26.0"   # -qnn variant (superset of -android): bundles the QNN EP for HTP
+# We ship the `-qnn` variant. It is NOT a superset of plain `-android` — the two are mutually
+# exclusive, verified at the symbol level in the 1.26.0 AARs:
+#   onnxruntime-android      exports ...AppendExecutionProvider_{CPU,Nnapi}   → NNAPI yes, QNN no
+#   onnxruntime-android-qnn  exports ...AppendExecutionProvider_{CPU}         → QNN yes, NNAPI no
+# You cannot have both (one libonnxruntime.so per process). We choose QNN, and it is not close —
+# measured on the RayNeo X3 Pro, whole-system, both runs with the HUD dashboard ON (so both are
+# inflated by the same JPEG-encode load; it is the comparison that matters, and README quotes the
+# HUD-off figure, ~200ms, for the shipped path):
+#   -qnn      : YOLO detect  8ms (Hexagon HTP)   | TinyCLIP  872ms (CPU)
+#   -android  : YOLO detect 537ms (GPU fallback) | TinyCLIP 1351ms (NNAPI: 72/890 nodes, 48 partitions)
+# Switching to -android to "get NNAPI for CLIP" loses on BOTH counts. Don't.
+onnxruntime = "1.26.0"
 coroutines = "1.11.0"
 litert = "1.4.0"
 qnn = "2.45.0"           # must be >= the QAIRT version of the qai-hub context binary (2.45)
