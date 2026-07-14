@@ -72,24 +72,57 @@ internal fun extractAsset(context: Context, name: String): File {
 }
 
 /**
- * Creates an ORT session that tries to offload to the device's NPU/GPU via NNAPI.
- * On the RayNeo X3 Pro (Snapdragon AR1 Gen1) this routes supported ops to the
- * Hexagon NPU / Adreno 621 instead of the CPU. ORT partitions the graph: ops the
- * NNAPI driver can't run stay on CPU (we do NOT set CPU_DISABLED, so unsupported
- * nodes fall back gracefully). If NNAPI can't initialise at all, we fall back to a
- * plain CPU session — same behaviour as before, never worse.
+ * Creates the ORT session for the CLIP towers. **In practice this always runs on the CPU**, and
+ * that is not an oversight — it is the fastest thing this device can do with a ViT. Read this
+ * before "fixing" it:
+ *
+ * ## The NNAPI attempt below ALWAYS fails. It is a probe, not a fast path.
+ * The shipped `onnxruntime-android-qnn` AAR contains **no NNAPI execution provider**: it exports
+ * only `OrtSessionOptionsAppendExecutionProvider_CPU` and imports **zero** `ANeuralNetworks*`
+ * symbols. So `addNnapi()` throws `ORT_INVALID_ARGUMENT: This binary was not compiled with NNAPI
+ * support` on every launch and we land in the CPU branch. It is kept as a probe so the day an ORT
+ * build ships with NNAPI, we pick it up for free — and so the log says out loud which EP we got.
+ *
+ * Do NOT trust `ai.onnxruntime.OrtProvider` to tell you otherwise: that enum lists all 17
+ * providers in *every* build, whether or not they are linked in. It is a menu, not an inventory.
+ * An earlier version of this comment claimed NNAPI "routes supported ops to the Hexagon NPU /
+ * Adreno 621" — it never did, and that fiction cost real debugging time.
+ *
+ * ## Why CPU is the right answer anyway (measured on the RayNeo X3 Pro, under the live pipeline)
+ * Every accelerator this SoC exposes was tried against a CLIP-class ViT, and every one lost to the
+ * CPU. The decisive variable is **int8 vs fp32**, not CPU vs accelerator:
+ *
+ *  | model / route                                  | vision p50 |
+ *  |------------------------------------------------|-----------|
+ *  | TinyCLIP-40M **int8**, ORT **CPU** (this path)  | **203ms**  |
+ *  | MobileCLIP2-S0 fp32, LiteRT Adreno GPU          |   929ms   |
+ *  | MobileCLIP2-S0 fp32, LiteRT CPU (XNNPACK)       |  ~3.5s    |
+ *  | MobileCLIP2-S0 fp32, LiteRT Hexagon HTP (fp16)  |  slower still |
+ *
+ * Latency on this part is LOAD-dependent, so always compare like with like. The AR1 is a **4-core**
+ * SoC (2xA78 + 2xA55) and the encoder shares those cores with the camera's YUV conversion, the
+ * detector, the store — and the HUD's per-frame JPEG encode. Closing the HUD alone takes this path
+ * from ~870ms to ~203ms (see Config.HUD_STREAM). The rows above are all measured HUD-off, one build,
+ * one session. An old "~450-490ms" note was an idle-device number and is not comparable to any of
+ * them.
+ *
+ * The Hexagon HTP takes an int8 YOLOv8n **CNN** at ~8ms — but of a 490-node ViT it accepts only
+ * **44 nodes** and shreds the graph into **50 partitions** (the Adreno GPU delegate manages 198).
+ * Every partition boundary is a round trip back to the CPU, which costs more than the accelerator
+ * saves. Meanwhile int8 matmuls hit ARM dot-product instructions and run several times faster than
+ * fp32 — which is the entire reason this CPU path wins.
+ *
+ * The unlock is not another delegate; it is a **quantized ViT that Hexagon will actually take**.
  */
 internal fun createAcceleratedSession(env: OrtEnvironment, modelPath: String): OrtSession {
     return try {
-        val opts = OrtSession.SessionOptions().apply {
-            // Empty flag set = let NNAPI use NPU/GPU with CPU fallback enabled.
-            addNnapi()
-        }
+        val opts = OrtSession.SessionOptions().apply { addNnapi() }
         env.createSession(modelPath, opts).also {
             Log.i("ClipEncoder", "ORT session created with NNAPI execution provider")
         }
     } catch (e: Throwable) {
-        Log.w("ClipEncoder", "NNAPI unavailable, falling back to CPU: ${e.message}")
+        // Expected on every launch with the current AAR — see the KDoc. CPU is the fast path here.
+        Log.i("ClipEncoder", "no NNAPI EP in this ORT build (expected) — running CLIP on CPU: ${e.message}")
         env.createSession(modelPath)
     }
 }

@@ -17,7 +17,9 @@ import android.graphics.Bitmap
  *    index (clear the Qdrant Edge collection / `pm clear`), exactly like switching EncoderFactory.
  *  - crop attributes (e.g. "red jacket" vs "blue jacket", small distant objects) are less reliable
  *    than SigLIP2; pick contrast-y demo objects to stay within TinyCLIP's strength.
- *  - latency is local (~450ms vision measured on RayNeo X3 Pro) instead of a USB round-trip.
+ *  - latency is local instead of a USB round-trip: ~870ms per crop, measured on the RayNeo X3 Pro
+ *    UNDER the running pipeline. (An older "~450ms" note here was an idle-device number — see
+ *    [createAcceleratedSession], which also documents why no accelerator on this SoC beats it.)
  *
  * Must be called OFF the main thread (ONNX Runtime inference); the ViewModel crop-embed lane
  * already runs off-main, matching [MacEndpointEncoder]'s contract.

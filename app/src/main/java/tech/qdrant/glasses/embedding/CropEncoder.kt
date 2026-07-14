@@ -33,7 +33,7 @@ interface CropEncoder : AutoCloseable {
  */
 object CropEncoderFactory {
     enum class Backend { MAC_ENDPOINT, CLOUD, ON_DEVICE }
-    val backend = Backend.MAC_ENDPOINT
+    val backend = Backend.ON_DEVICE
     fun create(context: Context): CropEncoder = when (backend) {
         // Wireless: reach the Mac on its LAN IP; wired: localhost via adb reverse. One constant.
         Backend.MAC_ENDPOINT -> MacEndpointEncoder(baseUrl = tech.qdrant.glasses.Config.MAC_BASE_URL)

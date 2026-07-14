@@ -106,19 +106,24 @@ class PerceptionPipeline(
         // synchronously: one owned by the stream lane, one by the detect lane. Each lane recycles
         // its own — no bitmap is shared across threads. streamCopy is mutable (true) so we can draw
         // boxes onto the downscaled copy in place.
-        val streamCopy = try { bitmap.copy(Bitmap.Config.ARGB_8888, true) } catch (e: Throwable) {
-            Log.w(TAG, "streamCopy failed: ${e.message}"); return
-        }
+        // Only snapshot for the stream if a HUD is actually attached. This copy is a full
+        // ARGB_8888 frame (~1.2MB at 640x480); allocating it unconditionally and recycling it a few
+        // lines later churned ~36MB/s at 30fps for nothing whenever no HUD was connected.
+        val streamCopy = if (!hud.hasClient) null else
+            try { bitmap.copy(Bitmap.Config.ARGB_8888, true) } catch (e: Throwable) {
+                // Don't abandon detection just because the HUD copy failed — the HUD is cosmetic.
+                Log.w(TAG, "streamCopy failed: ${e.message}"); null
+            }
         val frame = try { bitmap.copy(Bitmap.Config.ARGB_8888, false) } catch (e: Throwable) {
-            streamCopy.recycle(); Log.w(TAG, "frame snapshot failed: ${e.message}"); return
+            streamCopy?.recycle(); Log.w(TAG, "frame snapshot failed: ${e.message}"); return
         }
 
         // STREAM LANE: encode THIS frame with the LAST-known boxes, right now, independent of the
         // detect pipeline. Downscale to STREAM_WIDTH + JPEG Q60 keeps encode ~30-40ms → ~25 FPS.
         // Backpressure: if the previous frame is still encoding, DROP this one (recycle + skip) so
         // frames don't queue and the stream stays real-time instead of drifting seconds behind.
-        val streamHandled = hud.hasClient && streamBusy.compareAndSet(false, true)
-        if (streamHandled) {
+        // CAS the gate only AFTER both copies exist, so the early-return above can never strand it.
+        if (streamCopy != null && streamBusy.compareAndSet(false, true)) {
             val dets = latestDetections   // volatile read — at most ~1 detect cycle stale
             scope.launch(streamLane) {
                 try {
@@ -144,7 +149,7 @@ class PerceptionPipeline(
                 } finally { streamCopy.recycle(); streamBusy.set(false) }
             }
         } else {
-            streamCopy.recycle()   // no HUD client, or lane busy → drop this frame's copy
+            streamCopy?.recycle()   // lane busy → drop this frame's copy (null = no HUD, none taken)
         }
 
         // DETECT LANE: full detect → track → publish boxes → embed, at its own (slower) rate.
@@ -168,12 +173,12 @@ class PerceptionPipeline(
 
                 // Embed newly-confirmed objects on cropLane (network — must not block detection).
                 //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
-                //    cropFrom() copies pixels out of `frame` synchronously, so the snapshot can be
-                //    safely recycled below even while these cropLane coroutines are still running.
+                //    cropFrom() returns pixels it OWNS — never an alias of `frame` (it forces a copy
+                //    when Bitmap.createBitmap hands the source back; see cropFrom). That ownership
+                //    is what makes recycling the frame below safe while these coroutines still run.
                 for (track in tracker.confirmedUnembedded()) {
                     val crop = cropFrom(frame, track.bbox) ?: continue
-                    // Separate, wider crop for the visible thumbnail (see THUMB_PADDING). Copied
-                    // out of `frame` synchronously, same as `crop`.
+                    // Separate, wider crop for the visible thumbnail (see THUMB_PADDING), also ours.
                     val thumbCrop = cropFrom(frame, track.bbox, THUMB_PADDING) ?: crop
                     // Thumb is written LATER (in cropLane, only if this isn't a semantic duplicate),
                     // so a deduped object never leaves a stray JPEG on disk.
@@ -270,6 +275,18 @@ class PerceptionPipeline(
         // and can throw OutOfMemoryError even with valid coords, and this codebase has a history
         // of OOM crashes — swallow it → null → the caller's `?: continue` skips this track.
         paddedCropRect(box, padding, frame.width, frame.height)?.let { r ->
-            try { Bitmap.createBitmap(frame, r.left, r.top, r.width(), r.height()) } catch (_: Throwable) { null }
+            try {
+                val b = Bitmap.createBitmap(frame, r.left, r.top, r.width(), r.height())
+                // `Bitmap.createBitmap(src, …)` is documented to return THE SOURCE ITSELF when the
+                // requested subset is the whole bitmap ("the new bitmap may be the same object as
+                // source"). That happens routinely here: THUMB_PADDING grows a box by 120% of its
+                // own size PER SIDE, so anything larger than ~30% of the frame clamps to the full
+                // frame. The caller then recycles `frame` as soon as the loop ends — while the
+                // cropLane coroutine is still running — and the crop dies with it:
+                //     thumb write failed for laptop (track 49): Can't compress a recycled bitmap
+                // i.e. it silently broke thumbnails for exactly the biggest, most prominent objects.
+                // Force a copy so a crop NEVER aliases the frame, and every crop is ours to recycle.
+                if (b === frame) b.copy(frame.config ?: Bitmap.Config.ARGB_8888, false) else b
+            } catch (_: Throwable) { null }
         }
 }

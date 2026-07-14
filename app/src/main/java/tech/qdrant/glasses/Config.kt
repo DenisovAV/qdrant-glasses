@@ -22,10 +22,29 @@ object Config {
      * to the compiled-in home IP mid-rehearsal, twice). debug.qdrant.relay still works as a
      * volatile override and wins over persist. Read once at startup (app restart applies it).
      */
-    val MAC_BASE_URL: String = runCatching {
+    val MAC_BASE_URL: String = sysprop("qdrant.relay").ifBlank { DEFAULT_MAC_BASE_URL }
+
+    /**
+     * Whether to run the HUD stream (browser dashboard) at all.
+     *
+     *   adb shell setprop debug.qdrant.hud 0     → no HUD; on stage, or when measuring
+     *
+     * The stream is not free: it downscales and JPEG-encodes every frame (~30-40ms each) on the
+     * same cores the CLIP encoder needs, so a crop embed measured with the dashboard open is NOT
+     * the latency the demo has without it. Turning it off is also the honest way to benchmark the
+     * encoder — and a legitimate stage lever when nobody is watching the dashboard.
+     */
+    val HUD_STREAM: Boolean = sysprop("qdrant.hud") != "0"
+
+    /**
+     * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).
+     * persist.* matters because a glasses reboot silently reverted the app to compiled-in defaults
+     * mid-rehearsal — twice. Read once at startup; an app restart applies a change.
+     */
+    private fun sysprop(name: String): String = runCatching {
         val get = Class.forName("android.os.SystemProperties")
             .getMethod("get", String::class.java, String::class.java)
-        fun prop(name: String) = (get.invoke(null, name, "") as String)
-        prop("debug.qdrant.relay").ifBlank { prop("persist.qdrant.relay") }.ifBlank { DEFAULT_MAC_BASE_URL }
-    }.getOrDefault(DEFAULT_MAC_BASE_URL)
+        fun prop(key: String) = (get.invoke(null, key, "") as String)
+        prop("debug.$name").ifBlank { prop("persist.$name") }
+    }.getOrDefault("")
 }

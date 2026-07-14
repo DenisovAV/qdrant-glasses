@@ -184,6 +184,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startStreamer() {
+        // No sink attached → HudPublisher.hasClient stays false → PerceptionPipeline skips the
+        // stream lane entirely (not even the frame copy). See Config.HUD_STREAM.
+        if (!tech.qdrant.glasses.Config.HUD_STREAM) {
+            Log.i(TAG, "HUD stream DISABLED (debug.qdrant.hud=0) — no frame copy, no JPEG encode")
+            return
+        }
         try {
             if (tech.qdrant.glasses.Config.WIRELESS) {
                 // Wireless: push frames OUTBOUND to the Mac relay (no cable). The glasses aren't a
