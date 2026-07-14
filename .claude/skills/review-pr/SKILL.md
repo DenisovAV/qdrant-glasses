@@ -14,7 +14,7 @@ deduplicated, and written to a report.
 ## Context: what this app is
 
 `qdrant_glasses` (package `tech.qdrant.glasses`) is a **single-platform Android app** for
-RayNeo X3 Pro AR glasses (Snapdragon XR2 + Hexagon HTP). It is an on-device multimodal-RAG
+RayNeo X3 Pro AR glasses (Snapdragon AR1 Gen 1 + Hexagon HTP). It is an on-device multimodal-RAG
 **object-memory / lost-and-found demo**: the camera detects objects, crops are embedded
 (CLIP-family), stored in **Qdrant Edge** (Rust FFI via JNA) on the glasses, and retrieved by
 **voice search**. A HUD dashboard mirrors the state to a Mac.
@@ -27,11 +27,12 @@ camera → detect → track/dedup → embed (crop) → store (Qdrant Edge) → v
 
 The reviewers below are organized by that pipeline. Facts that shape how the review runs:
 
-- **Base branch is `master`** (there is no `main`), and the repo has **no git remote / no
-  GitHub PR** yet. The review works off the **local diff** by default.
+- **Base branch is `main`.** The review works off the **local diff** by default; pass a PR number
+  only if a GitHub PR actually exists.
 - The **Mac relay / `embed_server`** (SigLIP2 cloud embeddings + HUD rail) lives in a
-  **separate repo** (`~/Work/edge-mission-control`). It is out of scope here; this review
-  covers the Android app, `scripts/`, and `slides/`.
+  **separate repo** ([qdrant-labs/edge-mission-control](https://github.com/qdrant-labs/edge-mission-control),
+  cloned to `~/Work/edge-mission-control` by convention). It is out of scope here; this review
+  covers the Android app and `scripts/`.
 - **There are TWO pipelines behind `GlassesViewModel.appMode`.** `OBJECTS` (active demo):
   `CropEncoder` → `ObjectStore` → direct top-k search. `LEGACY` "moment" path (dormant in the
   shipped build): whole-frame CLIP + BGE → `VisionMemoryStore` → `MomentRetriever`. When a
@@ -41,7 +42,7 @@ The reviewers below are organized by that pipeline. Facts that shape how the rev
 ## Usage
 
 ```
-/review-pr            # review current branch vs master (the default path)
+/review-pr            # review current branch vs main (the default path)
 /review-pr 42         # review GitHub PR #42 (only if a remote/PR exists)
 /review-pr HEAD~3     # review the last 3 commits
 ```
@@ -50,13 +51,13 @@ The reviewers below are organized by that pipeline. Facts that shape how the rev
 
 ### Step 1: Get the diff
 
-Detect the base branch robustly (this repo's default is `master`, not `main`, and may have no
-remote):
+Detect the base branch robustly (this repo's default is `main`; it was `master` historically, and
+a clone may have neither checked out):
 
 ```bash
-# Base branch: prefer master (this repo's default), fall back to main.
-BASE=master
-git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1 || BASE=main
+# Base branch: prefer main (this repo's default), fall back to master.
+BASE=main
+git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1 || BASE=master
 
 ARG="{arg}"   # the /review-pr argument, if any
 if [ -z "$ARG" ]; then
@@ -90,14 +91,15 @@ untouched should say so briefly and skip deep work):
 
 | Stage | Paths | Owns |
 |-------|-------|------|
-| **Perception** | `detect/`, `camera/`, `GlassesViewModel.kt` | `ObjectDetector`/`YoloDetector`/`YoloQnnDetector`/`MediaPipeDetector`, `YoloDecoder`, `ObjectTracker`, `Geometry`, `CocoLabels`, `FrameCaptureManager`, pipeline orchestration |
+| **Perception** | `detect/`, `camera/`, `pipeline/`, `GlassesViewModel.kt` | `ObjectDetector`/`YoloDetector`/`YoloQnnDetector`/`MediaPipeDetector`, `YoloDecoder`, `ObjectTracker`, `Geometry`, `CocoLabels`, `FrameCaptureManager`, `PerceptionPipeline` (the detect→crop→embed→store hot path, and `DEDUP_COSINE`), `CropGeometry` |
 | **Embedding** | `embedding/` | `CropEncoder` + impls (`OnDeviceCropEncoder`, `MacEndpointEncoder`, TinyCLIP LiteRT/ONNX), text encoders, tokenizers (`*BpeTokenizer`, `WordPieceTokenizer`), `LiteRtSession`, `BgeTextEncoder` |
-| **Storage / Retrieval** | `storage/`, `search/MomentRetriever.kt` | `ObjectStore`, `VisionMemoryStore` (Qdrant Edge JNA FFI), `MomentRetriever` |
-| **Voice / ASR** | `search/` (except `MomentRetriever.kt`) | `SpeechRecognizer` + impls (`Android`/`Google`/`Vosk`/`SherpaVadAsr`), `AmbientTranscriber`, `VoiceSearchManager` |
+| **Storage / Retrieval** | `storage/`, `search/ObjectSearcher.kt`, `search/QueryText.kt`, `search/MomentRetriever.kt` | `ObjectStore`, `VisionMemoryStore` (Qdrant Edge JNA FFI), `ObjectSearcher` + `QueryText` (the ACTIVE voice-search path: cosine-gate-OR-label-match), `MomentRetriever` (dormant) |
+| **Voice / ASR** | `search/` (speech only — object search belongs to Storage/Retrieval above) | `SpeechRecognizer` + impls (`Android`/`Google`/`Vosk`/`SherpaVadAsr`), `AmbientTranscriber`, `VoiceSearchManager` |
 | **Streaming / HUD** | `stream/`, `ui/`, `assets/web/` | `MjpegServer`, `MjpegPusher`, `FrameSink`, `HudEvents`, `BoxOverlay`, view classes, web dashboard |
-| **Build / infra** | `app/build.gradle.kts`, `gradle/libs.versions.toml`, `settings.gradle.kts`, `scripts/`, `app/src/main/assets/**` (non-code), `libs/` AARs | native packaging, deps, demo/stage scripts |
+| **Legacy (dormant)** | `legacy/` | `LegacyMomentPipeline` — whole-frame path, not in the shipped build; findings here are lower-severity, say so |
+| **Build / infra** | `app/build.gradle.kts`, `gradle/libs.versions.toml`, `settings.gradle.kts`, `scripts/`, `app/src/main/assets/**` (non-code) | native packaging, deps, demo/stage scripts |
 
-Non-app areas: `slides/` (reveal.js deck), root gradle, `CLAUDE.md`.
+Non-app areas: root gradle, `CLAUDE.md`.
 
 ### Step 3: Launch ALL agents in parallel
 
@@ -116,13 +118,14 @@ and to state up front if its stage was not touched by the diff.
 
 ```
 You review the perception pipeline of qdrant_glasses (on-device object-memory app for RayNeo
-X3 Pro AR glasses, Snapdragon XR2 + Hexagon HTP). Review changed files under:
+X3 Pro AR glasses, Snapdragon AR1 Gen 1 + Hexagon HTP). Review changed files under:
   app/src/main/java/tech/qdrant/glasses/detect/ and /camera/, and GlassesViewModel.kt
 
 CHECKLIST:
 1. DETECTOR ABSTRACTION: ObjectDetector interface cleanly implemented by YoloQnnDetector (ORT
-   QNN EP / Hexagon HTP), YoloDetector (ORT CPU/NNAPI), MediaPipeDetector (EfficientDet). One
-   detector selected per Config; no leaking of impl details into callers.
+   QNN EP / Hexagon HTP — the default), YoloDetector (LiteRT on the Adreno GPU, ~113ms — the
+   fallback), MediaPipeDetector (EfficientDet, CPU — the last resort). One detector is chosen in
+   DetectorFactory.backend; no leaking of impl details into callers.
 2. ACCELERATOR SELECTION (KEY PROJECT RULE): int8 YOLOv8n runs on Hexagon HTP via ORT QNN EP
    (~8ms) with htp burst perf mode and NCHW layout. This is the ONE model that works on HTP.
    Check: correct EP/provider options, NCHW vs NHWC, quantization assumptions. If HTP init
@@ -158,11 +161,17 @@ vector search on AR glasses). Review changed files under:
 
 CHECKLIST:
 1. ENCODER ABSTRACTION: CropEncoder interface implemented by OnDeviceCropEncoder (TinyCLIP-512
-   INT8 via LiteRT/ONNX, runs on GPU/NNAPI) and MacEndpointEncoder (cloud SigLIP2 over HTTP).
-   Backend chosen via Config.Backend (ON_DEVICE vs MAC). Swapping backends must not leak.
-2. CLIP RUNS ON GPU/CPU, NOT HTP (KEY PROJECT RULE): ViT/CLIP embedders overflow Hexagon TCM
-   and FAIL on HTP — only the CNN detector uses HTP. CLIP must target GPU/NNAPI with a CPU
-   fallback. Flag any attempt to route the vision encoder to the QNN/HTP delegate.
+   int8 via ORT, on the CPU) and MacEndpointEncoder (SigLIP2 on a Mac, over HTTP). The backend is
+   chosen in CropEncoderFactory.backend. Swapping backends must not leak.
+2. CLIP RUNS ON THE CPU, AND THAT IS THE ANSWER (KEY PROJECT RULE — measured, not assumed):
+   every accelerator on this SoC was implemented and benchmarked against a CLIP-class ViT, and
+   every one LOST to the CPU. The Hexagon HTP accepts 44 of the graph's 490 nodes (the rest shred
+   into 50 partitions), the Adreno GPU delegate 198/490, NNAPI 72/890 — and each partition
+   boundary costs a round trip back to the CPU worth more than the acceleration saves. The shipped
+   onnxruntime-android-qnn AAR has NO NNAPI EP at all (zero ANeuralNetworks* imports), so
+   addNnapi() always throws; see the KDoc on createAcceleratedSession. CPU ~200ms is the fast
+   path. FLAG any change that moves the vision encoder onto HTP/GPU/NNAPI "for speed" — that is
+   a regression, not an optimization. (The CNN detector is the opposite: it belongs on the HTP.)
 3. EMBEDDING-SPACE INTEGRITY: vectors MUST be L2-normalized before storage/search; cosine is
    the metric. Vision-crop vectors and text-query vectors must come from the SAME paired
    encoder (CLIP modality gap) — never mix TinyCLIP vision with a different text tower, and
@@ -170,17 +179,22 @@ CHECKLIST:
 4. DIMENSIONS: on-device TinyCLIP = **512-d**, Mac SigLIP2 (`MacEndpointEncoder`) = **768-d**,
    BGE = 384-d. The vector dim MUST match the Qdrant Edge collection dim exactly (the store is
    opened with `cropEncoder.dim`, and each backend gets its own on-disk namespace). A dim
-   mismatch is a CRITICAL silent corruptor. `MacEndpointEncoder` does NOT validate the server's
-   returned vector length against `dim` — flag missing length/finite checks.
+   mismatch is a CRITICAL silent corruptor. `MacEndpointEncoder` DOES validate this today (it
+   throws on a wrong length and on non-finite values) — keep that guard; flag its removal, and
+   flag any NEW encoder that lacks the equivalent.
 5. PER-ENCODER THRESHOLDS: gates differ per encoder AND there are multiple gate systems — the
    *effective* object-search gate is `CropEncoderFactory.searchGate` (mac 0.08 / ondevice 0.25
    / cloud 0.12); `CropEncoder.visionMinScore` (mac 0.12 / ondevice 0.20) flows only into the
    dormant `MomentRetriever`. A threshold hardcoded for one encoder but applied to another —
    or edited on the wrong gate — silently wrecks recall/precision. `DEDUP_COSINE=0.90` is
    applied uniformly to both 512-d and 768-d spaces (a per-backend smell).
-6. ORT ENV LIFETIME: `OrtEnvironment.getEnvironment()` is a **process-wide singleton** — an
-   encoder's `close()` must NOT call `env.close()` (it pulls the environment out from under
-   every other live ONNX encoder / double-closes on mode switch). Flag per-encoder env closes.
+6. ORT ENV LIFETIME: `OrtEnvironment.getEnvironment()` is a process-wide singleton, and every
+   ONNX encoder here calls `env.close()` in its own `close()`. That reads like a double-free
+   hazard and was long flagged as one — but in the PINNED version (onnxruntime 1.26.0)
+   `OrtEnvironment.close()` is decompiled to a literal no-op (`return;`); teardown happens only
+   via a JVM shutdown hook. So it is harmless TODAY and is baseline behaviour, not something a
+   diff introduces. Don't spend review budget on it — but it is a real trip-wire if the ORT pin
+   ever moves, so flag an ORT version bump as needing a re-check here.
 7. TOKENIZERS: the text encoder's tokenizer must match the model it was trained with. Active
    CLIP tokenizer is `RankedBpeTokenizer` (open_clip-correct); `NaiveBpeTokenizer` is present
    but INCORRECT (applies `</w>` to every piece) — flag any switch to it. Check BPE
@@ -209,14 +223,20 @@ CHECKLIST:
    FFI errors surfaced as exceptions, not swallowed.
 2. COLLECTION CONFIG: dimension matches the active encoder (512-d on-device), distance =
    cosine, on-disk persistence path on the glasses. Collection created once / idempotently.
-3. UPSERT: point id derived from the tracking/dedup key (so re-sightings update, not
-   duplicate). Payload (label, confidence, thumbnail JPEG path, timestamp) stored and
-   round-trips. Thumbnail written to disk, not into the vector.
+3. UPSERT: point ids are random UUIDs and the store is INSERT-ONLY — there is no id-based
+   update. De-duplication happens entirely upstream, before upsert is reached: IoU tracking
+   (`ObjectTracker.markEmbedded`) plus a semantic cosine check (`DEDUP_COSINE`, in
+   `pipeline/PerceptionPipeline`). So a dedup bug shows up as DUPLICATE POINTS, never as a
+   clobbered one. Payload (label, bbox, thumb path, timestamp, track id) stored and round-trips.
+   Thumbnail written to disk, not into the vector.
 4. SEARCH: top-k query, score threshold/gate applied consistently with the encoder in use,
    results mapped back to payload. Empty-result path handled.
 5. THREAD SAFETY: store accessed from camera/infer and voice-search threads — is access
-   serialized? Qdrant Edge brute-force + binary quant is the chosen edge strategy (HNSW loses
-   at this scale) — don't reintroduce HNSW config without reason.
+   serialized? On indexing: the shipped collections are plain brute-force over full float
+   (`quantizationConfig = null`) and that is deliberate — benchmarked on this device, HNSW loses
+   at demo scale (and even at 1M: a 1h46m build and a worse p95 than a binary scan). Binary
+   quantization is the win at large scale but is NOT configured today, so don't describe it as
+   active; flag an HNSW/quantization change that arrives without a benchmark.
 6. TWO-PLACE MEMORY: object memory lives in TWO places — the glasses shard AND the Mac relay's
    RAM. Code that "clears memory" must not assume one side. (Wipes go through
    scripts/wipe-demo-memory.sh — do not hand-roll a one-sided wipe.)
@@ -303,7 +323,7 @@ Report CRITICAL / IMPORTANT / MINOR with file:line. State if this stage is untou
 
 **subagent_type:** `android-rag-architect`
 
-**Prompt:** Review this qdrant_glasses diff for architecture. It is an on-device multimodal-RAG object-memory app for RayNeo X3 Pro glasses. Focus on: the swappable abstractions (`ObjectDetector`, `CropEncoder`, `SpeechRecognizer`, `FrameSink`) and whether new code respects them; the on-device-detection + Qdrant-Edge-on-glasses + (optional) cloud-crop-embedding split; `Config` as the single source of truth for `appMode`/`Backend`; and separation between the perception, embedding, storage, and voice stages. **Also review build/native config if `app/build.gradle.kts`, `gradle/libs.versions.toml`, or `libs/` changed:** `useLegacyPackaging=true` (QNN/FastRPC needs the `.so` on disk), `pickFirsts` scoped to `lib/x86/libonnxruntime.so` ONLY (a real arm64 ORT clash must still fail loudly), `noCompress` for `onnx/tflite/bin/data/txt`, `ignoreAssetsPattern` keeping the ~945MB whole-frame CLIP weights OUT while keeping `tinyclip-int8.onnx` IN, `abiFilters = arm64-v8a` only, and version pins (`onnxruntime-android-qnn` and `qnn` >= the qai-hub context-binary QAIRT version). Read CLAUDE.md and flag anything that breaks the two-place-memory or stage-prep contracts.
+**Prompt:** Review this qdrant_glasses diff for architecture. It is an on-device multimodal-RAG object-memory app for RayNeo X3 Pro glasses. Focus on: the swappable abstractions (`ObjectDetector`, `CropEncoder`, `SpeechRecognizer`, `FrameSink`) and whether new code respects them; the on-device-detection + Qdrant-Edge-on-glasses + (optional) cloud-crop-embedding split; mode/backend selection (NOTE: `Config` holds only WIRELESS/MAC_BASE_URL/HUD_STREAM — `appMode` is a private val in `GlassesViewModel`, and each factory owns its own `Backend` enum: `DetectorFactory`, `CropEncoderFactory`, `EncoderFactory`, `Tokenizer`; flag drift BETWEEN them, not against `Config`); and separation between the perception, embedding, storage, and voice stages. **Also review build/native config if `app/build.gradle.kts` or `gradle/libs.versions.toml` changed:** `useLegacyPackaging=true` (QNN/FastRPC needs the `.so` on disk), `pickFirsts` scoped to `lib/x86/libonnxruntime.so` ONLY (a real arm64 ORT clash must still fail loudly), `noCompress` for `onnx/tflite/bin/data/txt`, `ignoreAssetsPattern` keeping the ~945MB whole-frame CLIP weights OUT while keeping `tinyclip-int8.onnx` IN, `abiFilters = arm64-v8a` only, and version pins (`onnxruntime-android-qnn` and `qnn` >= the qai-hub context-binary QAIRT version). Read CLAUDE.md and flag anything that breaks the two-place-memory or stage-prep contracts.
 
 ### Agent 7 — Android RAG Reviewer (domain code review)
 
@@ -315,19 +335,19 @@ Report CRITICAL / IMPORTANT / MINOR with file:line. State if this stage is untou
 
 **subagent_type:** `pr-review-toolkit:silent-failure-hunter`
 
-**Prompt:** Hunt for silent failures and inappropriate fallbacks in this qdrant_glasses diff. Highest-value targets: accelerator init (QNN/HTP → GPU → CPU) that downgrades *silently* so the demo is slow with no log; FFI/JNA errors from Qdrant Edge swallowed in catch blocks; embedding failures returning zero/empty vectors that then get stored; ASR errors that leave the user stuck in Listening; MjpegPusher network failures that should be logged-and-dropped vs ones that hide a real bug. NOTE: this project *intentionally* has GPU→CPU fallback for CLIP — those are fine WHEN logged; the bug is the *silent* ones and any fallback that corrupts data (wrong dim, unnormalized vector).
+**Prompt:** Hunt for silent failures and inappropriate fallbacks in this qdrant_glasses diff. Highest-value targets: accelerator init (QNN/HTP → GPU → CPU) that downgrades *silently* so the demo is slow with no log; FFI/JNA errors from Qdrant Edge swallowed in catch blocks; embedding failures returning zero/empty vectors that then get stored; ASR errors that leave the user stuck in Listening; MjpegPusher network failures that should be logged-and-dropped vs ones that hide a real bug. NOTE: the CLIP encoder runs on the CPU BY DESIGN (every accelerator was measured and lost) — its 'no NNAPI EP in this ORT build (expected)' log line is correct behaviour, not a silent downgrade; the bug is the *silent* ones and any fallback that corrupts data (wrong dim, unnormalized vector).
 
 ### Agent 9 — Type Design Analyzer
 
 **subagent_type:** `pr-review-toolkit:type-design-analyzer`
 
-**Prompt:** Analyze new/modified types and interfaces in this qdrant_glasses diff for encapsulation and invariant expression. Focus on the strategy interfaces (`ObjectDetector`, `CropEncoder`, `SpeechRecognizer`, `FrameSink`), the `Config`/`Backend`/`appMode` types, `HudEvents`, detection/geometry value types (boxes, tracks), and the stored-object/payload model. Are invariants (normalized vectors, matching dims, valid box coords) expressed in the types or left implicit?
+**Prompt:** Analyze new/modified types and interfaces in this qdrant_glasses diff for encapsulation and invariant expression. Focus on the strategy interfaces (`ObjectDetector`, `CropEncoder`, `SpeechRecognizer`, `FrameSink`), the factory `Backend` enums / `AppMode`, `HudEvents`, detection/geometry value types (boxes, tracks), and the stored-object/payload model. Are invariants (normalized vectors, matching dims, valid box coords) expressed in the types or left implicit?
 
 ### Agent 10 — Code Reviewer (general + CLAUDE.md)
 
 **subagent_type:** `pr-review-toolkit:code-reviewer`
 
-**Prompt:** Review this qdrant_glasses diff for general correctness, bugs, and adherence to CLAUDE.md. Kotlin specifics: coroutine scope/cancellation, null safety, resources closed in finally, no blocking on main thread, no hardcoded IPs/serials in committed code (`stage-demo.sh` has a default serial — that's expected in scripts, not in app code). Also assess test coverage: this repo has JUnit/Robolectric unit tests (`YoloDecoderTest`, `ObjectTrackerTest`, `GeometryTest`, `CocoLabelsTest`, `HudEventsTest`, `SmokeTest`) — if the diff changes decode/tracking/geometry/label/HUD logic, is there a matching test? Flag untested new branches in that logic.
+**Prompt:** Review this qdrant_glasses diff for general correctness, bugs, and adherence to CLAUDE.md. Kotlin specifics: coroutine scope/cancellation, null safety, resources closed in finally, no blocking on main thread, no hardcoded IPs/serials in committed code (`stage-demo.sh` has a default serial — that's expected in scripts, not in app code). Also assess test coverage: this repo has JUnit/Robolectric unit tests (`YoloDecoderTest`, `ObjectTrackerTest`, `GeometryTest`, `CropGeometryTest`, `CocoLabelsTest`, `HudEventsTest`, `QueryTextTest`, `ObjectPayloadTest`, `AppStateHolderTest`, `SmokeTest`) — if the diff changes decode/tracking/geometry/label/HUD logic, is there a matching test? Flag untested new branches in that logic.
 
 ### Agent 11 (optional) — Copilot second opinion
 
@@ -335,7 +355,7 @@ Run **only if** the `copilot` CLI is installed (`command -v copilot`). Run direc
 (timeout 300000ms), not as a subagent:
 
 ```bash
-copilot -p "Review the current branch of qdrant_glasses — an on-device multimodal-RAG object-memory Android app (Kotlin) for RayNeo X3 Pro AR glasses (Snapdragon XR2 + Hexagon HTP). Pipeline: camera → YOLOv8n detect (int8 on HTP) → IoU track/dedup → CLIP crop embed (TinyCLIP-512 on GPU/NNAPI, or Mac SigLIP2) → Qdrant Edge vector store (Rust FFI/JNA on the glasses) → voice search (VAD+offline ASR) → HUD. Base branch is master (no remote). Key rules: CLIP must NOT run on HTP (TCM overflow); vectors L2-normalized, cosine, dims must match the collection; never mix encoders/backends in one collection; accelerator fallback must be LOGGED not silent; views reused not recreated (hwui crash). Steps: run 'git diff master...HEAD', read CLAUDE.md, then report bugs / logic errors / race conditions / silent error-swallowing / memory or FFI leaks with file:line. Skip style nits. Categorize CRITICAL / IMPORTANT / MINOR." \
+copilot -p "Review the current branch of qdrant_glasses — an on-device multimodal-RAG object-memory Android app (Kotlin) for RayNeo X3 Pro AR glasses (Snapdragon AR1 Gen 1 + Hexagon HTP). Pipeline: camera → YOLOv8n detect (int8 on HTP) → IoU track/dedup → CLIP crop embed (TinyCLIP-512 on CPU — measured fastest here; every accelerator lost — or Mac SigLIP2) → Qdrant Edge vector store (Rust FFI/JNA on the glasses) → voice search (VAD+offline ASR) → HUD. Base branch is main. Key rules: CLIP must NOT run on HTP (TCM overflow); vectors L2-normalized, cosine, dims must match the collection; never mix encoders/backends in one collection; accelerator fallback must be LOGGED not silent; views reused not recreated (hwui crash). Steps: run 'git diff main...HEAD', read CLAUDE.md, then report bugs / logic errors / race conditions / silent error-swallowing / memory or FFI leaks with file:line. Skip style nits. Categorize CRITICAL / IMPORTANT / MINOR." \
   --allow-all-tools --allow-all-paths --no-auto-update --output-format text 2>&1
 ```
 
@@ -349,8 +369,10 @@ note "Copilot: not run (CLI unavailable)" in the report.
 These are the project's hardware/firmware realities — the equivalent of a platform's "gotchas".
 A change that ignores one of these is a finding even if the code "looks" correct:
 
-- **HTP is for the CNN detector only.** int8 YOLOv8n → Hexagon HTP (~8ms). CLIP/ViT overflows
-  TCM → runs on GPU/NNAPI with CPU fallback.
+- **HTP is for the CNN detector only.** int8 YOLOv8n → Hexagon HTP (~8ms). A CLIP/ViT does not
+  fit any accelerator here — measured, the HTP takes 44 of 490 graph nodes, the GPU 198, NNAPI
+  72/890 — so CLIP runs on the **CPU (~200ms), by design and by measurement**. Moving it to an
+  accelerator is a regression.
 - **UVLO battery brownout.** The voice-search current spike can brown-out the glasses (no BCL
   in firmware). Battery Saver mitigates it — don't add needless peak-current work at search.
 - **WiFi suspends on idle** (RayneoSuspendManager) and firmware **blocks inbound TCP on
@@ -374,12 +396,13 @@ After all agents return:
 
 ## Step 5: Generate the report
 
-Write to `docs/pr-reviews/pr-{number-or-branch}-review.md`:
+Write to `docs/pr-reviews/pr-{number-or-branch}-review.md` (gitignored — review findings are working
+notes, not published artifacts):
 
 ```markdown
 # PR Review: {number or branch} — {title}
 
-**Base:** {master}  **Head:** {branch}  **Date:** {date}
+**Base:** {base}  **Head:** {branch}  **Date:** {date}
 **Reviewers:** 10 agents (5 pipeline-stage + 5 general){ + Copilot if run}
 **Stages touched:** {perception, embedding, storage, voice, streaming, build}
 
