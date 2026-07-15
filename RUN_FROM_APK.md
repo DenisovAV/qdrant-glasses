@@ -103,14 +103,42 @@ adb -s "$S" shell am start -n tech.qdrant.glasses/.MainActivity
 
 ## 5. (Optional) See the memory in a browser — HUD dashboard
 
-The app can mirror the live feed + the object rail to a laptop browser over USB:
+The glasses can mirror the live camera feed and the object-memory rail to a browser on your Mac.
+This is the exact setup we ran on stage, so it is the one that is known to work: the glasses **push**
+each frame and thumbnail to a small relay on the Mac, and the browser reads the dashboard from the
+relay (not directly from the glasses).
+
+**1. Run the relay on the Mac** (holds the rail + serves the dashboard; from
+[qdrant-labs/edge-mission-control](https://github.com/qdrant-labs/edge-mission-control)):
 
 ```bash
-adb -s "$S" forward tcp:8081 tcp:8080
-# then open http://localhost:8081  in a browser
+git clone https://github.com/qdrant-labs/edge-mission-control && cd edge-mission-control
+uv run uvicorn embed_server:app --host 0.0.0.0 --port 9000
 ```
-Keep the USB cable connected; the dashboard shows the camera feed and the saved-object rail with
-thumbnails.
+
+**2. Put the glasses and the Mac on the same WiFi, then point the glasses at the Mac's IP** (this is
+how we ran it on stage):
+
+```bash
+MAC_IP=$(ipconfig getifaddr en0)                                        # the Mac's LAN IP
+adb -s "$S" shell setprop persist.qdrant.relay "http://$MAC_IP:9000"
+adb -s "$S" shell am force-stop tech.qdrant.glasses
+adb -s "$S" shell am start -n tech.qdrant.glasses/.MainActivity
+# sanity check — the glasses can reach the Mac (want 200):
+adb -s "$S" shell "curl -s -m5 -o /dev/null -w '%{http_code}\n' http://$MAC_IP:9000/poll"
+```
+
+**3. Open `http://localhost:9000/`** in a browser on the Mac (or `http://$MAC_IP:9000/` from any
+device on the WiFi). Start recording on the glasses; the feed, the detection boxes and the object
+rail (with thumbnails) appear live.
+
+> **No shared WiFi?** Do it over USB instead — same relay, just a different transport:
+> ```bash
+> adb -s "$S" reverse tcp:9000 tcp:9000
+> adb -s "$S" shell setprop persist.qdrant.relay http://localhost:9000
+> ```
+> then relaunch and open `http://localhost:9000/`.
+
 
 ---
 
