@@ -39,7 +39,7 @@ class QnnB32CropEncoder(context: Context) : CropEncoder {
         // Measures the REAL ORT-QNN-EP latency of the partitioned W8A16 graph on THIS device —
         // the number the native qnn-net-run path (28.6ms, all-on-HTP) can't tell us, since ORT
         // QNN EP rejects LayerNorm/GELU-Div (error 3110) and falls those ops back to the CPU.
-        if (Config.sysprop("qdrant.clipbench") == "1") runBenchmark()
+        if (Config.sysprop("qdrant.clipbench") == "1") runBenchmark(context)
     }
 
     override fun encode(crop: Bitmap): FloatArray = vision.encode(crop)
@@ -51,18 +51,26 @@ class QnnB32CropEncoder(context: Context) : CropEncoder {
         text.close()
     }
 
-    private fun runBenchmark() {
+    private fun runBenchmark(context: Context) {
         val img = syntheticCrop()
         Log.i(TAG, "clipbench: START (vision ${BENCH_N}× on ${img.width}×${img.height}, text ${BENCH_TEXT_N}×)")
-        // Vision: warm up (first run pays the ORT graph-partition + HTP context load), then time.
+        // Vision (QDQ, ORT-partitioned): warm up, then time. Keep a reference vector for cosine.
         repeat(BENCH_WARMUP) { vision.encode(img) }
         val vms = LongArray(BENCH_N)
+        var qdqVec = FloatArray(0)
         for (i in 0 until BENCH_N) {
             val t0 = System.currentTimeMillis()
-            vision.encode(img)                       // also appends its own line to clip_npu_latency.csv
+            qdqVec = vision.encode(img)              // also appends its own line to clip_npu_latency.csv
             vms[i] = System.currentTimeMillis() - t0
         }
-        logStats("vision(NPU W8A16)", vms)
+        logStats("vision(NPU W8A16 QDQ)", vms)
+
+        // Vision (native all-on-HTP via EPContext) — the speed experiment. Cosine vs QDQ is the
+        // correctness gate: a wrong graph name fails the load, a wrong I/O layout drops the cosine.
+        vision.epctxLatencies(context, img, BENCH_WARMUP, BENCH_N)?.let { (ems, evec) ->
+            logStats("vision(native HTP EPContext)", ems)
+            Log.i(TAG, "clipbench: EPContext vs QDQ cosine=%.4f (want ~1.0)".format(cosine(qdqVec, evec)))
+        } ?: Log.i(TAG, "clipbench: EPContext path unavailable (see epctx error above)")
         // Text: exercises BOTH sessions (GPU float + CPU int8); B32ClipTextEncoder logs each.
         repeat(BENCH_WARMUP) { text.encode(BENCH_QUERY) }
         val tms = LongArray(BENCH_TEXT_N)
@@ -83,6 +91,13 @@ class QnnB32CropEncoder(context: Context) : CropEncoder {
             b.setPixel(x, y, Color.rgb((x * 7) and 0xFF, (y * 5) and 0xFF, ((x + y) * 3) and 0xFF))
         }
         return b
+    }
+
+    private fun cosine(a: FloatArray, b: FloatArray): Float {
+        if (a.isEmpty() || b.isEmpty() || a.size != b.size) return Float.NaN
+        var dot = 0.0; var na = 0.0; var nb = 0.0
+        for (i in a.indices) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+        return (dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9)).toFloat()
     }
 
     private fun logStats(label: String, ms: LongArray) {

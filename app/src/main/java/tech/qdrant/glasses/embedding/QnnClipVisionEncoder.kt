@@ -88,6 +88,50 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
         return buf.apply { rewind() }
     }
 
+    /**
+     * DEBUG probe: load the native all-on-HTP context binary via an **EPContext**-ONNX and run it,
+     * for comparison against this (QDQ, ORT-partitioned) session. The native binary keeps every op
+     * on the HTP (no LayerNorm/Div CPU fallback), so if ORT accepts it we should see ~native speed.
+     * Returns (per-run latencies, last output vector) or null if the asset/session isn't available.
+     * Reuses this encoder's exact preprocessing so the vectors are directly comparable.
+     */
+    fun epctxLatencies(context: Context, bitmap: Bitmap, warmup: Int, iters: Int): Pair<LongArray, FloatArray>? {
+        val f = try { extractAsset(context, EPCTX_ASSET) } catch (e: Throwable) {
+            Log.e(TAG, "epctx: asset missing", e); return null
+        }
+        val sess = try {
+            val opts = OrtSession.SessionOptions().apply {
+                addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst"))
+            }
+            env.createSession(f.absolutePath, opts)
+        } catch (e: Throwable) {
+            Log.e(TAG, "epctx: session create FAILED — ${e.message}", e); return null
+        }
+        return try {
+            val resized = Bitmap.createScaledBitmap(bitmap, IMG, IMG, true)
+            val shape = longArrayOf(1, 3, IMG.toLong(), IMG.toLong())
+            repeat(warmup) {
+                OnnxTensor.createTensor(env, bitmapToTensor(resized), shape).use { t -> sess.run(mapOf("image" to t)).use {} }
+            }
+            val ms = LongArray(iters)
+            var last = FloatArray(0)
+            for (i in 0 until iters) {
+                val t = OnnxTensor.createTensor(env, bitmapToTensor(resized), shape)
+                val t0 = System.currentTimeMillis()
+                val r = t.use { sess.run(mapOf("image" to it)) }
+                ms[i] = System.currentTimeMillis() - t0
+                last = r.use { @Suppress("UNCHECKED_CAST") (it.get("image_embeds").get().value as Array<FloatArray>)[0] }
+            }
+            if (resized !== bitmap) resized.recycle()
+            Log.i(TAG, "epctx: OK — ran $iters iters, out dim=${last.size}")
+            ms to last
+        } catch (e: Throwable) {
+            Log.e(TAG, "epctx: run FAILED — ${e.message}", e); null
+        } finally {
+            sess.close()
+        }
+    }
+
     override fun close() {
         session.close()
         env.close()
@@ -96,6 +140,7 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
     companion object {
         private const val TAG = "ClipEncoder"
         private const val ASSET = "clip-vitb32-w8a16.onnx"
+        private const val EPCTX_ASSET = "clip-vitb32-epctx.onnx"
         private const val IMG = 224
     }
 }
