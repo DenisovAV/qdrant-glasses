@@ -39,6 +39,10 @@ class FrameCaptureManager(
 
     private val executor = Executors.newSingleThreadExecutor()
     private var cameraProvider: ProcessCameraProvider? = null
+    // Kept so we can unbind/rebind the SAME analysis use case (see setActive).
+    private var lifecycleOwner: LifecycleOwner? = null
+    private var analysis: ImageAnalysis? = null
+    private val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
     private var lastFrameTimeMs = 0L
     private val frameIntervalMs = 3000L
@@ -64,6 +68,7 @@ class FrameCaptureManager(
 
     fun start(lifecycleOwner: LifecycleOwner) {
         Log.i(TAG, "start: binding camera")
+        this.lifecycleOwner = lifecycleOwner
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
           try {
@@ -86,7 +91,8 @@ class FrameCaptureManager(
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
             analysis.setAnalyzer(executor) { proxy -> analyzeFrame(proxy) }
-            cameraProvider?.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
+            this.analysis = analysis
+            cameraProvider?.bindToLifecycle(lifecycleOwner, cameraSelector, analysis)
             Log.i(TAG, "start: camera bound OK")
           } catch (e: Throwable) {
             // future.get()/bindToLifecycle failure otherwise propagates uncaught on the main
@@ -99,6 +105,34 @@ class FrameCaptureManager(
     fun stop() {
         Log.i(TAG, "stop: analyzed=$framesAnalyzed sent=$framesSent skippedTime=$framesSkippedTime skippedSimilar=$framesSkippedSimilar")
         cameraProvider?.unbindAll()
+    }
+
+    /**
+     * Turn the camera stream off/on by UNBINDING the analysis use case — not just skipping our
+     * frame processing. On the AR1 the camera HAL (`vendor.qti.camera.provider`) burns ~110% of a
+     * core on its own while bound, on top of our ~100% for toBitmap+rotate+scale; together that's
+     * ~2 of the 4 cores, which is why a query starved the CPU text encoder (~1.2s). Unbinding stops
+     * the HAL too. Off during a voice query (Listening/Processing/Results), on for Idle + Recording.
+     * Rebinding on resume costs ~0.5s before frames flow again — fine outside recording.
+     * Idempotent; runs the bind/unbind on the main thread (CameraX requirement).
+     */
+    fun setActive(active: Boolean) {
+        val provider = cameraProvider ?: return
+        val a = analysis ?: return
+        val owner = lifecycleOwner ?: return
+        ContextCompat.getMainExecutor(context).execute {
+            try {
+                if (active && !provider.isBound(a)) {
+                    provider.bindToLifecycle(owner, cameraSelector, a)
+                    Log.i(TAG, "camera resumed")
+                } else if (!active && provider.isBound(a)) {
+                    provider.unbind(a)
+                    Log.i(TAG, "camera stopped for query (frees ~2 cores)")
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "setActive($active) failed", e)
+            }
+        }
     }
 
     /**

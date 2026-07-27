@@ -351,6 +351,13 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             viewModel.state.collect { state ->
                 Log.d(TAG, "state → $state")
+                // Free the cores for the (CPU) text encoder + search while a query is on screen:
+                // STOP the camera (unbind — kills the camera HAL's ~110% too, not just our frame
+                // work) during the whole search interaction, and run it in Idle (ready to record)
+                // and Recording (detection needs frames).
+                val searching = state is AppState.Listening ||
+                    state is AppState.Processing || state is AppState.Results
+                cameraManager.setActive(!searching)
                 when (state) {
                     is AppState.Loading -> showInBothEyes { LoadingView(this@MainActivity) }
                     is AppState.Idle -> showInBothEyes {
