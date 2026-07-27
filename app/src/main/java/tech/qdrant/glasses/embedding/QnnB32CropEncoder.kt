@@ -71,7 +71,7 @@ class QnnB32CropEncoder(context: Context) : CropEncoder {
             text.encode(BENCH_QUERY)
             tms[i] = System.currentTimeMillis() - t0
         }
-        logStats("text(GPU+CPU total)", tms)
+        logStats("text(CPU int8)", tms)
         img.recycle()
         Log.i(TAG, "clipbench: DONE")
     }
