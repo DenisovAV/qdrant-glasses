@@ -41,7 +41,7 @@ object Config {
      * persist.* matters because a glasses reboot silently reverted the app to compiled-in defaults
      * mid-rehearsal — twice. Read once at startup; an app restart applies a change.
      */
-    private fun sysprop(name: String): String = runCatching {
+    internal fun sysprop(name: String): String = runCatching {
         val get = Class.forName("android.os.SystemProperties")
             .getMethod("get", String::class.java, String::class.java)
         fun prop(key: String) = (get.invoke(null, key, "") as String)
