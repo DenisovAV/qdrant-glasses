@@ -77,10 +77,12 @@ class QnnB32CropEncoder(context: Context) : CropEncoder {
         Log.i(TAG, "clipbench: DONE")
     }
 
-    /** A fixed 224×224 crop — content is irrelevant to latency, only shape/dtype are. */
+    /** A non-224 crop (like a real object box) so the bench pays the resize the pipeline pays;
+     *  content is irrelevant to latency, only shape/dtype are. */
     private fun syntheticCrop(): Bitmap {
-        val b = Bitmap.createBitmap(224, 224, Bitmap.Config.ARGB_8888)
-        for (y in 0 until 224) for (x in 0 until 224) {
+        val w = 160; val h = 120
+        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) for (x in 0 until w) {
             b.setPixel(x, y, Color.rgb((x * 7) and 0xFF, (y * 5) and 0xFF, ((x + y) * 3) and 0xFF))
         }
         return b

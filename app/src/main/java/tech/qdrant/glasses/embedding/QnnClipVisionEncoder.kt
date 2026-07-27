@@ -39,6 +39,10 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
 
     private val mean = floatArrayOf(0.48145466f, 0.4578275f, 0.40821073f)
     private val std  = floatArrayOf(0.26862954f, 0.26130258f, 0.27577711f)
+    // Per-channel lookup: (v/255 - mean)/std for every byte value, so the hot per-pixel loop is
+    // three array reads instead of three divides — preprocessing is the crop encode's largest
+    // share now that inference is ~24ms on the NPU.
+    private val lut = Array(3) { c -> FloatArray(256) { v -> (v / 255f - mean[c]) / std[c] } }
 
     private val latencyFile = File(context.filesDir, "clip_npu_latency.csv")
     private var nInfer = 0
@@ -58,7 +62,10 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
     }
 
     override fun encode(bitmap: Bitmap): FloatArray {
-        val resized = Bitmap.createScaledBitmap(bitmap, IMG, IMG, true)
+        // Skip the copy when the crop is already 224×224 (createScaledBitmap allocates + filters
+        // even for a no-op resize); real crops vary in size, so the resize usually still runs.
+        val resized = if (bitmap.width == IMG && bitmap.height == IMG) bitmap
+                      else Bitmap.createScaledBitmap(bitmap, IMG, IMG, true)
         val tensor = OnnxTensor.createTensor(env, bitmapToTensor(resized), longArrayOf(1, 3, IMG.toLong(), IMG.toLong()))
         if (resized !== bitmap) resized.recycle()
         val t0 = System.currentTimeMillis()
@@ -76,15 +83,16 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
 
     private fun bitmapToTensor(bitmap: Bitmap): FloatBuffer {
         val pixels = IntArray(IMG * IMG).also { bitmap.getPixels(it, 0, IMG, 0, 0, IMG, IMG) }
-        val buf = FloatBuffer.allocate(3 * IMG * IMG)
+        val arr = FloatArray(3 * IMG * IMG)
         val stride = IMG * IMG
+        val lutR = lut[0]; val lutG = lut[1]; val lutB = lut[2]
         for (i in pixels.indices) {
             val px = pixels[i]
-            buf.put(i,              ((px shr 16 and 0xFF) / 255f - mean[0]) / std[0])
-            buf.put(i + stride,     ((px shr  8 and 0xFF) / 255f - mean[1]) / std[1])
-            buf.put(i + stride * 2, ((px        and 0xFF) / 255f - mean[2]) / std[2])
+            arr[i]              = lutR[px shr 16 and 0xFF]
+            arr[i + stride]     = lutG[px shr  8 and 0xFF]
+            arr[i + stride * 2] = lutB[px        and 0xFF]
         }
-        return buf.apply { rewind() }
+        return FloatBuffer.wrap(arr)
     }
 
     override fun close() {
