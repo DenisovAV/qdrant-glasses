@@ -114,6 +114,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // DEBUG: inject a text query without voice, for on-device verification of the search path:
+    //   adb shell am broadcast -a tech.qdrant.glasses.DEBUG_SEARCH --es q "bed"
+    // Runs the exact same VM search flow the ASR result would (text-encode + vector search).
+    private val debugSearchReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val q = intent.getStringExtra("q")?.takeIf { it.isNotBlank() } ?: return
+            Log.i(TAG, "DEBUG_SEARCH: \"$q\"")
+            viewModel.onVoiceResult(q)
+        }
+    }
+
     /** A press was released after [heldMs]; [longAlreadyStarted] = the long-press timer fired. */
     private fun onButtonRelease(heldMs: Long, longAlreadyStarted: Boolean) {
         // The long-press that just started a recording already did its job; its release is
@@ -149,6 +160,7 @@ class MainActivity : AppCompatActivity() {
         startStreamer()
         observeState()
         registerReceiver(actionButtonReceiver, IntentFilter("com.rayneo.key_pass_to_user"))
+        registerReceiver(debugSearchReceiver, IntentFilter("tech.qdrant.glasses.DEBUG_SEARCH"))
     }
 
     private fun requestMissingPermissions() {
