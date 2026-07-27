@@ -10,21 +10,27 @@ import java.io.File
 import java.nio.FloatBuffer
 
 /**
- * CLIP ViT-B/32 vision tower on the Hexagon NPU via ORT's QNN Execution Provider, compiling the
- * HTP context ON THIS DEVICE — same pattern as [tech.qdrant.glasses.detect.YoloQnnDetector].
+ * CLIP ViT-B/32 vision tower on the Hexagon NPU via ORT's QNN Execution Provider — running the
+ * **native, all-on-HTP** context binary through an **EPContext** wrapper.
  *
- * The model is a **W8A16** static-quant QDQ-ONNX: 8-bit weights, **16-bit activations**. The AR1's
- * HTP has NO fp16 (compiler rejects any fp16 op for soc_model 58), and plain int8 (W8A8) collapses
- * CLIP embeddings (cosine ~0.45 vs float). W8A16 is what keeps them correct — measured 0.995 vs the
- * float model, and ~28 ms/crop isolated on the AR1 NPU (vs ~200 ms for TinyCLIP on CPU).
+ * The model is W8A16 (8-bit weights, 16-bit activations): the AR1 HTP has NO fp16 and plain int8
+ * collapses CLIP (cosine ~0.45), so W8A16 is what keeps vectors correct (0.995 to float).
  *
- * We ship the SoC-agnostic QDQ-ONNX and let ORT's QNN EP do the HTP "preparation" pass for OUR SoC
- * on first run (`ep.context_enable=1`), caching to `<filesDir>/clip_vitb32_ctx.onnx`; a precompiled
- * context binary is SoC-locked and won't load. Per-crop latency is written to a FILE
- * (`clip_npu_latency.csv`) because the RayNeo camera floods logcat and evicts our lines.
+ * WHY the EPContext wrapper and not a plain QDQ-ONNX: if you hand ORT the QDQ-ONNX and let its QNN
+ * EP partition on-device, it REJECTS every LayerNorm + GELU-Div + Gather (error 3110) and falls
+ * them back to the CPU — dozens of HTP↔CPU round-trips, ~87ms/inference (worse under load). The
+ * native `qnn-context-binary-generator` puts all 761 layers on the HTP in one graph; wrapping that
+ * pre-built binary in a single **EPContext** node means ORT runs it whole, no re-partition:
+ * **~24ms/inference measured on the live AR1, cosine 0.9949 to the QDQ path** (~6x faster).
+ *
+ * The wrapper (`clip-vitb32-epctx.onnx`) carries float32 I/O with Q/DQ nodes to the graph's uint16
+ * activations (input scale 5.99e-05 / zp 29863, output scale 2.04e-04 / zp 51271). It is
+ * **SoC-LOCKED** to the AR1 (HTP V73) — regenerate for another SoC (see the private
+ * ar1-npu-findings.md recipe). No on-device compile step: the context is already built, so session
+ * creation is fast (vs ~21s for the QDQ on-device "preparation" pass).
  *
  * Preprocessing matches CLIP: resize 224, /255, subtract mean / divide std, NCHW float32.
- * I/O: input "image" [1,3,224,224] float → output "image_embeds" [1,512] float.
+ * I/O: input "pixel_values" [1,3,224,224] float → output "embeds" [1,512] float.
  */
 class QnnClipVisionEncoder(context: Context) : VisionEncoder {
 
@@ -39,23 +45,16 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
     private var sumInfer = 0L
 
     init {
-        latencyFile.appendText("=== clip session ${System.currentTimeMillis()} backend=QNN_HTP ViT-B32 W8A16 ===\n")
-        val ctxCache = File(context.filesDir, "clip_vitb32_ctx.onnx")
-        val cached = ctxCache.exists()
-        val modelPath = if (cached) ctxCache.absolutePath else extractAsset(context, ASSET).absolutePath
+        latencyFile.appendText("=== clip session ${System.currentTimeMillis()} backend=QNN_HTP ViT-B32 W8A16 EPContext ===\n")
         val opts = OrtSession.SessionOptions().apply {
             addQnn(mapOf(
                 "backend_path" to "libQnnHtp.so",
                 "htp_performance_mode" to "burst",
             ))
-            if (!cached) {
-                addConfigEntry("ep.context_enable", "1")
-                addConfigEntry("ep.context_file_path", ctxCache.absolutePath)
-            }
         }
         val t0 = System.currentTimeMillis()
-        session = env.createSession(modelPath, opts)
-        Log.i(TAG, "CLIP-QNN session created (cached=$cached) in ${System.currentTimeMillis() - t0}ms")
+        session = env.createSession(extractAsset(context, ASSET).absolutePath, opts)
+        Log.i(TAG, "CLIP-QNN EPContext session created in ${System.currentTimeMillis() - t0}ms")
     }
 
     override fun encode(bitmap: Bitmap): FloatArray {
@@ -63,7 +62,7 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
         val tensor = OnnxTensor.createTensor(env, bitmapToTensor(resized), longArrayOf(1, 3, IMG.toLong(), IMG.toLong()))
         if (resized !== bitmap) resized.recycle()
         val t0 = System.currentTimeMillis()
-        val results = tensor.use { session.run(mapOf("image" to it)) }
+        val results = tensor.use { session.run(mapOf("pixel_values" to it)) }
         val ms = System.currentTimeMillis() - t0
         nInfer++; sumInfer += ms
         latencyFile.appendText("$ms\n")
@@ -71,7 +70,7 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
         Log.i(TAG, "CLIP-QNN vision run=${ms}ms")
         return results.use { r ->
             @Suppress("UNCHECKED_CAST")
-            (r.get("image_embeds").get().value as Array<FloatArray>)[0]
+            (r.get("embeds").get().value as Array<FloatArray>)[0]
         }
     }
 
@@ -88,50 +87,6 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
         return buf.apply { rewind() }
     }
 
-    /**
-     * DEBUG probe: load the native all-on-HTP context binary via an **EPContext**-ONNX and run it,
-     * for comparison against this (QDQ, ORT-partitioned) session. The native binary keeps every op
-     * on the HTP (no LayerNorm/Div CPU fallback), so if ORT accepts it we should see ~native speed.
-     * Returns (per-run latencies, last output vector) or null if the asset/session isn't available.
-     * Reuses this encoder's exact preprocessing so the vectors are directly comparable.
-     */
-    fun epctxLatencies(context: Context, bitmap: Bitmap, warmup: Int, iters: Int): Pair<LongArray, FloatArray>? {
-        val f = try { extractAsset(context, EPCTX_ASSET) } catch (e: Throwable) {
-            Log.e(TAG, "epctx: asset missing", e); return null
-        }
-        val sess = try {
-            val opts = OrtSession.SessionOptions().apply {
-                addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst"))
-            }
-            env.createSession(f.absolutePath, opts)
-        } catch (e: Throwable) {
-            Log.e(TAG, "epctx: session create FAILED — ${e.message}", e); return null
-        }
-        return try {
-            val resized = Bitmap.createScaledBitmap(bitmap, IMG, IMG, true)
-            val shape = longArrayOf(1, 3, IMG.toLong(), IMG.toLong())
-            repeat(warmup) {
-                OnnxTensor.createTensor(env, bitmapToTensor(resized), shape).use { t -> sess.run(mapOf("image" to t)).use {} }
-            }
-            val ms = LongArray(iters)
-            var last = FloatArray(0)
-            for (i in 0 until iters) {
-                val t = OnnxTensor.createTensor(env, bitmapToTensor(resized), shape)
-                val t0 = System.currentTimeMillis()
-                val r = t.use { sess.run(mapOf("image" to it)) }
-                ms[i] = System.currentTimeMillis() - t0
-                last = r.use { @Suppress("UNCHECKED_CAST") (it.get("image_embeds").get().value as Array<FloatArray>)[0] }
-            }
-            if (resized !== bitmap) resized.recycle()
-            Log.i(TAG, "epctx: OK — ran $iters iters, out dim=${last.size}")
-            ms to last
-        } catch (e: Throwable) {
-            Log.e(TAG, "epctx: run FAILED — ${e.message}", e); null
-        } finally {
-            sess.close()
-        }
-    }
-
     override fun close() {
         session.close()
         env.close()
@@ -139,8 +94,7 @@ class QnnClipVisionEncoder(context: Context) : VisionEncoder {
 
     companion object {
         private const val TAG = "ClipEncoder"
-        private const val ASSET = "clip-vitb32-w8a16.onnx"
-        private const val EPCTX_ASSET = "clip-vitb32-epctx.onnx"
+        private const val ASSET = "clip-vitb32-epctx.onnx"
         private const val IMG = 224
     }
 }
