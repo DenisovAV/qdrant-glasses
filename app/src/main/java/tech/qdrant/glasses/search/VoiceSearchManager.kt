@@ -8,6 +8,8 @@ import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import tech.qdrant.glasses.BuildConfig
 import java.io.ByteArrayOutputStream
@@ -29,6 +31,11 @@ class VoiceSearchManager(
         private const val SPEECH_TIMEOUT_MS = 1000L
         private const val SPEECH_PAD_MS = 300          // keep this much audio around the speech region
         private const val MIN_SPEECH_MS = 250          // don't send anything shorter than this to STT
+        // If the system recognizer returns NOTHING (no partial, no result, no error) within this
+        // window, the engine is unavailable — e.g. the offline Google recognizer (Ajay's recipe)
+        // isn't installed, so SpeechRecognizer bound to RayNeo's whitelist-gated one, which never
+        // calls back. Bail to Idle instead of hanging on "Searching…" forever. A partial cancels it.
+        private const val STT_NO_RESPONSE_MS = 5000L
     }
 
     private val vosk = VoskSpeechRecognizer(context)
@@ -42,6 +49,10 @@ class VoiceSearchManager(
     private val androidStt = AndroidSpeechRecognizer(context)
     private val useAndroidStt = android.speech.SpeechRecognizer.isRecognitionAvailable(context)
     @Volatile private var androidSttActive = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var sttTimeout: Runnable? = null
+    private fun cancelSttTimeout() { sttTimeout?.let { mainHandler.removeCallbacks(it) }; sttTimeout = null }
 
     init {
         // Warm the system recognizer at construction (app start, calm moment): the first real
@@ -78,6 +89,7 @@ class VoiceSearchManager(
 
     fun startListening() {
         if (isListening) return
+        cancelSttTimeout()   // defensive: drop any stale timeout from a prior session before re-arming
 
         // Preferred path: on-device offline Google ASR. It manages the mic, VAD and
         // endpointing itself, so we don't open our own AudioRecord here — just hand off.
@@ -86,10 +98,24 @@ class VoiceSearchManager(
             isListening = true
             androidSttActive = true
             listenStartMs = System.currentTimeMillis()
+            // Dead-recognizer guard: bail if nothing comes back in time (see STT_NO_RESPONSE_MS).
+            sttTimeout = Runnable {
+                if (androidSttActive) {
+                    Log.w(TAG, "android STT: no response in ${STT_NO_RESPONSE_MS}ms — recognizer unavailable, bailing")
+                    isListening = false; androidSttActive = false
+                    runCatching { androidStt.stopListening() }
+                    onError("Speech recognizer not responding — is the offline engine installed?")
+                }
+            }.also { mainHandler.postDelayed(it, STT_NO_RESPONSE_MS) }
             androidStt.startListening(
-                onPartial,
-                onResult = { text -> isListening = false; androidSttActive = false; onResult(text) },
-                onError  = { err -> isListening = false; androidSttActive = false; onError(err) }
+                // Guard every callback on androidSttActive: once the session has ended it must go
+                // quiet. Critical for the late error the recognizer emits AFTER our no-response
+                // timeout already bailed — unguarded it re-fires onError and clobbers the
+                // "unavailable" screen straight back to Idle. A partial means the engine is alive
+                // (cancel the timeout) but the session stays active.
+                onPartial = { text -> if (androidSttActive) { cancelSttTimeout(); onPartial(text) } },
+                onResult  = { text -> if (androidSttActive) { androidSttActive = false; isListening = false; cancelSttTimeout(); onResult(text) } },
+                onError   = { err  -> if (androidSttActive) { androidSttActive = false; isListening = false; cancelSttTimeout(); onError(err) } }
             )
             onReady()
             return
@@ -250,6 +276,7 @@ class VoiceSearchManager(
     fun destroy() {
         isListening = false
         androidSttActive = false
+        cancelSttTimeout()
         releaseAudioFocus()
         audioRecord?.release()
         audioRecord = null

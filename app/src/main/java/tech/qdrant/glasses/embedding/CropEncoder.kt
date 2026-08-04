@@ -32,12 +32,15 @@ interface CropEncoder : AutoCloseable {
  * CLOUD is reserved (not built).
  */
 object CropEncoderFactory {
-    enum class Backend { MAC_ENDPOINT, CLOUD, ON_DEVICE }
-    val backend = Backend.ON_DEVICE
+    enum class Backend { MAC_ENDPOINT, CLOUD, ON_DEVICE, QNN_B32 }
+    val backend = Backend.QNN_B32
     fun create(context: Context): CropEncoder = when (backend) {
         // Wireless: reach the Mac on its LAN IP; wired: localhost via adb reverse. One constant.
         Backend.MAC_ENDPOINT -> MacEndpointEncoder(baseUrl = tech.qdrant.glasses.Config.MAC_BASE_URL)
         Backend.ON_DEVICE -> OnDeviceCropEncoder(context)
+        // CLIP ViT-B/32 W8A16 on the Hexagon NPU (crop) + ViT-B/32 text — one 512-dim space,
+        // ~28ms/crop isolated vs TinyCLIP's ~200ms CPU. Its own namespace (different space).
+        Backend.QNN_B32 -> QnnB32CropEncoder(context)
         // Fail fast rather than silently serving wrong-space data if this is selected.
         Backend.CLOUD -> TODO("CLOUD crop encoder not implemented in v1")
     }
@@ -49,6 +52,7 @@ object CropEncoderFactory {
     val namespace: String get() = when (backend) {
         Backend.MAC_ENDPOINT -> "mac"
         Backend.ON_DEVICE -> "ondevice"
+        Backend.QNN_B32 -> "qnnb32"
         Backend.CLOUD -> "cloud"
     }
 
@@ -63,6 +67,8 @@ object CropEncoderFactory {
     val searchGate: Float get() = when (backend) {
         Backend.MAC_ENDPOINT -> 0.08f
         Backend.ON_DEVICE -> 0.25f
+        // ViT-B/32 W8A16 — uncalibrated on real crops; reuse the ON_DEVICE midpoint as a start.
+        Backend.QNN_B32 -> 0.25f
         Backend.CLOUD -> 0.12f
     }
 }
