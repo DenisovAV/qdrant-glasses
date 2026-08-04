@@ -50,13 +50,16 @@ android {
         noCompress += "bin"   // qai-hub QNN context binary — extracted to disk for ORT QNN EP
         noCompress += "data"  // ONNX external weights (yolov8_det.data) — read from disk by ORT
         noCompress += "txt"   // sherpa tokens.txt is mmap'd natively, must stay uncompressed
-        // Keep the legacy whole-frame CLIP weights (~945MB) and the old Kaldi graph OUT of the
-        // APK: OBJECTS mode never loads them (crop embedding runs on the Mac), and bundling them
-        // bloats the APK to ~1.8GB → ~94s flaky USB installs. The files stay on disk (gitignored),
-        // so flipping appMode back to LEGACY only needs them re-included here. bge/ and detect/
-        // models are matched by path and stay in. Pattern segments are colon-separated globs.
-        // tinyclip-int8.onnx (~86MB) is IN: Backend.ON_DEVICE needs it on the glasses.
-        ignoreAssetsPattern = "clip-vision-int8.onnx:clip-text-int8.onnx:clip-vision.tflite:clip-text.tflite:model"
+        // Keep models the OBJECTS + QNN_B32 demo never loads OUT of the APK (they stay on disk,
+        // gitignored, so re-including is just editing this line). Pattern segments are
+        // colon-separated globs matched against asset path components.
+        //   model            — legacy whole-frame CLIP weights + the VOSK model dir
+        //   sherpa           — the sherpa transducer (encoder/decoder/joiner): referenced by NO code
+        //   moonshine        — the ambient ASR model; only SherpaVadAsr loads it, and only in LEGACY
+        //   tinyclip-int8    — the old vision encoder; Backend.QNN_B32 uses clip-vitb32-* instead
+        // Voice search in OBJECTS runs on the system Android STT (no bundled ASR model needed).
+        // The demo's own models (clip-vitb32-epctx/-text-int8, detect/, bge/) match none of these.
+        ignoreAssetsPattern = "clip-vision-int8.onnx:clip-text-int8.onnx:clip-vision.tflite:clip-text.tflite:model:sherpa:moonshine:tinyclip-int8.onnx"
     }
 
     packaging {
