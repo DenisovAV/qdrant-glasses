@@ -89,6 +89,7 @@ class VoiceSearchManager(
 
     fun startListening() {
         if (isListening) return
+        cancelSttTimeout()   // defensive: drop any stale timeout from a prior session before re-arming
 
         // Preferred path: on-device offline Google ASR. It manages the mic, VAD and
         // endpointing itself, so we don't open our own AudioRecord here — just hand off.
@@ -107,9 +108,14 @@ class VoiceSearchManager(
                 }
             }.also { mainHandler.postDelayed(it, STT_NO_RESPONSE_MS) }
             androidStt.startListening(
-                onPartial = { text -> cancelSttTimeout(); onPartial(text) },   // a partial = engine is alive
-                onResult  = { text -> cancelSttTimeout(); isListening = false; androidSttActive = false; onResult(text) },
-                onError   = { err  -> cancelSttTimeout(); isListening = false; androidSttActive = false; onError(err) }
+                // Guard every callback on androidSttActive: once the session has ended it must go
+                // quiet. Critical for the late error the recognizer emits AFTER our no-response
+                // timeout already bailed — unguarded it re-fires onError and clobbers the
+                // "unavailable" screen straight back to Idle. A partial means the engine is alive
+                // (cancel the timeout) but the session stays active.
+                onPartial = { text -> if (androidSttActive) { cancelSttTimeout(); onPartial(text) } },
+                onResult  = { text -> if (androidSttActive) { androidSttActive = false; isListening = false; cancelSttTimeout(); onResult(text) } },
+                onError   = { err  -> if (androidSttActive) { androidSttActive = false; isListening = false; cancelSttTimeout(); onError(err) } }
             )
             onReady()
             return

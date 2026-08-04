@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.job
@@ -211,7 +212,16 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")
-        session.setIdle()
+        // A missing/blocked recognizer (the no-response timeout) is indistinguishable from "nothing
+        // found" if we just go Idle — that's exactly what confused a tester. Surface it briefly, then
+        // auto-recover to Idle (the Error screen has no tap-out). A normal ASR error (e.g. no-match on
+        // a mumble) stays silent so we don't nag on every failed utterance.
+        if (error.contains("not responding")) {
+            session.setError("Speech recognition unavailable — see setup")
+            viewModelScope.launch { delay(3000); if (state.value is AppState.Error) session.setIdle() }
+        } else {
+            session.setIdle()
+        }
     }
 
     fun backToIdle() {

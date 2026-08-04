@@ -407,6 +407,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         Log.i(TAG, "onDestroy")
         unregisterReceiver(actionButtonReceiver)
+        unregisterReceiver(debugSearchReceiver)
         cameraManager.stop()
         voiceManager.destroy()
         mjpeg?.stop()
