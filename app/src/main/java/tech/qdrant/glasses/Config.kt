@@ -25,16 +25,18 @@ object Config {
     val MAC_BASE_URL: String = sysprop("qdrant.relay").ifBlank { DEFAULT_MAC_BASE_URL }
 
     /**
-     * Whether to run the HUD stream (browser dashboard) at all.
+     * Whether to run the HUD stream (browser dashboard). **OPT-IN — off by default.**
      *
-     *   adb shell setprop debug.qdrant.hud 0     → no HUD; on stage, or when measuring
+     *   adb shell setprop debug.qdrant.hud 1     → enable the dashboard stream (our stage setup)
      *
-     * The stream is not free: it downscales and JPEG-encodes every frame (~30-40ms each) on the
-     * same cores the CLIP encoder needs, so a crop embed measured with the dashboard open is NOT
-     * the latency the demo has without it. Turning it off is also the honest way to benchmark the
-     * encoder — and a legitimate stage lever when nobody is watching the dashboard.
+     * Default OFF because the pusher otherwise keeps trying to reach the Mac relay ([MAC_BASE_URL],
+     * a compiled-in LAN IP) on a device that has no relay — spamming `MjpegPusher: Failed to
+     * connect` and phoning home to a private IP that means nothing on someone else's unit (this
+     * confused a tester into thinking it was a Mac/host build). It's also not free: it downscales +
+     * JPEG-encodes every frame on the same cores the CLIP encoder needs. Enable it only when the
+     * relay is actually up.
      */
-    val HUD_STREAM: Boolean = sysprop("qdrant.hud") != "0"
+    val HUD_STREAM: Boolean = sysprop("qdrant.hud") == "1"
 
     /**
      * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).

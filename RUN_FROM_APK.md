@@ -65,7 +65,39 @@ Launch it (or just tap the app on the glasses):
 adb -s "$S" shell am start -n tech.qdrant.glasses/.MainActivity
 ```
 
-You're done — for an `ON_DEVICE` build the demo now works standalone.
+You're done installing — for an `ON_DEVICE` build the demo runs standalone. One more one-time step
+below enables **voice search** (indexing works without it).
+
+---
+
+## 2b. Speech recognition — one-time setup (needed for voice search)
+
+Voice search speaks to the device's **offline Google recognizer** via Android's `SpeechRecognizer`
+(`EXTRA_PREFER_OFFLINE`) — this is RayNeo's own offline-ASR recipe. **The X3 Pro does NOT ship the
+Google recognizer by default**, and RayNeo's built-in one is whitelist-gated for third-party apps.
+Without a working recognizer, a voice query would sit on "Searching…" (the app now times out after
+~5 s and returns to idle instead of hanging). Indexing does not need this — only voice search does.
+
+**1. Check whether it's installed and selected:**
+```bash
+adb -s "$S" shell pm path com.google.android.tts                 # installed? (prints a path if yes)
+adb -s "$S" shell settings get secure voice_recognition_service  # who is the default recognizer?
+```
+If `voice_recognition_service` already points to
+`com.google.android.tts/…GoogleTTSRecognitionService`, you're set — skip to §3.
+
+**2. If it's not installed** — get **"Speech Services by Google"** (`com.google.android.tts`) from a
+trusted source (e.g. APKMirror) and install the split APKs:
+```bash
+adb -s "$S" install-multiple base.apk split_config.arm64_v8a.apk split_config.en.apk split_config.xxhdpi.apk
+```
+
+**3. Make it the default recognizer:**
+```bash
+adb -s "$S" shell settings put secure voice_recognition_service \
+  "com.google.android.tts/com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService"
+```
+First offline use may fetch the English recognition model once (needs internet that one time).
 
 ---
 
