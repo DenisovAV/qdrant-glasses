@@ -89,6 +89,11 @@ class VectorStoreBenchmark(private val context: Context) {
 
     private fun runScale(n: Long): ScaleResult {
         val store = VectorStoreFactory.create(context, DIM, BENCH_NAMESPACE)
+        // Tracks whichever store is CURRENTLY open, so the finally closes exactly once: `store`
+        // gets an intentional close() at the cold-load step below (then this goes null), and
+        // `reopened` takes its place. Without this the finally would double-close `store` — a
+        // native use-after-free in the Rust shard, uncatchable by runCatching.
+        var open: VectorStore? = store
         try {
             store.deleteAll() // start from empty regardless of a previous run's leftovers
 
@@ -157,8 +162,10 @@ class VectorStoreBenchmark(private val context: Context) {
             // NOTE: this is a WARM-CACHE open (we do NOT drop the OS page cache from the app; that
             // needs `echo 3 > /proc/sys/vm/drop_caches` with root between load and reopen).
             store.close()
+            open = null
             val coldT0 = System.nanoTime()
             val reopened = VectorStoreFactory.create(context, DIM, BENCH_NAMESPACE)
+            open = reopened
             val coldMs = (System.nanoTime() - coldT0) / 1e6
             val reopenedCount = reopened.count()
 
@@ -167,6 +174,7 @@ class VectorStoreBenchmark(private val context: Context) {
             reopened.deleteAll()
             val deleteMs = (System.nanoTime() - delT0) / 1e6
             reopened.close()
+            open = null
 
             return ScaleResult(
                 scale = n,
@@ -184,8 +192,9 @@ class VectorStoreBenchmark(private val context: Context) {
                 diskMb = diskMb,
             )
         } finally {
-            // Best-effort: leave nothing behind even on an early failure.
-            runCatching { store.close() }
+            // Best-effort: close whichever store is still open (the original on an early failure,
+            // the reopened one on a late failure) — never the already-closed original.
+            runCatching { open?.close() }
         }
     }
 

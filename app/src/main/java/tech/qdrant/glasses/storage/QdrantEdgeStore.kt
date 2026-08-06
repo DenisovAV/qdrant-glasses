@@ -76,6 +76,9 @@ class QdrantEdgeStore(
     // every read of it happens inside the lock.
     private val lock = Any()
     private var shard: EdgeShard
+    // Guards against a second close(): the native shard is freed on the first, so calling count()
+    // or close() on it again is a use-after-free (an uncatchable native abort). Idempotent close.
+    private var closed = false
 
     init {
         shard = EdgeShard.load(dir, config)
@@ -207,6 +210,9 @@ class QdrantEdgeStore(
     }
 
     override fun close() = synchronized(lock) {
+        // Idempotent: a second close() must NOT touch the already-freed native shard.
+        if (closed) return@synchronized
+        closed = true
         // Always release the native shard even if the diagnostic count throws.
         runCatching { Log.i(TAG, "close: total objects=${count()}") }
         shard.close()
