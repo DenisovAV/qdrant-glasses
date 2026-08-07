@@ -20,6 +20,14 @@ onnxruntime = "1.26.0"
 coroutines = "1.11.0"
 litert = "1.4.0"
 qnn = "2.45.0"           # must be >= the QAIRT version of the qai-hub context binary (2.45)
+# ObjectBox on-device vector DB — only compiled into a VectorStoreFactory.backend=OBJECTBOX bench
+# build (the shipping demo stays on QDRANT_EDGE, which pulls none of this). 5.4.2 = latest stable
+# (ships database core 5.3.2); its Gradle plugin runs codegen (MyObjectBox / <Entity>_ meta) and
+# packages the arm64 native lib at build time. Requires kapt — but this project uses AGP 9's
+# built-in Kotlin, and org.jetbrains.kotlin.kapt is INCOMPATIBLE with built-in Kotlin, so the
+# annotation processor is wired through com.android.legacy-kapt (AGP-versioned, the documented AGP-9
+# kapt fallback ObjectBox's own getting-started prescribes) rather than the JetBrains kapt plugin.
+objectbox = "5.4.2"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -45,3 +53,7 @@ lifecycle = ["lifecycle-viewmodel-ktx", "lifecycle-runtime-ktx"]
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+# com.android.legacy-kapt is versioned with AGP (NOT the objectbox/kotlin version): it is AGP's own
+# kapt shim that coexists with built-in Kotlin (the JetBrains kotlin-kapt plugin does not).
+legacy-kapt = { id = "com.android.legacy-kapt", version.ref = "agp" }
+objectbox = { id = "io.objectbox", version.ref = "objectbox" }

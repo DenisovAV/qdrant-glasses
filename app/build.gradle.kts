@@ -2,6 +2,11 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
+    // Order matters: android application first, then the kapt shim, then io.objectbox (its transform
+    // + annotation processor ride on kapt). Only pulled in for a VectorStoreFactory.backend=OBJECTBOX
+    // bench build; harmless (unused entity + codegen) in the default QDRANT_EDGE demo build.
+    alias(libs.plugins.legacy.kapt)
+    alias(libs.plugins.objectbox)
 }
 
 // Read the Google STT API key from local.properties (kept out of git).
@@ -21,6 +26,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GOOGLE_STT_API_KEY", "\"$googleSttApiKey\"")
 
@@ -104,6 +110,19 @@ dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    // ObjectBox (VectorStoreFactory.backend=OBJECTBOX bench builds). The io.objectbox Gradle plugin
+    // auto-adds these, but we pin them explicitly so the runtime AAR (arm64 native .so) and the kapt
+    // processor are wired deterministically under the legacy-kapt path (belt-and-suspenders; same
+    // 5.4.2 coordinates the plugin would add, so no version clash). objectbox-processor MUST go on the
+    // `kapt` configuration — that is the configuration com.android.legacy-kapt provides.
+    implementation("io.objectbox:objectbox-android:5.4.2")
+    implementation("io.objectbox:objectbox-kotlin:5.4.2")
+    kapt("io.objectbox:objectbox-processor:5.4.2")
+
+    // Instrumented tests (emulator/device) — used to verify the ObjectBoxStore engine end-to-end
+    // (insert / kNN / time-filter / recall) without booting the full NPU pipeline.
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
 }
