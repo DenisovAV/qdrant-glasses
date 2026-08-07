@@ -63,8 +63,16 @@ class VectorStoreBenchmark(private val context: Context) {
     private fun run() {
         val backend = VectorStoreFactory.backend.name.lowercase()
         val maxScale = Config.sysprop("qdrant.dbbench.max").toLongOrNull() ?: DEFAULT_MAX
-        Log.i(TAG, "START backend=$backend dim=$DIM maxScale=$maxScale scales=${SCALES.toList()}")
+        benchmark(backend, maxScale, BENCH_NAMESPACE) { ns -> VectorStoreFactory.create(context, DIM, ns) }
+    }
 
+    /**
+     * Run the full matrix against [makeStore] (invoked with the bench namespace), write the raw CSV
+     * + one-row-per-scale MD, log each scale. Reusable so an instrumented comparison test can bench
+     * several engines back-to-back in ONE process — a clean head-to-head with no NPU/camera contention.
+     */
+    fun benchmark(backendName: String, maxScale: Long, namespace: String, makeStore: (String) -> VectorStore) {
+        Log.i(TAG, "START backend=$backendName dim=$DIM maxScale=$maxScale scales=${SCALES.toList()}")
         val rows = ArrayList<ScaleResult>()
         for (scale in SCALES) {
             if (scale > maxScale) {
@@ -73,22 +81,22 @@ class VectorStoreBenchmark(private val context: Context) {
                 continue
             }
             Log.i(TAG, "scale=$scale: begin")
-            val r = runCatching { runScale(scale) }.getOrElse {
+            val r = runCatching { runScale(scale, namespace, makeStore) }.getOrElse {
                 Log.e(TAG, "scale=$scale failed", it)
                 ScaleResult.failed(scale, it.message ?: it.javaClass.simpleName)
             }
             rows.add(r)
-            writeCsv(backend, r)
+            writeCsv(backendName, r)
             Log.i(TAG, "scale=$scale: ${r.summaryLine()}")
         }
-        writeMarkdown(backend, rows)
-        Log.i(TAG, "DONE — results in ${context.filesDir}")
+        writeMarkdown(backendName, rows)
+        Log.i(TAG, "DONE ($backendName) — results in ${context.filesDir}")
     }
 
     // ---- one scale --------------------------------------------------------------------------
 
-    private fun runScale(n: Long): ScaleResult {
-        val store = VectorStoreFactory.create(context, DIM, BENCH_NAMESPACE)
+    private fun runScale(n: Long, namespace: String, makeStore: (String) -> VectorStore): ScaleResult {
+        val store = makeStore(namespace)
         // Tracks whichever store is CURRENTLY open, so the finally closes exactly once: `store`
         // gets an intentional close() at the cold-load step below (then this goes null), and
         // `reopened` takes its place. Without this the finally would double-close `store` — a
@@ -129,7 +137,7 @@ class VectorStoreBenchmark(private val context: Context) {
             forceGc()
             val pssAfterKb = totalPssKb()
             val ramMb = (pssAfterKb - pssBeforeKb) / 1024.0
-            val diskMb = dirSizeMb(BENCH_NAMESPACE)
+            val diskMb = dirSizeMb(namespace)
 
             // ---- search-kNN (topK=5) ----
             val searchMs = timed { i -> store.search(queries[i % N_QUERIES], TOPK) }
@@ -164,7 +172,7 @@ class VectorStoreBenchmark(private val context: Context) {
             store.close()
             open = null
             val coldT0 = System.nanoTime()
-            val reopened = VectorStoreFactory.create(context, DIM, BENCH_NAMESPACE)
+            val reopened = makeStore(namespace)
             open = reopened
             val coldMs = (System.nanoTime() - coldT0) / 1e6
             val reopenedCount = reopened.count()
@@ -260,14 +268,20 @@ class VectorStoreBenchmark(private val context: Context) {
     }
 
     /**
-     * Disk footprint of the engine's on-disk collection. For Qdrant Edge the directory is
-     * `objects_shard_<namespace>` (its [QdrantEdgeStore] convention) — a future engine with a
-     * different layout adjusts this when its phase lands.
+     * Disk footprint of the engine's on-disk artifacts for this bench. Each engine names its store
+     * after the namespace (`objects_shard_<ns>` for Qdrant, `objectbox_<ns>` for ObjectBox,
+     * `sqlitevec_<ns>.db[-wal/-shm]` for sqlite-vec), so summing every filesDir child whose name
+     * contains the namespace is engine-agnostic — as long as the namespace is UNIQUE per engine in a
+     * comparison run (which the comparison test ensures), there is no cross-engine double counting.
      */
     private fun dirSizeMb(namespace: String): Double {
-        val dir = File(context.filesDir, "objects_shard_$namespace")
-        if (!dir.exists()) return 0.0
-        val bytes = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        // Walk the WHOLE filesDir and sum any file whose path contains the namespace — catches the
+        // flat artifacts (Qdrant `objects_shard_<ns>`, sqlite-vec `sqlitevec_<ns>.db`) AND ObjectBox's
+        // NESTED layout (`objectbox/<ns>/...`). Namespace is unique per engine in a comparison run,
+        // so there is no cross-engine double counting.
+        val bytes = context.filesDir.walkTopDown()
+            .filter { it.isFile && it.absolutePath.contains(namespace) }
+            .sumOf { it.length() }
         return bytes / (1024.0 * 1024.0)
     }
 
