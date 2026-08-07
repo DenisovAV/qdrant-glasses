@@ -119,7 +119,14 @@ dependencies {
     implementation("io.objectbox:objectbox-kotlin:5.4.2")
     kapt("io.objectbox:objectbox-processor:5.4.2")
 
-    // Instrumented tests (emulator/device) — used to verify the ObjectBoxStore engine end-to-end
+    // sqlite-vec (VectorStoreFactory.backend=SQLITE_VEC bench builds). BundledSQLiteDriver ships its
+    // own SQLite (extensions enabled) and loads the vec0 loadable extension via addExtension(); the
+    // extension .so is shipped as jniLibs/arm64-v8a/libvec.so (renamed from the release's vec0.so so
+    // Android extracts it AND SQLite derives the entry point sqlite3_vec_init from the lib name).
+    implementation("androidx.sqlite:sqlite:2.7.0")
+    implementation("androidx.sqlite:sqlite-bundled:2.7.0")
+
+    // Instrumented tests (emulator/device) — used to verify each engine end-to-end
     // (insert / kNN / time-filter / recall) without booting the full NPU pipeline.
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")

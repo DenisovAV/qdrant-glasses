@@ -22,7 +22,7 @@ object VectorStoreFactory {
     fun create(context: Context, dim: Int, namespace: String): VectorStore = when (backend) {
         Backend.QDRANT_EDGE -> QdrantEdgeStore(context, dim, namespace)
         Backend.OBJECTBOX -> ObjectBoxStore(context, dim, namespace)
-        Backend.SQLITE_VEC -> TODO("phase 3 — sqlite-vec adapter")
+        Backend.SQLITE_VEC -> SqliteVecStore(context, dim, namespace)
         Backend.USEARCH -> TODO("phase 4 — USearch adapter")
         Backend.FAISS -> TODO("phase 5 — FAISS adapter")
     }
