@@ -30,11 +30,10 @@ class ComparisonBenchmarkTest {
         val bench = VectorStoreBenchmark(ctx)
         val dim = 512
 
+        // IDENTICAL test for every engine — same scales, same ops. An engine that can't ingest a
+        // scale within the load budget records DNF for it (and larger scales), never a silent cap.
         bench.benchmark("qdrant-edge", max, "cmpq") { ns -> QdrantEdgeStore(ctx, dim, ns) }
-        // ObjectBox HNSW build cost is superlinear on-device (measured 536→68 pts/s from 1k→10k), so
-        // 100k+ ingest is impractical here — cap it (the collapse itself is a finding). Exact engines
-        // stay uncapped.
-        bench.benchmark("objectbox", minOf(max, 20_000L), "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
+        bench.benchmark("objectbox", max, "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
         bench.benchmark("sqlite-vec", max, "cmpsv") { ns -> SqliteVecStore(ctx, dim, ns) }
     }
 }

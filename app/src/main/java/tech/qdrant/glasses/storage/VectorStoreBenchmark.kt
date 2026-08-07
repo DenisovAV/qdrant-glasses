@@ -41,12 +41,18 @@ class VectorStoreBenchmark(private val context: Context) {
         private const val N_QUERIES = 10          // fixed query set for search / recall
         private const val TOPK = 5                // headline kNN + recall@k
         private const val WARMUP = 3              // discarded before every timed op
-        private const val TIMED = 20              // timed runs per search-style op
+        private const val TIMED = 10              // timed runs per search-style op (keeps 1M timing bounded)
         private const val SINGLE_INSERTS = 100    // flush-per-op upserts measured on top of the load
         private const val FILTER_WINDOW = 2000L   // width (in points) of the time filter window
         private const val TS_BASE = 1_000_000_000L // synthetic epoch; point i gets ts = TS_BASE + i
         private const val BENCH_NAMESPACE = "dbbench"
         private const val DEFAULT_MAX = 100_000L
+        // DNF an ingest whose RATE collapses (pathological, e.g. ObjectBox HNSW build cost) — by rate,
+        // not a fixed time cap, so linear-ingest engines still reach 1M (a fixed cap would wrongly
+        // DNF a slow-but-healthy 500k/1M load). Below the floor for 2 consecutive chunks → DNF that
+        // scale + all larger ones (never a silent cap). LOAD_BUDGET_MS is only a runaway safety net.
+        private const val MIN_INGEST_RATE = 150.0     // pts/s
+        private const val LOAD_BUDGET_MS = 1_800_000.0 // 30 min hard safety cap per scale
 
         // 1k → 10k → 100k → 500k → 1M (design §3.2). Anything above the sysprop cap is LOGGED as
         // skipped, never silently dropped.
@@ -74,19 +80,31 @@ class VectorStoreBenchmark(private val context: Context) {
     fun benchmark(backendName: String, maxScale: Long, namespace: String, makeStore: (String) -> VectorStore) {
         Log.i(TAG, "START backend=$backendName dim=$DIM maxScale=$maxScale scales=${SCALES.toList()}")
         val rows = ArrayList<ScaleResult>()
+        var gaveUp = false   // once a scale DNFs on the ingest budget, larger scales can't do better
         for (scale in SCALES) {
             if (scale > maxScale) {
                 Log.i(TAG, "SKIP scale=$scale (> max=$maxScale) — logged, not dropped")
                 rows.add(ScaleResult.skipped(scale))
                 continue
             }
+            if (gaveUp) {
+                rows.add(ScaleResult.dnf(scale, "not attempted — a smaller scale exceeded the ingest budget"))
+                continue
+            }
             Log.i(TAG, "scale=$scale: begin")
-            val r = runCatching { runScale(scale, namespace, makeStore) }.getOrElse {
-                Log.e(TAG, "scale=$scale failed", it)
-                ScaleResult.failed(scale, it.message ?: it.javaClass.simpleName)
+            val r = try {
+                runScale(scale, namespace, makeStore)
+            } catch (e: LoadBudgetExceeded) {
+                gaveUp = true
+                Log.w(TAG, "scale=$scale DNF: ${e.message}")
+                ScaleResult.dnf(scale, e.message ?: "ingest budget exceeded")
+            } catch (t: Throwable) {
+                Log.e(TAG, "scale=$scale failed", t)
+                ScaleResult.failed(scale, t.message ?: t.javaClass.simpleName)
             }
             rows.add(r)
             writeCsv(backendName, r)
+            writeMarkdown(backendName, rows)   // rewrite after every scale so partial results survive a mid-run device death
             Log.i(TAG, "scale=$scale: ${r.summaryLine()}")
         }
         writeMarkdown(backendName, rows)
@@ -116,6 +134,7 @@ class VectorStoreBenchmark(private val context: Context) {
             // ---- LOAD (insert-batch throughput): chunked, ground truth updated per chunk ----
             var loadMs = 0.0
             var inserted = 0L
+            var slowChunks = 0
             while (inserted < n) {
                 val c = minOf(CHUNK.toLong(), n - inserted).toInt()
                 val vecs = Array(c) { randomUnitVector(rnd) }
@@ -125,13 +144,23 @@ class VectorStoreBenchmark(private val context: Context) {
                 }
                 val t0 = System.nanoTime()
                 val ids = store.upsertBatch(items)
-                loadMs += (System.nanoTime() - t0) / 1e6
+                val chunkMs = (System.nanoTime() - t0) / 1e6
+                loadMs += chunkMs
                 // Fold this chunk into the exact top-k for each query BEFORE discarding it.
                 for (qi in 0 until N_QUERIES) {
                     val q = queries[qi]
                     for (i in 0 until c) groundTruth[qi].offer(ids[i], dot(q, vecs[i]))
                 }
                 inserted += c
+                // DNF a collapsing ingest fast, by RATE (not a fixed time cap): 2 consecutive chunks
+                // below the floor → pathological (HNSW build), bail. Skip the first (cold) chunk.
+                val chunkRate = c / (chunkMs / 1000.0)
+                if (inserted > CHUNK && chunkRate < MIN_INGEST_RATE) {
+                    if (++slowChunks >= 2) throw LoadBudgetExceeded(inserted, loadMs)
+                } else {
+                    slowChunks = 0
+                }
+                if (loadMs > LOAD_BUDGET_MS) throw LoadBudgetExceeded(inserted, loadMs) // runaway guard
             }
 
             forceGc()
@@ -288,7 +317,7 @@ class VectorStoreBenchmark(private val context: Context) {
     // ---- output -----------------------------------------------------------------------------
 
     private fun writeCsv(backend: String, r: ScaleResult) {
-        if (r.skipped || r.failed) return
+        if (r.skipped || r.failed || r.dnf) return
         val f = File(context.filesDir, "db_bench_${backend}_${r.scale}.csv")
         val sb = StringBuilder()
         sb.append("op,run,ms\n")
@@ -321,6 +350,10 @@ class VectorStoreBenchmark(private val context: Context) {
             }
             if (r.failed) {
                 sb.append("| ${r.scale} | _failed: ${r.failReason}_ |  |  |  |  |  |  |  |  |\n")
+                continue
+            }
+            if (r.dnf) {
+                sb.append("| ${r.scale} | _DNF: ${r.failReason}_ |  |  |  |  |  |  |  |  |\n")
                 continue
             }
             sb.append(
@@ -387,10 +420,12 @@ class VectorStoreBenchmark(private val context: Context) {
         val diskMb: Double = 0.0,
         val skipped: Boolean = false,
         val failed: Boolean = false,
+        val dnf: Boolean = false,
         val failReason: String = "",
     ) {
         fun summaryLine(): String =
             if (skipped) "skipped"
+            else if (dnf) "DNF: $failReason"
             else if (failed) "FAILED: $failReason"
             else "load=%.0fms (%.0f pts/s) search med=%.3fms recall@$TOPK=%.3f filtered med=%.3fms (n=%d) single med=%.2fms delete=%.2fms cold=%.2fms ram=%.1fMB disk=%.2fMB reopened=%d"
                 .format(loadMs, insertBatchPtsPerSec, search.median, recallAtK, filtered.median,
@@ -399,6 +434,11 @@ class VectorStoreBenchmark(private val context: Context) {
         companion object {
             fun skipped(scale: Long) = ScaleResult(scale = scale, skipped = true)
             fun failed(scale: Long, reason: String) = ScaleResult(scale = scale, failed = true, failReason = reason)
+            fun dnf(scale: Long, reason: String) = ScaleResult(scale = scale, dnf = true, failReason = reason)
         }
     }
+
+    /** Thrown when a scale's ingest RATE collapses (or the safety cap trips) — recorded as DNF. */
+    private class LoadBudgetExceeded(inserted: Long, ms: Double) :
+        Exception("ingest rate collapsed — ${inserted}pts in ${(ms / 1000).toInt()}s (< ${MIN_INGEST_RATE.toInt()} pts/s)")
 }
