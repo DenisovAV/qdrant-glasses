@@ -12,6 +12,7 @@ import tech.qdrant.edge.VectorDataConfig
 import tech.qdrant.edge.ffi.Condition
 import tech.qdrant.edge.ffi.FieldCondition
 import tech.qdrant.edge.ffi.Filter
+import tech.qdrant.edge.ffi.HnswIndexConfig
 import tech.qdrant.edge.ffi.NamedVector
 import tech.qdrant.edge.ffi.PointId
 import tech.qdrant.edge.ffi.Query
@@ -45,6 +46,10 @@ class QdrantEdgeStore(
     context: Context,
     private val dim: Int = OBJECT_DIM,
     namespace: String = "default",
+    // When true, build an HNSW graph (approximate ANN) instead of the default exact brute-force scan
+    // — the graph is finalized in [buildIndex] (`optimize()`). Lets us benchmark BOTH index strategies
+    // in the SAME engine (design: brute-force {Qdrant-scan, sqlite-vec} vs HNSW {Qdrant-HNSW, ObjectBox}).
+    private val hnsw: Boolean = false,
 ) : VectorStore {
 
     companion object {
@@ -53,7 +58,7 @@ class QdrantEdgeStore(
         const val OBJECT_DIM = 768   // SigLIP2 (Mac endpoint) crop-embedding dimension
     }
 
-    override val name: String get() = "qdrant-edge"
+    override val name: String get() = if (hnsw) "qdrant-hnsw" else "qdrant-edge"
 
     // Kept as fields so deleteAll() can drop + recreate the shard on the same directory in-process
     // (no app relaunch): close the native handle, wipe the dir, reload from the same config.
@@ -63,7 +68,13 @@ class QdrantEdgeStore(
         vectorData = mapOf(
             FIELD to VectorDataConfig(
                 size = dim.toULong(), distance = Distance.COSINE,
-                quantizationConfig = null, multivectorConfig = null, datatype = null
+                quantizationConfig = null, multivectorConfig = null, datatype = null,
+                // HNSW mode: m/efConstruct are the Edge SDK's own bench defaults; fullScanThreshold
+                // 10000 means collections under that size still full-scan (HNSW only kicks in above).
+                hnswConfig = if (hnsw) HnswIndexConfig(
+                    m = 16uL, efConstruct = 100uL, fullScanThreshold = 10000uL,
+                    maxIndexingThreads = 1uL, onDisk = false, payloadM = null,
+                ) else null,
             )
         ),
         sparseVectorData = emptyMap()
@@ -146,7 +157,7 @@ class QdrantEdgeStore(
                     gte = sinceMs?.toDouble(), gt = null,
                     lte = untilMs?.toDouble(), lt = null,
                 ),
-                geoBoundingBox = null, geoRadius = null, valuesCount = null,
+                geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
             ))),
             should = null, mustNot = null,
         )
@@ -207,6 +218,13 @@ class QdrantEdgeStore(
         File(dir).mkdirs()
         shard = EdgeShard.load(dir, config)
         Log.i(TAG, "deleteAll: dropped $before points, shard recreated empty at $dir")
+    }
+
+    override fun buildIndex() {
+        // HNSW mode only: build the graph over everything inserted (a single native pass — the pricey
+        // step, ~5.5min@100k / ~1h46m@1M measured in the edge-scale bench, and NOT interruptible).
+        // Brute-force mode: no index → no-op.
+        if (hnsw) synchronized(lock) { shard.optimize() }
     }
 
     override fun close() = synchronized(lock) {

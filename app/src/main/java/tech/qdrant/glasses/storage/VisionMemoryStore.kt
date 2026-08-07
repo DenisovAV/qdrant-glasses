@@ -64,11 +64,11 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
             vectorData = mapOf(
                 VECTOR_FIELD to VectorDataConfig(
                     size = VECTOR_DIM, distance = Distance.COSINE,
-                    quantizationConfig = null, multivectorConfig = null, datatype = null
+                    quantizationConfig = null, multivectorConfig = null, datatype = null, hnswConfig = null
                 ),
                 TEXT_FIELD to VectorDataConfig(
                     size = TEXT_DIM, distance = Distance.COSINE,
-                    quantizationConfig = null, multivectorConfig = null, datatype = null
+                    quantizationConfig = null, multivectorConfig = null, datatype = null, hnswConfig = null
                 )
             ),
             sparseVectorData = emptyMap()
@@ -128,7 +128,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                 filter = Filter(
                     must = listOf(Condition.Field(FieldCondition(
                         key = "type", match = Match.Value(ValueVariants.String(typeValue)),
-                        range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                        range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null
                     ))),
                     should = null, mustNot = null
                 ),
@@ -151,11 +151,11 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
                     must = listOf(
                         Condition.Field(FieldCondition(
                             key = "type", match = Match.Value(ValueVariants.String("text")),
-                            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null
                         )),
                         Condition.Field(FieldCondition(
                             key = "transcript", match = Match.Text(query),
-                            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+                            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null
                         ))
                     ),
                     should = null, mustNot = null
@@ -197,7 +197,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     fun transcriptsOverlappingFrame(frameTimestampMs: Long, slackMs: Long = 1500): List<String> {
         val typeText = Condition.Field(FieldCondition(
             key = "type", match = Match.Value(ValueVariants.String("text")),
-            range = null, geoBoundingBox = null, geoRadius = null, valuesCount = null
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null
         ))
         val resp = shard.scroll(
             ScrollRequest(

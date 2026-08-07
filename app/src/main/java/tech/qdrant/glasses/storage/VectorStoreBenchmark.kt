@@ -162,6 +162,12 @@ class VectorStoreBenchmark(private val context: Context) {
                 }
                 if (loadMs > LOAD_BUDGET_MS) throw LoadBudgetExceeded(inserted, loadMs) // runaway guard
             }
+            // Finalize the ANN index (HNSW engines build the graph here; no-op for brute-force).
+            // Count it in ingest so HNSW's build cost shows up in pts/s — comparable to ObjectBox's
+            // incremental build already folded into its insert time.
+            val buildT0 = System.nanoTime()
+            store.buildIndex()
+            loadMs += (System.nanoTime() - buildT0) / 1e6
 
             forceGc()
             val pssAfterKb = totalPssKb()

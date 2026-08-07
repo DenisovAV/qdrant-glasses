@@ -92,6 +92,14 @@ interface VectorStore : AutoCloseable {
     /** Clear the whole collection in-process (bench reset + the B3 wipe gesture). */
     fun deleteAll()
 
+    /**
+     * Finalize/build the ANN index after a bulk load. Default no-op: brute-force engines (Qdrant
+     * scan, sqlite-vec) have no index to build, and engines that index incrementally on insert
+     * (ObjectBox HNSW) already paid the cost during [upsertBatch]. Qdrant Edge in HNSW mode builds
+     * the graph here via `optimize()`.
+     */
+    fun buildIndex() {}
+
     /** Stable engine name for CSV/MD bench output ("qdrant-edge" / "objectbox" / …). */
     val name: String
 }

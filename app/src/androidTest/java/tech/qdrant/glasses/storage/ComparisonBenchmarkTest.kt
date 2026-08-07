@@ -30,9 +30,14 @@ class ComparisonBenchmarkTest {
         val bench = VectorStoreBenchmark(ctx)
         val dim = 512
 
-        // IDENTICAL test for every engine — same scales, same ops. An engine that can't ingest a
-        // scale within the load budget records DNF for it (and larger scales), never a silent cap.
+        // Both index strategies, IDENTICAL ops per engine:
+        //   brute-force: qdrant-edge (scan), sqlite-vec   ·   HNSW: qdrant-hnsw, objectbox
+        // An engine that can't ingest a scale in budget records DNF (never a silent cap).
         bench.benchmark("qdrant-edge", max, "cmpq") { ns -> QdrantEdgeStore(ctx, dim, ns) }
+        // Qdrant in HNSW mode: capped at 100k — its graph build (optimize()) is a single
+        // non-interruptible native pass (~5.5min@100k, ~1h46m@1M in the edge-scale bench), so 500k/1M
+        // are impractical on-device (shown as skipped, same honest limit ObjectBox hits via DNF).
+        bench.benchmark("qdrant-hnsw", minOf(max, 100_000L), "cmpqh") { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
         bench.benchmark("objectbox", max, "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
         bench.benchmark("sqlite-vec", max, "cmpsv") { ns -> SqliteVecStore(ctx, dim, ns) }
     }
