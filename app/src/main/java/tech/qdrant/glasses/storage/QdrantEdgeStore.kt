@@ -72,8 +72,11 @@ class QdrantEdgeStore(
                 // HNSW mode: m/efConstruct are the Edge SDK's own bench defaults; fullScanThreshold
                 // 10000 means collections under that size still full-scan (HNSW only kicks in above).
                 hnswConfig = if (hnsw) HnswIndexConfig(
+                    // maxIndexingThreads = 0 → auto (use all cores). Was 1 (copied from the Edge SDK
+                    // bench example), which serialized the graph build on ONE of the AR1's 4 cores and
+                    // ~3–4×'d the build time — the real cause of the low HNSW ingest, not Qdrant itself.
                     m = 16uL, efConstruct = 100uL, fullScanThreshold = 10000uL,
-                    maxIndexingThreads = 1uL, onDisk = false, payloadM = null,
+                    maxIndexingThreads = 0uL, onDisk = false, payloadM = null,
                 ) else null,
             )
         ),
