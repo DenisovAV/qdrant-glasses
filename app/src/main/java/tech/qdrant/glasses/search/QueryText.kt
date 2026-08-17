@@ -22,3 +22,47 @@ fun labelMatchesQuery(label: String, queryTokens: Set<String>): Boolean {
         }
     }
 }
+
+data class TimeWindow(val sinceMs: Long?, val untilMs: Long?)
+
+private fun startOfDay(nowMs: Long, zone: java.util.TimeZone): Long {
+    val c = java.util.Calendar.getInstance(zone)
+    c.timeInMillis = nowMs
+    c.set(java.util.Calendar.HOUR_OF_DAY, 0); c.set(java.util.Calendar.MINUTE, 0)
+    c.set(java.util.Calendar.SECOND, 0); c.set(java.util.Calendar.MILLISECOND, 0)
+    return c.timeInMillis
+}
+
+/** Map a few spoken time phrases to a [TimeWindow]; null if the query names no time.
+ *  Calendar-accurate for "today"/"yesterday" in [zone]; relative for hour-scale phrases. */
+fun extractTimeWindow(
+    raw: String,
+    nowMs: Long,
+    zone: java.util.TimeZone = java.util.TimeZone.getDefault(),
+): TimeWindow? {
+    val q = raw.lowercase()
+    val sod = startOfDay(nowMs, zone)
+    return when {
+        Regex("\\byesterday\\b").containsMatchIn(q) -> TimeWindow(sod - 86_400_000L, sod)
+        Regex("\\b(today|this morning|this afternoon|earlier today)\\b").containsMatchIn(q) ->
+            TimeWindow(sod, nowMs)
+        Regex("\\b(an hour ago|last hour|in the last hour)\\b").containsMatchIn(q) ->
+            TimeWindow(nowMs - 3_600_000L, nowMs)
+        Regex("\\b(just now|a moment ago|recently|a minute ago)\\b").containsMatchIn(q) ->
+            TimeWindow(nowMs - 600_000L, nowMs)
+        else -> null
+    }
+}
+
+private val TIME_PHRASE = Regex(
+    "\\b(yesterday|today|this morning|this afternoon|earlier today|an hour ago|last hour|" +
+    "in the last hour|just now|a moment ago|a minute ago|recently)\\b")
+
+/** Remove time words so they don't pollute the CLIP text embedding. */
+fun stripTimePhrases(phrase: String): String =
+    phrase.replace(TIME_PHRASE, "").replace(Regex("\\s+"), " ").trim().ifBlank { phrase }
+
+private val RECALL_INTENT = Regex("where\\s+did\\s+i\\s+(leave|put|last\\s+see|drop)")
+
+/** "where did I leave/put my X" — answer with the most RECENT sighting, not the best score. */
+fun isRecallLocationIntent(raw: String): Boolean = RECALL_INTENT.containsMatchIn(raw.lowercase())
