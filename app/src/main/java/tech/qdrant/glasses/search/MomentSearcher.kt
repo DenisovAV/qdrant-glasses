@@ -73,15 +73,24 @@ class MomentSearcher(
         // channels share the same qvec/window/fetchK — a region is only ever a small-object find on
         // the SAME query embedding, never a separately-tuned search.
         val fetchK = if (isRecallLocationIntent(query)) RECALL_FETCH_K else 5
-        val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
-        val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
         // Task 2.3 (Spec §3): collapse the two channels to one hit per moment (client-side max —
         // frame and region vectors share the same CLIP space), then a bounded soft nudge for a
         // query-token match against a VERIFIED region label. Neither step can introduce a moment
         // that wasn't already a hit on one of the two channels — YOLO tags never gate (Spec §3).
-        val fused = fuseAndCollapse(frameHits, regionHits)
-        val allHits = softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
-            .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
+        // A native EdgeException (locked/corrupt shard) escaping store.searchFrames/searchRegions
+        // would otherwise crash the inferLane coroutine and strand the UI in Processing — wrap the
+        // store calls AND the fusion that consumes their results, same honest Unavailable the embed
+        // failure above already gets.
+        val allHits = try {
+            val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
+            val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
+            val fused = fuseAndCollapse(frameHits, regionHits)
+            softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
+                .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
+        } catch (e: Throwable) {
+            Log.e(TAG, "moment store search failed", e)
+            return ObjectSearcher.Outcome.Unavailable
+        }
         // Region points carry the only labels this channel has (frame points are unlabeled — Stage
         // 1), so there is no label-match fallback here the way ObjectSearcher has one — cosine gate
         // only (a verified-region label match already contributed via softBoost above, not here).
