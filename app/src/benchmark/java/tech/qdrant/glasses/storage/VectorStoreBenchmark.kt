@@ -276,10 +276,14 @@ class VectorStoreBenchmark(private val context: Context) {
             val coldMs = (System.nanoTime() - coldT0) / 1e6
             val reopenedCount = reopened.count()
 
-            // ---- integrity gate #2: the reopened shard must hold every point that was on disk
-            // (a partial/corrupted reload would otherwise sail through as a normal, silently-wrong row).
-            if (reopenedCount != n) {
-                val msg = "reopen count mismatch: reopened.count()=$reopenedCount, want=$n"
+            // ---- integrity gate #2: the reopened shard must hold every point that was on disk —
+            // the n loaded points PLUS the SINGLE_INSERTS single-inserts done above (also persisted,
+            // BEFORE this close+reopen) — a partial/corrupted reload would otherwise sail through as
+            // a normal, silently-wrong row.
+            val wantReopened = n + SINGLE_INSERTS
+            if (reopenedCount != wantReopened) {
+                val msg = "reopen count mismatch: reopened.count()=$reopenedCount, want=$wantReopened " +
+                    "(n=$n + SINGLE_INSERTS=$SINGLE_INSERTS)"
                 Log.e(TAG, "scale=$n INTEGRITY FAIL: $msg")
                 return ScaleResult.failed(n, msg, storedCount = storedCount, reopenedCount = reopenedCount)
             }
@@ -445,7 +449,8 @@ class VectorStoreBenchmark(private val context: Context) {
         sb.append("chunk=$CHUNK · seed=$SEED. Latency in ms. \"max\" is the slowest of $TIMED timed runs, ")
         sb.append("NOT a real percentile (too few samples for one). RAM = PSS delta after load. ")
         sb.append("Disk = shard-dir size. Cold-load is a WARM-cache open (page cache not dropped). ")
-        sb.append("stored/reopened = post-load store.count() / post-reopen count() vs the target n — ")
+        sb.append("stored/reopened = post-load store.count() (vs target n) / post-reopen count() (vs ")
+        sb.append("n+SINGLE_INSERTS, since the single-insert measurement below also persists) — ")
         sb.append("a mismatch fails the scale (see the row) rather than hiding in a normal result.\n\n")
         sb.append("| scale | insert-batch (pts/s) | insert-single med/max | search med/max | recall@$TOPK | ")
         sb.append("filtered med/max (n=ret) | deleteAll | cold-load | RAM MB | disk MB | stored/reopened |\n")
