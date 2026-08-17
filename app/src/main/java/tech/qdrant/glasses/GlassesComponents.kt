@@ -11,6 +11,7 @@ import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.EncoderFactory
+import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
 import tech.qdrant.glasses.pipeline.MomentCapture
@@ -140,6 +141,17 @@ class GlassesComponents(
                     // the moment CropEncoderFactory.backend is MAC_ENDPOINT (768-dim SigLIP2).
                     val ms = QdrantEdgeMomentStore(app, namespace = CropEncoderFactory.namespace, dim = cropEncoder.dim)
                     momentStore = ms
+                    // Label-text vector cache (Task 2.1/2.2, Spec §2 "CLIP-verify-the-label") — one
+                    // encodeText call per distinct YOLO label, ever, memoized + persisted to disk.
+                    // Namespaced by CropEncoderFactory.namespace (Task 2.1 concern #2): a text vector
+                    // from one crop-encoder backend's space is meaningless cosine'd against a region
+                    // vector from another, so switching CropEncoderFactory.backend must not reuse a
+                    // stale file — same convention objectStore/momentStore already use for their
+                    // on-disk collections.
+                    val labelCache = LabelVectorCache(
+                        encodeText = { cropEncoder.encodeText(it) },
+                        persistFile = File(app.filesDir, "label_vectors_${CropEncoderFactory.namespace}.tsv"),
+                    )
                     momentCapture = MomentCapture(
                         scope = scope,
                         embedLane = embedLane,
@@ -147,6 +159,7 @@ class GlassesComponents(
                         store = ms,
                         momentThumbsDir = thumbsDir,
                         isRecording = isRecording,
+                        labelCache = labelCache,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
                         // thumb for /thumb/<key> BEFORE pushing the event, same call ORDER

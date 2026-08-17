@@ -119,6 +119,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         embedLane = embedLane,
                         momentCapture = c.momentCapture,
                     )
+                    // Task 2.2: wire MomentCapture's region source to PerceptionPipeline's confirmed-
+                    // tracks snapshot ONLY NOW — not inside GlassesComponents.load(), where
+                    // momentCapture is actually constructed — because `perception` doesn't exist
+                    // until this line: PerceptionPipeline's OWN constructor above needs
+                    // `c.momentCapture` as an argument, so the two have a genuine circular
+                    // dependency at wiring time (see MomentCapture.regionsProvider's KDoc). No-op
+                    // when the sysprop is off / momentCapture is null.
+                    c.momentCapture?.regionsProvider = { perception?.latestConfirmedRegions ?: emptyList() }
                     searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
                     if (Config.MOMENT_MEMORY) {
                         momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)

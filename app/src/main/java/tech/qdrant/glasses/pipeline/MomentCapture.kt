@@ -1,11 +1,13 @@
 package tech.qdrant.glasses.pipeline
 
 import android.graphics.Bitmap
+import android.graphics.RectF
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
@@ -22,10 +24,12 @@ import kotlin.math.sqrt
  *  - [decide] (+ [Decision]) — the PURE capture-trigger decision (Spec §4 steps 2 + 5). No
  *    Bitmap/coroutine/store touched, so it is fully JVM unit-tested (`MomentCaptureGateTest`).
  *  - [MomentCapture] — the stateful wiring around it: the armed sharpness-selection window
- *    (Spec §4 step 3), the semantic confirm (step 4), and the store + thumb write. This half is
- *    verified on-device at the Stage 1 gate, not by assertion — Spec §4's thresholds are STARTING
- *    values pending an on-device calibration pass (Global Constraints), and the window/confirm
- *    logic needs a real camera feed to exercise meaningfully.
+ *    (Spec §4 step 3), the semantic confirm (step 4), the store + thumb write, and (Task 2.2) the
+ *    CLIP-verified YOLO region layer stored alongside each successful frame keyframe. This half is
+ *    verified on-device at the Stage gates, not by assertion — Spec §4's thresholds (and Task
+ *    2.2's `VERIFY_COS`) are STARTING values pending an on-device calibration pass (Global
+ *    Constraints), and the window/confirm/region logic needs a real camera feed to exercise
+ *    meaningfully.
  *
  * [MomentCapture] mirrors [PerceptionPipeline]'s lane/snapshot/recycle/backpressure discipline
  * (its KDoc) — NOT its store-search dedup: a moment's "dedup" IS the pre-gate + confirm below,
@@ -111,6 +115,13 @@ class MomentCapture(
     private val store: MomentStore,
     private val momentThumbsDir: File,
     private val isRecording: () -> Boolean,
+    // CLIP-verify-the-label cache (plan Task 2.1/2.2, Spec §2) — null disables the region layer
+    // entirely (no verification possible without it), leaving this class's frame-store behavior
+    // identical to before Task 2.2. GlassesComponents always builds one alongside a non-null
+    // regionsProvider when Config.MOMENT_MEMORY is on, so in practice this is non-null whenever
+    // regions matter; the nullability exists so a bare MomentCapture (unit tests, a hypothetical
+    // frame-only deployment) needs no cache just to store keyframes.
+    private val labelCache: LabelVectorCache? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -123,6 +134,16 @@ class MomentCapture(
     // stays unaware of the HUD (same seam style as ObjectSearcher not knowing about HudPublisher
     // internals).
     var onMoment: ((MomentHit) -> Unit)? = null,
+    // Region source (Task 2.2, Spec §2 "CLIP-verify-the-label") — the tracker's CONFIRMED boxes at
+    // the time confirmAndStore runs. Defaults to no regions so a bare MomentCapture (unit tests,
+    // regions disabled) behaves exactly as before Task 2.2. A `var`, not a constructor-injected
+    // `val` set once, for the same reason [onMoment] is: MomentCapture is built inside
+    // GlassesComponents.load(), strictly BEFORE PerceptionPipeline exists —
+    // GlassesViewModel constructs PerceptionPipeline with `c.momentCapture` as one of ITS OWN
+    // constructor args, so the two classes have a genuine circular dependency at wiring time. The
+    // real provider ({ perception.latestConfirmedRegions }) is wired by GlassesViewModel right
+    // after PerceptionPipeline is constructed — see its init block.
+    var regionsProvider: () -> List<RegionCandidate> = { emptyList() },
 ) {
     companion object {
         private const val TAG = "MomentCapture"
@@ -149,6 +170,20 @@ class MomentCapture(
         // downscale would already have blurred that detail away.
         private const val PIXEL_SCALE_SIDE = 160
         private const val THUMB_QUALITY = 85
+        // Region layer (Task 2.2, Spec §2): at most this many confirmed tracker boxes get a region
+        // embedding per stored moment, highest yolo_conf first — a bound on the extra NPU/store work
+        // one keyframe can trigger, not a quality signal (a scene with more objects just loses the
+        // weakest-confidence ones). UNCALIBRATED — tuned at the Stage 2 gate (Spec §8.7).
+        const val REGIONS_MAX_PER_MOMENT = 6
+        // CLIP-verify-the-label threshold (Spec §2/§7): a region embedding's cosine against its
+        // YOLO label's CLIP text vector must clear this to keep the label as a display tag. Seeded
+        // from QnnB32CropEncoder.visionMinScore (0.22, the same encoder's absolute-cosine "is this
+        // a real match at all" floor for a completely different comparison — text query vs stored
+        // crop) as a plausible starting order of magnitude, NOT a calibrated value for THIS
+        // comparison (label text vs region crop, same modality gap but a different query distribution)
+        // — UNCALIBRATED, tuned at the Stage 2 gate. Below this, the region vector is still stored
+        // (it's still a valid recall signal) — only the label is dropped.
+        const val VERIFY_COS = 0.22f
     }
 
     private val busy = AtomicBoolean(false)
@@ -458,6 +493,60 @@ class MomentCapture(
                 ))
             } catch (e: Throwable) {
                 Log.w(TAG, "moment stored (id=$id) but onMoment callback failed: ${e.message}")
+            }
+
+            // Region layer (Task 2.2, Spec §2 "CLIP-verify-the-label"): CLIP-verified YOLO
+            // regions sharing THIS moment's id, layered ADDITIVELY on top of the frame keyframe
+            // just stored above. Still on embedLane, still holding `bitmap` (the chosen keyframe,
+            // recycled only in the outer `finally`), so the crop below is against the EXACT pixels
+            // that were embedded/stored as the frame vector. One try/catch around the whole block
+            // (not per-region): the frame moment is ALREADY durable at this point (id/thumbPath
+            // persisted, baseline advanced above) — a region failure here is diagnostic-worthy but
+            // must never be allowed to look like a frame-store failure.
+            try {
+                val cache = labelCache
+                if (cache == null) {
+                    Log.d(TAG, "moment $id: no LabelVectorCache — region layer skipped")
+                } else {
+                    val regions = regionsProvider()
+                        .sortedByDescending { it.conf }
+                        .take(REGIONS_MAX_PER_MOMENT)
+                    for (region in regions) {
+                        val box = RectF(
+                            region.left * bitmap.width, region.top * bitmap.height,
+                            region.right * bitmap.width, region.bottom * bitmap.height,
+                        )
+                        val crop = cropFrom(bitmap, box) ?: continue
+                        try {
+                            val regionVec = cropEncoder.encode(crop)
+                            val verifyCos = cache.verify(regionVec, region.label)
+                            val verified = verifyCos >= VERIFY_COS
+                            // dedup-check-style diagnostic line (PerceptionPipeline's convention) so
+                            // VERIFY_COS can be calibrated on real data at the Stage 2 gate.
+                            Log.i(TAG, "region: label=${region.label} verifyCos=%.3f yoloConf=%.3f -> %s"
+                                .format(verifyCos, region.conf, if (verified) "stored" else "label-dropped"))
+                            store.storeRegion(regionVec, MomentPayload(
+                                type = "region",
+                                momentId = id,
+                                episodeId = episodeId,
+                                timestampMs = ts,
+                                tEndMs = ts,
+                                thumbPath = if (thumbOk) thumbFile.absolutePath else "",
+                                bbox = "%.3f,%.3f,%.3f,%.3f".format(region.left, region.top, region.right, region.bottom),
+                                // Verified → keep the label as a display tag; unverified → keep the
+                                // vector as a recall signal but drop the (unreliable) label (Spec §2).
+                                label = if (verified) region.label else "",
+                                yoloConf = region.conf,
+                                verifyCos = verifyCos,
+                                text = "",
+                            ))
+                        } finally {
+                            crop.recycle()
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "moment stored (id=$id) but region layer failed: ${e.message}")
             }
         } finally {
             bitmap.recycle()
