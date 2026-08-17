@@ -7,7 +7,7 @@ import io.objectbox.BoxStore
 import io.objectbox.kotlin.query
 
 /**
- * ObjectBox implementation of [VectorStore] (design §4 Phase 2) — the HNSW alternative to
+ * ObjectBox implementation of [VectorStore] (the benchmark's Phase 2 engine) — the HNSW alternative to
  * [QdrantEdgeStore]'s exact brute-force scan. Only instantiated when
  * [VectorStoreFactory.backend] == OBJECTBOX (a benchmark build); the demo default stays Qdrant.
  *

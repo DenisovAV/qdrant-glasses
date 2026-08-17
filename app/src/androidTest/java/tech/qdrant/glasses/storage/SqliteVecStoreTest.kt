@@ -54,7 +54,9 @@ class SqliteVecStoreTest {
 
     @Test fun recall_is_exact_for_bruteforce() {
         // sqlite-vec is brute-force (exact), so recall@5 on ANY data — even random near-orthogonal
-        // vectors — must be 1.0. (Contrast ObjectBox HNSW, which is approximate.)
+        // vectors — should be ~1.0 / effectively exact. (Contrast ObjectBox HNSW, which is
+        // approximate.) Not asserted at hard 1.0: vec0's native cosine vs this test's Kotlin Double
+        // ground truth can disagree on a boundary tie.
         val rnd = Random(11)
         val n = 500
         val vecs = Array(n) { unit(rnd) }
@@ -66,7 +68,7 @@ class SqliteVecStoreTest {
         val exact = (0 until n).sortedByDescending { dot(q, vecs[it]) }.take(5).map { ids[it] }.toSet()
         val got = store.search(q, 5).map { it.id }.toSet()
         val recall = exact.count { it in got }.toDouble() / exact.size
-        assertTrue("brute-force recall@5 must be exact, was $recall", recall >= 0.99)
+        assertTrue("brute-force recall@5 should be ~1.0 / effectively exact, was $recall", recall >= 0.99)
     }
 
     @Test fun search_filtered_restricts_to_time_window() {

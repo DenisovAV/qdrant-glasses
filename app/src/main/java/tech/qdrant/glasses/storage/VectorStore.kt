@@ -81,7 +81,10 @@ interface VectorStore : AutoCloseable {
     fun search(vector: FloatArray, topK: Int = 5): List<ObjectHit>
 
     /** k-nearest by cosine, restricted to points whose `timestamp_ms` is in [[sinceMs], [untilMs]]
-     *  (either bound null = open). Filter-during-scan (a post-filtered top-k could return < k). */
+     *  (either bound null = open). Backends differ in HOW they filter, so the < k guarantee differs
+     *  too: Qdrant Edge and sqlite-vec (both brute-force) apply the range condition DURING the scan,
+     *  so a top-k that finds k matches always returns k. ObjectBox (HNSW) over-fetches a candidate
+     *  set THEN filters it, so it CAN return fewer than k if too few candidates survive the window. */
     fun searchFiltered(vector: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<ObjectHit>
 
     /** Every stored object, oldest-first (payload only, no vectors) — used to rebuild the HUD rail. */

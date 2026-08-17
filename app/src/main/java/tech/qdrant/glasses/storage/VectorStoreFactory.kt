@@ -9,9 +9,11 @@ import android.content.Context
  * construction (only the active engine's native libs and symbols live in-process) and the shipping
  * demo build stays on the default with no extra dependencies.
  *
- * Only [Backend.QDRANT_EDGE] is wired today (the product default + baseline); the alternatives are
- * the phased benchmark integrations (design §4) and each `TODO`s until its phase lands. Flipping
- * [backend] is the ONLY change needed to build+measure a different engine — never a runtime switch.
+ * [Backend.QDRANT_EDGE] is the product default + baseline. [Backend.OBJECTBOX] and
+ * [Backend.SQLITE_VEC] are also fully wired — the benchmark's HNSW and brute-force-in-SQLite
+ * comparison points. Only [Backend.USEARCH] and [Backend.FAISS] remain `TODO`, until their phase
+ * lands. Flipping [backend] is the ONLY change needed to build+measure a different engine — never a
+ * runtime switch.
  */
 object VectorStoreFactory {
     enum class Backend { QDRANT_EDGE, OBJECTBOX, SQLITE_VEC, USEARCH, FAISS }

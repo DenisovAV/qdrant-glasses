@@ -11,8 +11,10 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * sqlite-vec implementation of [VectorStore] (design §4 Phase 3) — brute-force + (optional) binary,
- * the same index family Qdrant Edge wins with at edge scale, but inside SQLite.
+ * sqlite-vec implementation of [VectorStore] (the benchmark's Phase 3 engine) — brute-force f32
+ * cosine via the `vec0` virtual table (no binary/quantized path in THIS class — that's a separate
+ * capability of Qdrant's), the same index family Qdrant Edge wins with at edge scale, but inside
+ * SQLite.
  *
  * The `vec0` virtual table does the KNN; we reach it through **androidx.sqlite**'s
  * [BundledSQLiteDriver] (it ships its own SQLite with extension-loading enabled) plus
