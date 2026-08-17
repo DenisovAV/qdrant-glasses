@@ -304,48 +304,69 @@ class MomentCapture(
 
             val ts = nowMs()
             val thumbFile = File(momentThumbsDir, "moment_$ts.jpg")
+            // Bitmap.compress returns false on an ENCODING failure without throwing — the try/catch
+            // alone doesn't see that case. A false return used to be treated as success anyway,
+            // which persisted a thumbPath pointing at an empty/invalid file (a broken HUD card with
+            // no trace of what went wrong). Fold the Boolean return into thumbOk too, and delete the
+            // file in both the false-return and the exception case: compress() can leave a
+            // zero-byte/partial file behind before either reports failure.
             val thumbOk = try {
-                FileOutputStream(thumbFile).use { bitmap.compress(Bitmap.CompressFormat.JPEG, THUMB_QUALITY, it) }
-                true
+                val compressed = FileOutputStream(thumbFile).use {
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, THUMB_QUALITY, it)
+                }
+                if (!compressed) Log.w(TAG, "moment thumb compress returned false: $thumbFile")
+                compressed
             } catch (e: Throwable) {
                 Log.w(TAG, "moment thumb write failed: ${e.message}")
                 false
             }
+            if (!thumbOk) thumbFile.delete()
 
             val storeT0 = System.currentTimeMillis()
-            // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the
-            // new point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
-            // documents on storeMoment(). The gate embedding above IS the stored vector: it is
-            // never re-embedded here or anywhere else on this path.
-            val id = store.storeMoment(vec, MomentPayload(
-                type = "frame",
-                momentId = "",
-                episodeId = episodeId,
-                timestampMs = ts,
-                tEndMs = ts,
-                thumbPath = if (thumbOk) thumbFile.absolutePath else "",
-                bbox = "",
-                label = "",
-                yoloConf = 0f,
-                verifyCos = 0f,
-                text = "",
-            ))
-            val storeMs = System.currentTimeMillis() - storeT0
+            try {
+                // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the
+                // new point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
+                // documents on storeMoment(). The gate embedding above IS the stored vector: it is
+                // never re-embedded here or anywhere else on this path.
+                val id = store.storeMoment(vec, MomentPayload(
+                    type = "frame",
+                    momentId = "",
+                    episodeId = episodeId,
+                    timestampMs = ts,
+                    tEndMs = ts,
+                    thumbPath = if (thumbOk) thumbFile.absolutePath else "",
+                    bbox = "",
+                    label = "",
+                    yoloConf = 0f,
+                    verifyCos = 0f,
+                    text = "",
+                ))
+                val storeMs = System.currentTimeMillis() - storeT0
 
-            // Advance the baseline ONLY on a successful store — a failed embed/store above already
-            // returned early, leaving lastStoredGrid/lastStoredVec/lastStoreMs untouched so the
-            // NEXT gate fire retries against the same last-known-good keyframe, not a phantom one.
-            lastStoredGrid = grid
-            lastStoredVec = vec
-            lastStoreMs = ts
+                // Advance the baseline ONLY on a successful store — a failed embed/store above already
+                // returned early, leaving lastStoredGrid/lastStoredVec/lastStoreMs untouched so the
+                // NEXT gate fire retries against the same last-known-good keyframe, not a phantom one.
+                lastStoredGrid = grid
+                lastStoredVec = vec
+                lastStoreMs = ts
 
-            val count = store.count()
-            Log.i(TAG, "moment stored: id=$id decision=$decision cos=%.3f (embed=${embedMs}ms store=${storeMs}ms) total=$count"
-                .format(cos))
-            onMoment?.invoke(MomentHit(
-                id = id, score = 0f, type = "frame", momentId = id, timestampMs = ts,
-                thumbPath = if (thumbOk) thumbFile.absolutePath else "", label = "", bbox = "",
-            ))
+                val count = store.count()
+                Log.i(TAG, "moment stored: id=$id decision=$decision cos=%.3f (embed=${embedMs}ms store=${storeMs}ms) total=$count"
+                    .format(cos))
+                onMoment?.invoke(MomentHit(
+                    id = id, score = 0f, type = "frame", momentId = id, timestampMs = ts,
+                    thumbPath = if (thumbOk) thumbFile.absolutePath else "", label = "", bbox = "",
+                ))
+            } catch (e: Throwable) {
+                // storeMoment (native shard/flush) or onMoment (Task 1.6's HUD forward) can throw.
+                // Left unguarded this escaped scope.launch(embedLane) UNCAUGHT (mirrors the crop-embed
+                // catch in PerceptionPipeline's onFrame) and orphaned the thumb just written above.
+                // Log + delete the orphan and DO NOT rethrow: lastStoredGrid/Vec/Ms are untouched
+                // (the advance above never ran), so the next gate fire retries cleanly against the
+                // same last-known-good keyframe instead of a phantom one.
+                Log.w(TAG, "moment store failed, will retry on the next gate fire: ${e.message}")
+                if (thumbOk) thumbFile.delete()
+            }
         } finally {
             bitmap.recycle()
         }
