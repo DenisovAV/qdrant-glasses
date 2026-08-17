@@ -11,7 +11,8 @@ import kotlinx.coroutines.withContext
 import tech.qdrant.glasses.detect.ObjectDetector
 import tech.qdrant.glasses.detect.ObjectTracker
 import tech.qdrant.glasses.embedding.CropEncoder
-import tech.qdrant.glasses.storage.ObjectStore
+import tech.qdrant.glasses.storage.ObjectPayload
+import tech.qdrant.glasses.storage.VectorStore
 import tech.qdrant.glasses.stream.HudPublisher
 import java.io.File
 import java.io.FileOutputStream
@@ -39,7 +40,7 @@ class PerceptionPipeline(
     private val detector: ObjectDetector,
     private val tracker: ObjectTracker,
     private val cropEncoder: CropEncoder,
-    private val store: ObjectStore,
+    private val store: VectorStore,
     private val hud: HudPublisher,
     private val isRecording: () -> Boolean,
     private val onMemoryIndexed: () -> Unit,
@@ -231,8 +232,15 @@ class PerceptionPipeline(
                                 Log.w(TAG, "thumb write failed for $label (track $tid): ${e.message}"); false
                             }
                             val storeT0 = System.currentTimeMillis()
-                            store.upsert(vec, label, bboxStr, System.currentTimeMillis(), tid,
-                                if (thumbOk) thumbFile.absolutePath else "")
+                            // caption reserved (empty) for a later hybrid upgrade.
+                            store.upsert(vec, ObjectPayload(
+                                label = label,
+                                bbox = bboxStr,
+                                timestampMs = System.currentTimeMillis(),
+                                trackId = tid,
+                                thumbPath = if (thumbOk) thumbFile.absolutePath else "",
+                                caption = "",
+                            ))
                             val storeMs = System.currentTimeMillis() - storeT0
                             // Bump the session counter on inferLane (the only lane that touches it),
                             // only while still Recording (a late embed after stopRecording must not

@@ -89,3 +89,4 @@ app/src/main/assets/detect/qnn/
 
 # Conference slides — presentation material, not part of the app. Lives with the talk, not here.
 slides/
+.kotlin/

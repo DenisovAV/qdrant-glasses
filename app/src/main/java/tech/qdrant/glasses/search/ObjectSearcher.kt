@@ -5,7 +5,7 @@ import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.storage.MemoryFrame
 import tech.qdrant.glasses.storage.ObjectHit
-import tech.qdrant.glasses.storage.ObjectStore
+import tech.qdrant.glasses.storage.VectorStore
 import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
 
@@ -23,7 +23,7 @@ import tech.qdrant.glasses.stream.HudPublisher
  */
 class ObjectSearcher(
     private val cropEncoder: CropEncoder,
-    private val store: ObjectStore,
+    private val store: VectorStore,
     private val hud: HudPublisher,
 ) {
     companion object {

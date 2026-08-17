@@ -13,7 +13,9 @@ import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
 import tech.qdrant.glasses.search.MomentRetriever
 import tech.qdrant.glasses.search.SherpaVadAsr
-import tech.qdrant.glasses.storage.ObjectStore
+import tech.qdrant.glasses.storage.DbBenchRunner
+import tech.qdrant.glasses.storage.VectorStore
+import tech.qdrant.glasses.storage.VectorStoreFactory
 import tech.qdrant.glasses.storage.VisionMemoryStore
 
 /**
@@ -33,7 +35,7 @@ class GlassesComponents(
     val detector: ObjectDetector?,
     val tracker: ObjectTracker?,
     val cropEncoder: CropEncoder?,
-    val objectStore: ObjectStore?,
+    val objectStore: VectorStore?,
     val retriever: MomentRetriever?,
 ) : AutoCloseable {
 
@@ -72,13 +74,16 @@ class GlassesComponents(
             var detector: ObjectDetector? = null
             var tracker: ObjectTracker? = null
             var cropEncoder: CropEncoder? = null
-            var objectStore: ObjectStore? = null
+            var objectStore: VectorStore? = null
             var retriever: MomentRetriever? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 tracker = ObjectTracker(confirmSightings = 3)
                 cropEncoder = CropEncoderFactory.create(app)
-                objectStore = ObjectStore(
+                // The vector engine is the single build-time switch (VectorStoreFactory.backend);
+                // QDRANT_EDGE is the default → identical behavior to the former direct ObjectStore.
+                // Namespace stays per-crop-encoder so each variant keeps its own on-disk collection.
+                objectStore = VectorStoreFactory.create(
                     app,
                     dim = cropEncoder.dim,
                     namespace = CropEncoderFactory.namespace,
@@ -86,7 +91,12 @@ class GlassesComponents(
                 // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
                 // TinyCLIP have different cosine scales, so an absent query returns nothing).
                 retriever = MomentRetriever(store, visionMinScore = cropEncoder.visionMinScore)
-                Log.i(TAG, "object mode ready (backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim}), objects=${objectStore.count()}")
+                Log.i(TAG, "object mode ready (store=${objectStore.name}, backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim}), objects=${objectStore.count()}")
+                // Optional in-app vector-DB benchmark, gated + off the main thread. This file
+                // compiles into both flavors, so the actual sysprop-check + launch is indirected
+                // through a flavor seam: a no-op in the demo flavor, the real thing in benchmark
+                // (see DbBenchRunner's KDoc, and its two flavor copies, for why).
+                DbBenchRunner.runIfEnabled(app)
                 // NOTE: the "fill any already-connected HUDs' rails" broadcast does NOT happen
                 // here — it needs `hud`, which the VM constructs independently of `components`.
                 // The VM's init calls hud.broadcastRailSnapshot() itself right after load() returns.
