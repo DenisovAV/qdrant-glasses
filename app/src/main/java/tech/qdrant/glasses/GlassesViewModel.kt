@@ -142,8 +142,13 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // onMoment either.
                     val hudOnMoment = c.momentCapture?.onMoment
                     c.momentCapture?.onMoment = { hit ->
-                        hudOnMoment?.invoke(hit)
+                        // Schedule the counter update BEFORE invoking hudOnMoment (Codex P2 fix):
+                        // if the HUD callback throws (e.g. ms.count() or an attached sink), the
+                        // launch below would never be reached and MomentCapture's own catch would
+                        // swallow the exception — the moment gets stored but `indexed` silently
+                        // stays stale. Launching first makes the counter update immune to that.
                         viewModelScope.launch(inferLane) { session.onMemoryIndexed() }
+                        hudOnMoment?.invoke(hit)
                     }
                     perception = localPerception
                     if (Config.MOMENT_MEMORY) {
