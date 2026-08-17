@@ -55,6 +55,10 @@ class PerceptionPipeline(
         // while still keeping genuinely different objects apart. The dedup-check log prints the
         // real nearest-neighbor cosine per object so this can be tuned on data at rehearsal.
         private const val DEDUP_COSINE = 0.90f
+        // Dedup only against the RECENT past: the same object seen again in a new place a day
+        // later is a NEW memory, not a duplicate. The old code searched the WHOLE store forever,
+        // which collapsed every re-sighting into the first-ever one (the "wallet yesterday" bug).
+        private const val DEDUP_WINDOW_MS = 10L * 60_000L   // 10 minutes
         // Browser stream is downscaled from the ~960px detection frame to keep JPEG encode cheap
         // (~30-40ms → smooth ~25 FPS). Height is derived from the frame's aspect ratio at runtime.
         private const val STREAM_WIDTH = 640
@@ -208,7 +212,11 @@ class PerceptionPipeline(
                             // We DON'T unmark the track here: this is "handled, just not stored", not a
                             // failure, so we must not re-run this search every frame for the same track.
                             val dedupT0 = System.currentTimeMillis()
-                            val nearest = store.search(vec, topK = 1).firstOrNull()
+                            val nearest = store.searchFiltered(
+                                vec, topK = 1,
+                                sinceMs = System.currentTimeMillis() - DEDUP_WINDOW_MS,
+                                untilMs = null,
+                            ).firstOrNull()
                             val dedupSearchMs = System.currentTimeMillis() - dedupT0
                             // DIAGNOSTIC: log the nearest-neighbor cosine for EVERY new object (not
                             // just skips) so we can see the real distribution on a live scene and
