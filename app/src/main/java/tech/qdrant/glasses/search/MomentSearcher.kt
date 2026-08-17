@@ -43,14 +43,18 @@ class MomentSearcher(
         private const val RECALL_FETCH_K = 25
 
         /**
-         * Per-channel score gate for whole-frame moment search. UNCALIBRATED (Spec §7/§8 unknown
-         * #7): [tech.qdrant.glasses.embedding.CropEncoderFactory.searchGate]'s 0.25 was rehearsed
-         * against object CROPS, not whole ROOM frames — a whole-frame text→image cosine
-         * distribution is a different shape (more context in-frame competing for the same
-         * embedding). Seeded at 0.20 as a starting value; final number comes from the Stage 1
-         * on-device rehearsal pass (plan Stage Gate 1), not from this constant.
+         * Per-channel score gate for whole-frame moment search. CALIBRATED from an on-device
+         * rehearsal (Spec §7/§8 unknown #7): the CLIP modality gap is real at this scale — whole-
+         * frame top cosines for a query naming a PRESENT object ran 0.26–0.29 (laptop 0.29, phone
+         * 0.28, cup/keyboard/chair 0.26), but an ABSENT object's query landed at 0.236–0.246
+         * (elephant 0.236, banana 0.241, pizza/umbrella 0.246) — indistinguishable from a WEAK
+         * present-object hit (person/book 0.239). The old 0.20 gate passed EVERY absent-object
+         * query as a "hit". 0.25 is precision-first: it clears the observed junk floor (~0.246)
+         * while every strong present object still survives; a weak/broad present object that now
+         * misses this gate is recovered by an exact VERIFIED-tag match instead (see the
+         * tag-accept filter in [search] / [tagAcceptedMomentIds]), not by loosening the vector gate.
          */
-        private const val MOMENT_SEARCH_GATE = 0.20f
+        private const val MOMENT_SEARCH_GATE = 0.25f
     }
 
     /** Runs on: inferLane. */
@@ -81,23 +85,34 @@ class MomentSearcher(
         // would otherwise crash the inferLane coroutine and strand the UI in Processing — wrap the
         // store calls AND the fusion that consumes their results, same honest Unavailable the embed
         // failure above already gets.
-        val allHits = try {
+        val (allHits, tagAcceptedIds) = try {
             val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
             val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
             val fused = fuseAndCollapse(frameHits, regionHits)
-            softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
+            val ranked = softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
                 .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
+            // Change 2 of the calibration rehearsal: tagAcceptedIds is computed from the PRE-collapse
+            // regionHits (fuseAndCollapse can drop an unverified-but-top-scoring region's label — see
+            // its KDoc — so the verified label pool has to come from here, same as softBoost above).
+            ranked to tagAcceptedMomentIds(regionHits, queryTokens(embedPhrase))
         } catch (e: Throwable) {
             Log.e(TAG, "moment store search failed", e)
             return ObjectSearcher.Outcome.Unavailable
         }
-        // Region points carry the only labels this channel has (frame points are unlabeled — Stage
-        // 1), so there is no label-match fallback here the way ObjectSearcher has one — cosine gate
-        // only (a verified-region label match already contributed via softBoost above, not here).
-        val hits = allHits.filter { it.score >= MOMENT_SEARCH_GATE }
+        // MOMENT_SEARCH_GATE's raised 0.25 is precision-first against the whole-frame junk floor,
+        // but it can also drop a moment whose region label we ALREADY verified at capture time,
+        // just because that moment's fused vector score happens to miss the gate (broad categories
+        // like "person" verify at 0.21–0.23, per VERIFY_COS's KDoc — nowhere near guaranteed to
+        // clear 0.25). So accept on EITHER the fused score clearing the gate OR an exact match
+        // between a query token and one of this moment's VERIFIED region labels (tagAcceptedIds
+        // above) — mirrors the retired ObjectSearcher's gate-OR-labelMatch, but sourced from
+        // CLIP-verified region labels, not YOLO's raw output, so it can't be polluted by a raw
+        // mislabel the way ObjectSearcher's version could.
+        val hits = allHits.filter { it.score >= MOMENT_SEARCH_GATE || it.momentId in tagAcceptedIds }
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +
-            "hits=${hits.size}/${allHits.size} gate=$MOMENT_SEARCH_GATE top=${allHits.firstOrNull()?.score}")
+            "hits=${hits.size}/${allHits.size} gate=$MOMENT_SEARCH_GATE tagAccepted=${tagAcceptedIds.size} " +
+            "top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
         // Both branches keep the established top-5 contract: recall re-sorts by recency then trims;
