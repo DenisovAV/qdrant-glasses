@@ -12,6 +12,7 @@ import tech.qdrant.glasses.storage.MomentStore
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sqrt
 
 /**
@@ -152,6 +153,18 @@ class MomentCapture(
 
     private val busy = AtomicBoolean(false)
 
+    // Session-generation counter: bumped SYNCHRONOUSLY (on the CALLING thread, not embedLane) at
+    // the very top of every startSession(), before its reset is even posted. onFrame() captures
+    // the generation at dispatch time and threads it through to process(), which discards
+    // (recycle, no state touched) any frame whose captured generation no longer matches the
+    // CURRENT one. This is what actually closes the cross-session race startSession()'s own KDoc
+    // describes: the reset itself still runs async on embedLane, but the generation bump ahead of
+    // it is synchronous, so a frame already queued on embedLane — whether still ahead of that
+    // reset in the queue, or dispatched in the gap between beginRecording() and this call — always
+    // carries the OLD generation and gets dropped rather than attributed to the wrong session
+    // (wrong episodeId, or gated against a baseline the new session never produced).
+    private val sessionGen = AtomicInteger(0)
+
     // ---- Cross-thread bookkeeping: read on the camera thread by the "due" check in onFrame,
     // written only from embedLane. @Volatile for visibility across that thread hop (see class KDoc).
     @Volatile private var windowArmed = false
@@ -192,12 +205,19 @@ class MomentCapture(
      * Posted onto [embedLane], not applied inline: every field touched here — the armed window,
      * `lastStoredGrid`/`lastStoredVec`/`lastStoreMs`, `episodeId` — is embedLane-confined state
      * per the class KDoc's threading discipline, and the caller
-     * ([tech.qdrant.glasses.GlassesViewModel.startRecording]) runs on the main thread. This is
-     * fire-and-forget: the caller doesn't wait for it, the same "soft, racy" tolerance [onFrame]'s
-     * KDoc already documents for its own cross-thread reads — worst case one frame right at the
-     * start of a session is gated by the tail end of the old baseline, never a correctness issue.
+     * ([tech.qdrant.glasses.GlassesViewModel.startRecording]) runs on the main thread. The reset
+     * body is still fire-and-forget (the caller doesn't wait for it), but the [sessionGen] bump
+     * right below is NOT: it happens SYNCHRONOUSLY on the calling thread, before this reset is
+     * even posted, so any frame [onFrame] already dispatched to [embedLane] — still queued ahead
+     * of this reset, or dispatched in the gap between `beginRecording()` and this call — carries
+     * the OLD generation and gets discarded by [process]'s generation check instead of running
+     * against a baseline/episodeId this reset is about to replace out from under it. That closes a
+     * real correctness gap (wrong `episode_id`, or a false "unchanged scene" against a baseline
+     * the new session never produced) — NOT just the "gated one frame late" soft race [onFrame]'s
+     * KDoc documents for its own cheap cross-thread reads.
      */
     fun startSession(sessionStartMs: Long = nowMs()) {
+        val gen = sessionGen.incrementAndGet()
         scope.launch(embedLane) {
             abortWindow()
             lastStoredGrid = null
@@ -205,7 +225,7 @@ class MomentCapture(
             lastStoreMs = 0L
             lastCheckMs = 0L
             episodeId = sessionStartMs
-            Log.i(TAG, "startSession: episodeId=$sessionStartMs (baseline + window reset)")
+            Log.i(TAG, "startSession: episodeId=$sessionStartMs gen=$gen (baseline + window reset)")
         }
     }
 
@@ -237,19 +257,31 @@ class MomentCapture(
             busy.set(false)
             return
         }
+        // Captured HERE, at dispatch time — not read again until process() runs on embedLane, so
+        // it reflects whichever session was current the instant this frame was queued. See
+        // [sessionGen] and [process]'s check.
+        val gen = sessionGen.get()
         scope.launch(embedLane) {
             try {
-                process(frame, now)
+                process(frame, now, gen)
             } finally {
                 busy.set(false)
             }
         }
     }
 
-    /** Runs entirely on [embedLane]. Owns `frame` from here on: every path below either recycles
-     *  it, hands it to [bestBitmap] to be recycled later, or passes it into [confirmAndStore]
-     *  (which recycles it when done). */
-    private fun process(frame: Bitmap, now: Long) {
+    /** Runs entirely on [embedLane]. `gen` is the session generation [onFrame] captured at
+     *  dispatch time (see [sessionGen]); if it no longer matches the CURRENT generation, this
+     *  frame belongs to a session [startSession] has already reset past and is discarded before
+     *  touching any window/baseline state (the reset queued right behind it, per [startSession]'s
+     *  KDoc, is what actually cleans that state up). Otherwise owns `frame` from here on: every
+     *  path below either recycles it, hands it to [bestBitmap] to be recycled later, or passes it
+     *  into [confirmAndStore] (which recycles it when done). */
+    private fun process(frame: Bitmap, now: Long, gen: Int) {
+        if (gen != sessionGen.get()) {
+            frame.recycle()
+            return
+        }
         // Re-check HERE, not just at onFrame entry — a stop-recording that races a dispatched
         // frame must not arm a new window or store into a dead session (mirrors PerceptionPipeline).
         if (!isRecording()) {
