@@ -150,6 +150,10 @@ class GlassesComponents(
                     // on-disk collections.
                     val labelCache = LabelVectorCache(
                         encodeText = { cropEncoder.encodeText(it) },
+                        // Codex P1 fix: lets loadPersisted drop a truncated persisted line (a torn
+                        // append) instead of caching a short vector that would later be indexed
+                        // past its end against a full-length region vector.
+                        dim = cropEncoder.dim,
                         persistFile = File(app.filesDir, "label_vectors_${CropEncoderFactory.namespace}.tsv"),
                     )
                     momentCapture = MomentCapture(
