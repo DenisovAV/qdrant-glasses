@@ -44,6 +44,15 @@ class ObjectTrackerTest {
         assertTrue(t.confirmedUnembedded().isEmpty())  // embedded once, not again
     }
 
+    @Test fun confirmedIncludesEmbeddedTracksUnlikeConfirmedUnembedded() {
+        val t = ObjectTracker(confirmSightings = 2)
+        t.update(listOf(det("cup", 0f, 0f)))
+        t.update(listOf(det("cup", 0f, 0f)))
+        t.markEmbedded(t.confirmedUnembedded().first().trackId)
+        assertTrue(t.confirmedUnembedded().isEmpty())  // embedded once, dedup'd out
+        assertEquals(1, t.confirmed().size)             // confirmed() doesn't filter on `embedded`
+    }
+
     @Test fun twoSameLabelObjectsKeepSeparateTracks() {
         // Two cups, far apart, seeded as two tracks. Next frame both reappear (slightly moved).
         // Global best-first matching must keep each cup on its own track — no cross-claim,

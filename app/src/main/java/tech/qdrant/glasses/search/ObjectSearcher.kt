@@ -10,16 +10,22 @@ import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
 
 /**
- * OBJECTS-mode voice search: normalize the query → text-embed → vector search → hybrid
- * cosine-gate-OR-label-match filter → HUD push → map to [MomentCard]s. Moved VERBATIM out of
- * [tech.qdrant.glasses.GlassesViewModel.onVoiceResult]'s OBJECTS branch (Task 8 of the
- * God-object decomposition) — same normalization, same gate-OR-labelMatch filter, same
- * push-before-return-value ordering, same empty-result behavior (an empty [Outcome.Success]
- * list is a valid, honest "nothing found" — not [Outcome.Unavailable]).
+ * RETIRED (doc-rot fix, whole-branch review): this class's own [search] is no longer called from
+ * anywhere — Task 2.4 retired the crop-based [VectorStore] search path it queried in favor of
+ * [tech.qdrant.glasses.search.MomentSearcher]'s moment/region search, and
+ * [tech.qdrant.glasses.GlassesViewModel.onVoiceResult] now calls that instead. This class survives
+ * SOLELY so its nested [Outcome] type stays available — [MomentSearcher] deliberately reuses
+ * [ObjectSearcher.Outcome] rather than defining its own sealed type (see [MomentSearcher]'s KDoc)
+ * — so treat every doc/comment below this point as HISTORICAL: it describes the live OBJECTS-mode
+ * search path this class used to be, not current behavior.
  *
- * Threading: [search] MUST already be running on `inferLane` (the same lane as the OBJECTS
- * detect/embed pipeline, so a query text-embed serializes with the detect/embed hot path and
- * the store query) — this function does no dispatching of its own.
+ * (Original KDoc, kept for that history: OBJECTS-mode voice search — normalize the query →
+ * text-embed → vector search → hybrid cosine-gate-OR-label-match filter → HUD push → map to
+ * [MomentCard]s. Moved VERBATIM out of [tech.qdrant.glasses.GlassesViewModel.onVoiceResult]'s
+ * OBJECTS branch (Task 8 of the God-object decomposition) — same normalization, same
+ * gate-OR-labelMatch filter, same push-before-return-value ordering, same empty-result behavior
+ * (an empty [Outcome.Success] list is a valid, honest "nothing found" — not [Outcome.Unavailable]).
+ * Threading: [search] MUST already be running on `inferLane`.)
  */
 class ObjectSearcher(
     private val cropEncoder: CropEncoder,
@@ -28,6 +34,11 @@ class ObjectSearcher(
 ) {
     companion object {
         private const val TAG = "GlassesVM"
+
+        /** Recall-intent queries fetch a wider candidate pool before recency-sorting, so the
+         *  actual most-recent sighting (which may not be a top-5 cosine hit — a changed angle
+         *  or lighting can drop it below fresher-but-worse-matching ones) is still reachable. */
+        private const val RECALL_FETCH_K = 25
     }
 
     sealed interface Outcome {
@@ -44,10 +55,13 @@ class ObjectSearcher(
         // compressed, and "where is my laptop" scores ~0.11 vs 0.128 for plain "laptop" —
         // enough to dip under the gate. Search on the object phrase, display the full query.
         val phrase = searchPhrase(query)
-        if (phrase != query.lowercase()) Log.i(TAG, "query normalized: \"$query\" → \"$phrase\"")
+        val window = extractTimeWindow(query, System.currentTimeMillis())
+        val embedPhrase = stripTimePhrases(phrase)
+        if (embedPhrase != query.lowercase())
+            Log.i(TAG, "query normalized: \"$query\" → \"$embedPhrase\" window=$window")
         val t0 = System.currentTimeMillis()
         val qvec = try {
-            cropEncoder.encodeText(phrase)
+            cropEncoder.encodeText(embedPhrase)
         } catch (e: Throwable) {
             Log.e(TAG, "query embed failed", e)
             return Outcome.Unavailable
@@ -57,7 +71,11 @@ class ObjectSearcher(
         // Per-encoder score gate: without it an absent-object query ("keys" when no keys
         // were ever stored) surfaces junk top-5 around 0.09 — worse than saying "nothing".
         val gate = CropEncoderFactory.searchGate
-        val allHits = store.search(qvec, topK = 5)
+        // Recall-intent queries need a wider pool than a display top-5 — see RECALL_FETCH_K.
+        val fetchK = if (isRecallLocationIntent(query)) RECALL_FETCH_K else 5
+        val allHits =
+            if (window == null) store.search(qvec, topK = fetchK)
+            else store.searchFiltered(qvec, topK = fetchK, sinceMs = window.sinceMs, untilMs = window.untilMs)
         // Hybrid acceptance: cosine gate OR detector-label word match. SigLIP2's text→crop
         // scale is compressed AND environment-sensitive (the same "cell phone" query scored
         // 0.117 at home but 0.095-0.106 at the venue against a darker/farther crop), so an
@@ -68,13 +86,22 @@ class ObjectSearcher(
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(objects): encode=${encMs}ms search=${searchMs}ms " +
             "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
-        val resultItems = hits.map { h ->
+        // "Where did I leave/put X" wants the MOST RECENT sighting, not the best cosine match —
+        // the wallet you're looking for now is wherever you last set it down, not wherever it
+        // best matched the query historically. Widening to RECALL_FETCH_K before this sort is a
+        // pragmatic fix, not a real one: a fully time-ordered recall would need a payload-ordered
+        // store query (out of scope for Stage 0) — this just makes it likely enough that the
+        // true latest sighting is somewhere in the pool to sort to the top.
+        val ordered =
+            if (isRecallLocationIntent(query)) hits.sortedByDescending { it.timestampMs }.take(5)
+            else hits
+        val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)
             HudEvents.ResultItem(key, h.label, h.score)
         }
         hud.pushEvent(HudEvents.resultsEvent(resultItems))
-        return Outcome.Success(hits.map { toMomentCard(it) })
+        return Outcome.Success(ordered.map { toMomentCard(it) })
     }
 
     private fun toMomentCard(h: ObjectHit): MomentCard = MomentCard(

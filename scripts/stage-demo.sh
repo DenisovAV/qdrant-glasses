@@ -76,7 +76,10 @@ adb -s "$SERIAL" get-state >/dev/null 2>&1 || { echo "ERROR: glasses not on USB 
 adb -s "$SERIAL" shell am force-stop tech.qdrant.glasses
 # Glob, not a hand-written list: CropEncoderFactory.namespace mints a new shard dir per backend,
 # and a list silently misses any new one — leaving a stale shard that keeps answering dedup queries.
-adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs'" 2>/dev/null || true
+# moments_shard_*/moment_thumbs are the episodic-memory plan's opt-in moment path (Task 1.5,
+# QdrantEdgeMomentStore) — same per-namespace glob rule, or a fresh venue run leaves a ghost
+# moment shard behind exactly the way a stale objects_shard_* used to (Spec §7 / CLAUDE.md).
+adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs files/moments_shard_* files/moment_thumbs'" 2>/dev/null || true
 echo "glasses memory wiped"
 
 adb -s "$SERIAL" shell setprop persist.qdrant.relay "$RELAY"

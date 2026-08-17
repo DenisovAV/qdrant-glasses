@@ -51,4 +51,20 @@ class HudEventsTest {
         assertEquals("obj_3_171", r0.getString("id"))
         assertEquals(0.82, r0.getDouble("score"), 0.001)
     }
+
+    @Test fun momentEvent_shape() {
+        val json = JSONObject(HudEvents.momentEvent("moment_171", 1_786_633_200_000L, 12))
+        assertEquals("moment", json.getString("t"))
+        assertEquals("moment_171", json.getString("id"))
+        assertEquals(1_786_633_200_000L, json.getLong("ts"))
+        assertEquals(12, json.getInt("count"))
+        assertEquals(false, json.has("tags"))   // Stage 1: tags always empty, so omitted
+    }
+
+    @Test fun momentEvent_withTags() {
+        val json = JSONObject(HudEvents.momentEvent("moment_171", 1_786_633_200_000L, 12, listOf("cup", "laptop")))
+        val tags = json.getJSONArray("tags")
+        assertEquals(2, tags.length())
+        assertEquals("cup", tags.getString(0))
+    }
 }

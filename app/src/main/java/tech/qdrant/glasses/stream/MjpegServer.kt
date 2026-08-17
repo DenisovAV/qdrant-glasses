@@ -113,6 +113,18 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
     // Activity to point at ObjectStore.all(); each item's thumb is registered for /thumb/<key>.
     @Volatile override var railSnapshotProvider: (() -> List<RailItem>)? = null
 
+    /** One already-stored moment, replayed into the timeline when a HUD connects (F2, whole-branch
+     *  review fix) — the moment analogue of [RailItem]. A separate shape, not [RailItem] reused,
+     *  because [HudEvents.momentEvent] carries a timestamp (`ts`), not a display `label` the way
+     *  [HudEvents.storedEvent] does. */
+    data class MomentItem(val key: String, val thumbPath: String, val tsMs: Long)
+
+    // Moment-timeline analogue of [railSnapshotProvider]: supplies the moments already in memory so
+    // a freshly-connected/reconnected /events client's timeline isn't empty (fixes: a HUD that
+    // connects/reconnects mid-session after GlassesViewModel's one-time init backfill has already
+    // fired saw no timeline). Set by HudPublisher.attach, same wiring as railSnapshotProvider.
+    @Volatile override var momentSnapshotProvider: (() -> List<MomentItem>)? = null
+
     /** FrameSink: stop the NanoHTTPD server (symmetry with MjpegPusher.close()). */
     override fun close() = stop()
 
@@ -299,6 +311,21 @@ class MjpegServer(port: Int, private val assets: AssetManager) : NanoHTTPD("0.0.
                 stream.offer("data: ${HudEvents.storedEvent(it.key, it.label, count)}\n\n".toByteArray())
             }
             Log.i(TAG, "replayed $count stored objects to new HUD")
+        }
+        // F2 (whole-branch review fix): moments' own parallel replay — see [MomentItem]'s KDoc for
+        // why this can't reuse railSnapshotProvider/storedEvent (wrong JSON event type, no `ts`
+        // field). MomentStore.timeline() already returns oldest-first (its own contract), so
+        // pushing in that order here reproduces live capture order — the browser's addToTimeline
+        // appends (doesn't prepend), so it expects oldest-first too. count is items.size, the same
+        // approximation railSnapshotProvider's replay above already makes for objects (timeline()
+        // caps to its own `limit`, fine at demo scale — see its KDoc).
+        momentSnapshotProvider?.invoke()?.let { items ->
+            val count = items.size.toLong()
+            for (m in items) {
+                thumbs[m.key] = m.thumbPath
+                stream.offer("data: ${HudEvents.momentEvent(m.key, m.tsMs, count)}\n\n".toByteArray())
+            }
+            Log.i(TAG, "replayed $count stored moments to new HUD")
         }
         val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", stream)
         // CRITICAL: never gzip SSE. text/event-stream is "text/*" so NanoHTTPD gzips it when the

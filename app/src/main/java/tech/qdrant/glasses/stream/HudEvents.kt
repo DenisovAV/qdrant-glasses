@@ -5,12 +5,18 @@ import org.json.JSONObject
 import tech.qdrant.glasses.detect.Track
 
 /**
- * Pure builders for the 5 SSE event lines the HUD consumes. Each returns one compact
+ * Pure builders for the 6 SSE event lines the HUD consumes. Each returns one compact
  * JSON line (no trailing newline — the server adds the SSE "data: ...\n\n" framing).
- * Boxes carry the tracker's trackId as `id`; stored/results carry the thumb KEY as `id`.
+ * Boxes carry the tracker's trackId as `id`; stored/results/moment carry the thumb KEY as `id`.
  */
 object HudEvents {
-    data class ResultItem(val thumbKey: String, val label: String, val score: Float)
+    // [tags] (F3, whole-branch review fix, Spec §5): a fused moment hit's VERIFIED region label,
+    // surfaced separately from [label] so the browser can render it as a distinct tag chip on the
+    // recall card rather than folding it into the existing label+score line. Defaulted so every
+    // pre-F3 positional ResultItem(...) call site (ObjectSearcher, HudEventsTest) keeps compiling
+    // unchanged — ObjectSearcher never populates it (it has no verified-region concept), so its
+    // cards render with no chip, same as before this field existed.
+    data class ResultItem(val thumbKey: String, val label: String, val score: Float, val tags: List<String> = emptyList())
 
     /** scores maps trackId -> detection score for this frame; absent → score omitted. */
     fun boxesEvent(tracks: List<Track>, scores: Map<Int, Float>, frameW: Int, frameH: Int): String {
@@ -44,7 +50,30 @@ object HudEvents {
 
     fun resultsEvent(items: List<ResultItem>): String {
         val arr = JSONArray()
-        for (r in items) arr.put(JSONObject().put("id", r.thumbKey).put("label", r.label).put("score", r.score.toDouble()))
+        for (r in items) {
+            val o = JSONObject().put("id", r.thumbKey).put("label", r.label).put("score", r.score.toDouble())
+            // Same null-omit convention [momentEvent] uses for its optional `tags`/`query`-shaped
+            // fields — most ResultItems (any unverified moment, every ObjectSearcher hit) carry none.
+            if (r.tags.isNotEmpty()) o.put("tags", JSONArray(r.tags))
+            arr.put(o)
+        }
         return JSONObject().put("t", "results").put("items", arr).toString()
+    }
+
+    /** One stored keyframe dropping onto the HUD's live timeline (episodic-memory plan Task 1.6,
+     *  Spec §5). [key] is the thumb file's `nameWithoutExtension` (same `/thumb/<key>` convention
+     *  as [storedEvent]'s `id`). [tags] is the verified-region label layer (Stage 2 has shipped —
+     *  this is no longer a forward-looking field), but callers still always leave it empty here in
+     *  practice: [tech.qdrant.glasses.pipeline.MomentCapture.onMoment] fires from inside
+     *  `confirmAndStore`'s frame-store block, BEFORE that same call's region layer runs (see its
+     *  KDoc), so no verified region label exists yet at the instant this event is built for a given
+     *  moment. A moment's verified tags DO reach the HUD once its regions exist — as a recall-card
+     *  chip via [resultsEvent]/[ResultItem.tags] (F3, whole-branch review fix) when the moment is
+     *  found again by a later search, not on this live timeline event. Omitted from the JSON
+     *  entirely when empty, same null-omit convention [modeEvent] uses for its optional `query`. */
+    fun momentEvent(key: String, tsMs: Long, count: Long, tags: List<String> = emptyList()): String {
+        val o = JSONObject().put("t", "moment").put("id", key).put("ts", tsMs).put("count", count)
+        if (tags.isNotEmpty()) o.put("tags", JSONArray(tags))
+        return o.toString()
     }
 }

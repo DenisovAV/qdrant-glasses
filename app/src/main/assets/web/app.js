@@ -64,6 +64,9 @@ function handle(ev) {
     setMode(ev.value, ev.query);
   } else if (ev.t === "results") {
     renderResults(ev.items);
+  } else if (ev.t === "moment") {
+    addToTimeline(ev.id, ev.ts);
+    $("moment-count").textContent = ev.count + (ev.count == 1 ? " moment" : " moments");
   }
 }
 
@@ -85,6 +88,32 @@ function addToRail(key, label) {
   while (rail.children.length > RAIL_CAP) rail.removeChild(rail.lastChild);
 }
 
+const TIMELINE_CAP = 60;
+// Moment timeline (Task 1.6, Codex P1 fix): mirrors addToRail's fetch/thumb/DOM approach
+// (same /thumb/<key> mechanism, same .cell markup) but APPENDS instead of prepending — a
+// timeline reads oldest-to-newest left-to-right, the opposite of the rail's newest-first grid.
+function addToTimeline(key, tsMs) {
+  const strip = $("timeline");
+  if (!strip) { console.error("[hud] #timeline element MISSING"); return; }
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  const img = document.createElement("img");
+  img.src = "/thumb/" + key;
+  img.onerror = () => console.warn("[hud] moment thumb failed to load:", img.src);
+  const span = document.createElement("span");
+  span.textContent = formatTime(tsMs);
+  cell.appendChild(img); cell.appendChild(span);
+  strip.appendChild(cell);
+  while (strip.children.length > TIMELINE_CAP) strip.removeChild(strip.firstChild);
+  strip.scrollLeft = strip.scrollWidth;   // keep the just-appended (newest) moment in view
+}
+
+function formatTime(ms) {
+  const d = new Date(ms);
+  const pad = (n) => n.toString().padStart(2, "0");
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
+
 function setMode(value, query) {
   $("mode-badge").textContent = value.toUpperCase();
   $("rec").classList.toggle("hidden", value !== "recording");
@@ -102,7 +131,11 @@ function renderResults(items) {
   for (const r of items) {
     const d = document.createElement("div");
     d.className = "cell";
-    d.innerHTML = `<img src="/thumb/${r.id}" onerror="this.classList.add('broken')"><span>${r.label} ${(r.score*100|0)}%</span>`;
+    // F3 (whole-branch review fix, Spec §5): a verified region label rides in on `tags` (kept
+    // separate from `label`/score above so it can render as its own small chip). Only moment hits
+    // carry it today; absent/empty for a plain object/frame hit, so no chip shows then.
+    const tagHtml = (r.tags && r.tags.length) ? `<span class="tag-chip">${r.tags[0]}</span>` : "";
+    d.innerHTML = `<img src="/thumb/${r.id}" onerror="this.classList.add('broken')">${tagHtml}<span>${r.label} ${(r.score*100|0)}%</span>`;
     wrap.appendChild(d);
   }
 }

@@ -2,7 +2,9 @@
 # Wipe the demo memory EVERYWHERE — the only correct way to "почистить базу".
 #
 # The object memory lives in TWO places that must be cleared together:
-#   1. Glasses: Qdrant Edge shards + thumbnail JPEGs (files/objects_shard_*, object_thumbs)
+#   1. Glasses: Qdrant Edge shards + thumbnail JPEGs — the crop-store path
+#      (files/objects_shard_*, object_thumbs) AND the opt-in episodic-memory moment path
+#      (files/moments_shard_*, moment_thumbs — episodic-memory plan Task 1.7, Spec §7)
 #   2. Mac relay: HUD rail + pushed thumbs, held in embed_server process RAM
 # Wiping only one side leaves ghost cards on the dashboard (bitten twice at rehearsals).
 #
@@ -63,7 +65,10 @@ adb -s "$SERIAL" shell am force-stop tech.qdrant.glasses
 # whenever a backend is added, and a list silently misses it — leaving a stale shard that keeps
 # answering dedup queries. (A bench build with an extra `objects_shard_ondevice_mclip` did exactly
 # this: "wiped" store, 35 objects still in it, every crop deduped away.)
-adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs'" 2>/dev/null || true
+# moments_shard_*/moment_thumbs are the episodic-memory plan's opt-in moment path (Task 1.5,
+# QdrantEdgeMomentStore) — same per-namespace glob rule, or a ghost moment shard survives a wipe
+# exactly the way a stale objects_shard_* used to (Spec §7 / CLAUDE.md).
+adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs files/moments_shard_* files/moment_thumbs'" 2>/dev/null || true
 echo "glasses memory wiped"
 
 # 3) Re-point the relay property (setprop does NOT survive a reboot — a glasses
