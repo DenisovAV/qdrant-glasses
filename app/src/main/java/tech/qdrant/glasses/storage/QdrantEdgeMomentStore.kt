@@ -1,0 +1,244 @@
+package tech.qdrant.glasses.storage
+
+import android.content.Context
+import android.util.Log
+import tech.qdrant.edge.CountRequest
+import tech.qdrant.edge.Distance
+import tech.qdrant.edge.EdgeConfig
+import tech.qdrant.edge.EdgeShard
+import tech.qdrant.edge.Point
+import tech.qdrant.edge.UpdateOperation
+import tech.qdrant.edge.VectorDataConfig
+import tech.qdrant.edge.ffi.Condition
+import tech.qdrant.edge.ffi.FieldCondition
+import tech.qdrant.edge.ffi.Filter
+import tech.qdrant.edge.ffi.Match
+import tech.qdrant.edge.ffi.NamedVector
+import tech.qdrant.edge.ffi.PointId
+import tech.qdrant.edge.ffi.Query
+import tech.qdrant.edge.ffi.QueryRequest
+import tech.qdrant.edge.ffi.RangeFloat
+import tech.qdrant.edge.ffi.ScoredPoint
+import tech.qdrant.edge.ffi.ScoringQuery
+import tech.qdrant.edge.ffi.ScrollRequest
+import tech.qdrant.edge.ffi.ValueVariants
+import tech.qdrant.edge.ffi.Vector
+import tech.qdrant.edge.ffi.WithPayload
+import tech.qdrant.edge.ffi.WithVector
+import java.io.File
+import java.util.UUID
+
+/**
+ * Moment memory: one Qdrant Edge collection holding two point channels distinguished by
+ * [MomentPayload.type] — whole-frame keyframes ("frame") and the CLIP-verified YOLO regions within
+ * them ("region") (plan Task 1.3, Spec §6). First (and so far only) [MomentStore] implementation,
+ * cloned from [QdrantEdgeStore]'s proven mechanics VERBATIM: single monitor [lock] serializing every
+ * native call, flush-per-upsert on the live path, idempotent [close], drop+recreate [deleteAll].
+ * Type filtering (`Match` on `type`) mirrors [VisionMemoryStore.channelQuery]; time filtering
+ * (`RangeFloat` on `timestamp_ms`) mirrors [QdrantEdgeStore.searchFiltered]. Both are combined in one
+ * `Filter.must` list (standard Qdrant semantics: `must` = AND) for the filtered searches.
+ *
+ * **Named vectors (Spec §6/§8.4 unknown, RESOLVED):** the collection provisions BOTH `"clip"`
+ * (512-dim cosine) and `"text"` (384-dim cosine) at creation. [VisionMemoryStore] already runs a
+ * 2-named-vector Edge collection in production on this exact AAR (`""`+`"text"`), and `EdgeConfig`
+ * accepted the same `vectorData` map shape here on-device (see `QdrantEdgeMomentStoreTest`) — so the
+ * assumed-unsupported fallback (`clip`-only) was NOT needed this stage. Frame/region points write
+ * only the `clip` field; `text` sits empty until the speech/OCR channels (Stage 3/4) start using it.
+ *
+ * [namespace] picks the on-disk shard directory (`moments_shard_<namespace>`), same convention as
+ * [QdrantEdgeStore] — different crop-encoder backends get separate collections.
+ */
+class QdrantEdgeMomentStore(
+    context: Context,
+    namespace: String = "default",
+) : MomentStore {
+
+    companion object {
+        private const val TAG = "QdrantEdgeMomentStore"
+        private const val CLIP_FIELD = "clip"
+        private const val TEXT_FIELD = "text"
+        private const val CLIP_DIM = 512
+        private const val TEXT_DIM = 384
+        private const val TYPE_FRAME = "frame"
+        private const val TYPE_REGION = "region"
+    }
+
+    // Kept as a field so deleteAll() can drop + recreate the shard on the same directory in-process,
+    // exactly as QdrantEdgeStore does (no app relaunch needed for the demo wipe gesture).
+    private val dir: String = File(context.filesDir, "moments_shard_$namespace")
+        .also { it.mkdirs() }.absolutePath
+    private val config = EdgeConfig(
+        vectorData = mapOf(
+            CLIP_FIELD to VectorDataConfig(
+                size = CLIP_DIM.toULong(), distance = Distance.COSINE,
+                quantizationConfig = null, multivectorConfig = null, datatype = null, hnswConfig = null,
+            ),
+            TEXT_FIELD to VectorDataConfig(
+                size = TEXT_DIM.toULong(), distance = Distance.COSINE,
+                quantizationConfig = null, multivectorConfig = null, datatype = null, hnswConfig = null,
+            ),
+        ),
+        sparseVectorData = emptyMap(),
+    )
+
+    // Same concurrency story as QdrantEdgeStore: the native EdgeShard's thread-safety is unverified
+    // and this store will be touched from more than one lane (moment capture writes, HUD timeline
+    // reads, voice-query searches) — serialize every native call through one reentrant monitor.
+    private val lock = Any()
+    private var shard: EdgeShard
+    // Guards close()/deleteAll() against a use-after-free on the native handle — see QdrantEdgeStore
+    // for the exact reasoning; the discipline is copied verbatim.
+    private var closed = false
+
+    init {
+        shard = EdgeShard.load(dir, config)
+        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))}")
+    }
+
+    override fun storeMoment(clipVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
+        require(clipVec.size == CLIP_DIM) { "dim ${clipVec.size} != $CLIP_DIM" }
+        val id = UUID.randomUUID().toString()
+        // Spec §6 / MomentPayload KDoc invariant: a frame's moment_id == its OWN id. The caller can't
+        // know that id before this call generates it, so storeMoment stamps type+momentId itself
+        // rather than asking every call site to pre-generate a UUID and pass it in twice.
+        val stamped = payload.copy(type = TYPE_FRAME, momentId = id)
+        val named = Vector.Named(mapOf(CLIP_FIELD to NamedVector.Dense(clipVec.toList())))
+        shard.update(UpdateOperation.upsertPoints(listOf(
+            Point(id = PointId.Uuid(id), vector = named, payload = stamped.toJson())
+        )))
+        shard.flush()
+        Log.d(TAG, "storeMoment: id=$id ts=${payload.timestampMs}")
+        id
+    }
+
+    override fun storeRegion(clipVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
+        require(clipVec.size == CLIP_DIM) { "dim ${clipVec.size} != $CLIP_DIM" }
+        require(payload.momentId.isNotBlank()) {
+            "storeRegion requires payload.momentId = the parent frame's id (Spec §6: region.moment_id = parent's)"
+        }
+        val id = UUID.randomUUID().toString()
+        val stamped = payload.copy(type = TYPE_REGION)
+        val named = Vector.Named(mapOf(CLIP_FIELD to NamedVector.Dense(clipVec.toList())))
+        shard.update(UpdateOperation.upsertPoints(listOf(
+            Point(id = PointId.Uuid(id), vector = named, payload = stamped.toJson())
+        )))
+        shard.flush()
+        Log.d(TAG, "storeRegion: id=$id momentId=${payload.momentId} label=\"${payload.label}\"")
+        id
+    }
+
+    override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
+        channelSearch(TYPE_FRAME, qvec, topK, sinceMs, untilMs)
+
+    override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
+        channelSearch(TYPE_REGION, qvec, topK, sinceMs, untilMs)
+
+    private fun channelSearch(
+        typeValue: String,
+        qvec: FloatArray,
+        topK: Int,
+        sinceMs: Long?,
+        untilMs: Long?,
+    ): List<MomentHit> = synchronized(lock) {
+        require(qvec.size == CLIP_DIM) { "dim ${qvec.size} != $CLIP_DIM" }
+        val results = shard.query(QueryRequest(
+            limit = topK.toULong(), offset = null,
+            query = ScoringQuery.Vector(Query.Nearest(vector = qvec.toList(), using = CLIP_FIELD)),
+            prefetches = emptyList(),
+            withVector = null, withPayload = WithPayload.Bool(true),
+            filter = typeAndTimeFilter(typeValue, sinceMs, untilMs),
+            scoreThreshold = null, params = null,
+        ))
+        val hits = results.map { toHit(it) }
+        Log.i(TAG, "search[$typeValue]: topK=$topK since=$sinceMs until=$untilMs returned=${hits.size}")
+        hits
+    }
+
+    // AND's a `type` equality condition with an optional `timestamp_ms` range condition in one
+    // `Filter.must` list (must = AND, standard Qdrant semantics). No time bound at all → type-only.
+    private fun typeAndTimeFilter(typeValue: String, sinceMs: Long?, untilMs: Long?): Filter {
+        val conditions = mutableListOf<Condition>(
+            Condition.Field(FieldCondition(
+                key = "type", match = Match.Value(ValueVariants.String(typeValue)),
+                range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+            ))
+        )
+        if (sinceMs != null || untilMs != null) {
+            conditions.add(Condition.Field(FieldCondition(
+                key = "timestamp_ms", match = null,
+                range = RangeFloat(gte = sinceMs?.toDouble(), gt = null, lte = untilMs?.toDouble(), lt = null),
+                geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+            )))
+        }
+        return Filter(must = conditions, should = null, mustNot = null)
+    }
+
+    /**
+     * Every stored `type=frame` moment, oldest-first (payload only, no vectors) — rebuilds the HUD
+     * timeline rail on connect, mirroring [QdrantEdgeStore.all]. Scrolls the frame channel only
+     * (no time filter — the full history) then sorts, same pattern as `all()`.
+     */
+    override fun timeline(limit: Int): List<MomentHit> = synchronized(lock) {
+        val resp = shard.scroll(ScrollRequest(
+            offset = null, limit = limit.toULong(),
+            filter = Filter(must = listOf(Condition.Field(FieldCondition(
+                key = "type", match = Match.Value(ValueVariants.String(TYPE_FRAME)),
+                range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+            ))), should = null, mustNot = null),
+            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+            orderBy = null,
+        ))
+        resp.records
+            .map { rec -> toHit(rec.id, rec.payload ?: "{}") }
+            .sortedBy { it.timestampMs }
+            .also { Log.i(TAG, "timeline(): ${it.size} stored frames") }
+    }
+
+    override fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }
+
+    override fun deleteAll(): Unit = synchronized(lock) {
+        // Drop + recreate in-process, identical discipline to QdrantEdgeStore.deleteAll(): close the
+        // native handle, wipe the shard directory on disk, reload an empty shard from the same
+        // config. closed=true is set right after shard.close() so a later close()/deleteAll() sees
+        // the guard even if the wipe/reload below throws (the handle is dangling from that point on).
+        check(!closed) { "deleteAll() called on a closed QdrantEdgeMomentStore" }
+        val before = runCatching { shard.count(CountRequest(filter = null, exact = false)).toLong() }.getOrDefault(-1L)
+        shard.close()
+        closed = true
+        val wiped = File(dir).deleteRecursively()
+        check(wiped) {
+            "deleteAll: failed to fully wipe $dir (a locked/mmap'd file likely survived) — " +
+                "reloading a shard on top of leftover files would silently keep old points"
+        }
+        File(dir).mkdirs()
+        shard = EdgeShard.load(dir, config)
+        closed = false
+        Log.i(TAG, "deleteAll: dropped $before points, shard recreated empty at $dir")
+    }
+
+    override fun close() = synchronized(lock) {
+        // Idempotent: a second close() must NOT touch the already-freed native shard.
+        if (closed) return@synchronized
+        closed = true
+        runCatching { Log.i(TAG, "close: total points=${count()}") }
+        shard.close()
+    }
+
+    private fun toHit(p: ScoredPoint): MomentHit = toHit(p.id, p.payload ?: "{}", p.score)
+
+    private fun toHit(id: PointId?, payload: String, score: Float = 0f): MomentHit {
+        // A single malformed payload must not crash the whole result list — MomentPayload.fromJson
+        // already falls back to an empty JSONObject internally, same discipline as QdrantEdgeStore.
+        val p = MomentPayload.fromJson(payload)
+        return MomentHit(
+            id = (id as? PointId.Uuid)?.value ?: "",
+            score = score,
+            type = p.type,
+            momentId = p.momentId,
+            timestampMs = p.timestampMs,
+            thumbPath = p.thumbPath,
+            label = p.label,
+            bbox = p.bbox,
+        )
+    }
+}
