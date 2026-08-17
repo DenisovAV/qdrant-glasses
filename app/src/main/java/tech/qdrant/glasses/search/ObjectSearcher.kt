@@ -28,6 +28,11 @@ class ObjectSearcher(
 ) {
     companion object {
         private const val TAG = "GlassesVM"
+
+        /** Recall-intent queries fetch a wider candidate pool before recency-sorting, so the
+         *  actual most-recent sighting (which may not be a top-5 cosine hit — a changed angle
+         *  or lighting can drop it below fresher-but-worse-matching ones) is still reachable. */
+        private const val RECALL_FETCH_K = 25
     }
 
     sealed interface Outcome {
@@ -60,9 +65,11 @@ class ObjectSearcher(
         // Per-encoder score gate: without it an absent-object query ("keys" when no keys
         // were ever stored) surfaces junk top-5 around 0.09 — worse than saying "nothing".
         val gate = CropEncoderFactory.searchGate
+        // Recall-intent queries need a wider pool than a display top-5 — see RECALL_FETCH_K.
+        val fetchK = if (isRecallLocationIntent(query)) RECALL_FETCH_K else 5
         val allHits =
-            if (window == null) store.search(qvec, topK = 5)
-            else store.searchFiltered(qvec, topK = 5, sinceMs = window.sinceMs, untilMs = window.untilMs)
+            if (window == null) store.search(qvec, topK = fetchK)
+            else store.searchFiltered(qvec, topK = fetchK, sinceMs = window.sinceMs, untilMs = window.untilMs)
         // Hybrid acceptance: cosine gate OR detector-label word match. SigLIP2's text→crop
         // scale is compressed AND environment-sensitive (the same "cell phone" query scored
         // 0.117 at home but 0.095-0.106 at the venue against a darker/farther crop), so an
@@ -75,9 +82,12 @@ class ObjectSearcher(
             "hits=${hits.size}/${allHits.size} gate=$gate top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT sighting, not the best cosine match —
         // the wallet you're looking for now is wherever you last set it down, not wherever it
-        // best matched the query historically.
+        // best matched the query historically. Widening to RECALL_FETCH_K before this sort is a
+        // pragmatic fix, not a real one: a fully time-ordered recall would need a payload-ordered
+        // store query (out of scope for Stage 0) — this just makes it likely enough that the
+        // true latest sighting is somewhere in the pool to sort to the top.
         val ordered =
-            if (isRecallLocationIntent(query)) hits.sortedByDescending { it.timestampMs }
+            if (isRecallLocationIntent(query)) hits.sortedByDescending { it.timestampMs }.take(5)
             else hits
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
