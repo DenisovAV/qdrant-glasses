@@ -155,6 +155,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         session.beginRecording(viewModelScope)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
         legacy?.onRecordingStarted()
+        // Task 1.5 P2 fix: MomentCapture is built once at load() and outlives every recording, so
+        // without this a stop→start in the same process kept gating against the PRIOR session's
+        // baseline and stamped the app-init episodeId onto a NEW session's frames — see its KDoc.
+        // No-op when the sysprop is off / not OBJECTS mode (momentCapture stays null then).
+        components?.momentCapture?.startSession()
     }
 
     fun stopRecording() {

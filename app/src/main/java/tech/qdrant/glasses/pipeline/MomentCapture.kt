@@ -111,10 +111,12 @@ class MomentCapture(
     private val momentThumbsDir: File,
     private val isRecording: () -> Boolean,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
-    // Spec §6: a frame's `episode_id` = the recording session's start timestamp. MomentCapture has
-    // no session concept of its own, so the caller (Task 1.5) passes the session start; absent
-    // that, default to construction time so a standalone instance still stamps SOMETHING sane.
-    private val episodeId: Long = nowMs(),
+    // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
+    // construction time so a standalone instance still stamps SOMETHING sane; the real value for
+    // a live recording is set by [startSession] at the START of each session (a `var`, not a
+    // `val`, precisely because this class is constructed ONCE at `GlassesComponents.load()` but
+    // must stamp a FRESH episode on every stop→start in the same process — see [startSession]).
+    private var episodeId: Long = nowMs(),
     // Fired after a successful storeMoment(), on embedLane. Deliberately NOT a HudPublisher
     // reference — Task 1.6 wires the HUD timeline event through this callback so MomentCapture
     // stays unaware of the HUD (same seam style as ObjectSearcher not knowing about HudPublisher
@@ -167,6 +169,45 @@ class MomentCapture(
     private var lastStoredGrid: FloatArray? = null
     private var lastStoredVec: FloatArray? = null
     private var lastStoreMs: Long = 0L
+
+    /**
+     * Resets this capture for a NEW recording session. [MomentCapture] is constructed ONCE at
+     * `GlassesComponents.load()` and lives for the whole process, but nothing reset it when a
+     * NEW recording started: after a stop→start in the same process, the first frames of the new
+     * session were gated against the PRIOR session's [lastStoredGrid]/[lastStoredVec]/
+     * [lastStoreMs] (so a scene that only changed since the OLD session's last keyframe could look
+     * "unchanged" and get skipped) and every stored frame kept stamping the app-init [episodeId]
+     * instead of the new session's own start (Spec §6: a frame's `episode_id` = ITS session's
+     * start). Mirrors the intent of
+     * [tech.qdrant.glasses.camera.FrameCaptureManager.resetForNewSession] for this class's own
+     * baseline.
+     *
+     * Aborts any in-flight sharpness window (a window armed by the OLD session must not be
+     * confirmed/stored under the NEW one's episodeId), clears the stored-keyframe baseline so the
+     * very first candidate of the new session is unconditionally a [Decision.CAPTURE] (mirrors
+     * [decide]'s `prevGrid == null` case), resets the cadence clock so the new session doesn't
+     * inherit a stale [MOMENT_CHECK_MS] wait from whenever the old session's last gate fired, and
+     * stamps a fresh [episodeId].
+     *
+     * Posted onto [embedLane], not applied inline: every field touched here — the armed window,
+     * `lastStoredGrid`/`lastStoredVec`/`lastStoreMs`, `episodeId` — is embedLane-confined state
+     * per the class KDoc's threading discipline, and the caller
+     * ([tech.qdrant.glasses.GlassesViewModel.startRecording]) runs on the main thread. This is
+     * fire-and-forget: the caller doesn't wait for it, the same "soft, racy" tolerance [onFrame]'s
+     * KDoc already documents for its own cross-thread reads — worst case one frame right at the
+     * start of a session is gated by the tail end of the old baseline, never a correctness issue.
+     */
+    fun startSession(sessionStartMs: Long = nowMs()) {
+        scope.launch(embedLane) {
+            abortWindow()
+            lastStoredGrid = null
+            lastStoredVec = null
+            lastStoreMs = 0L
+            lastCheckMs = 0L
+            episodeId = sessionStartMs
+            Log.i(TAG, "startSession: episodeId=$sessionStartMs (baseline + window reset)")
+        }
+    }
 
     /**
      * Camera-thread entry point. Cheap eligibility check first (no bitmap work at all on the
