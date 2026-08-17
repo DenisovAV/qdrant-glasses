@@ -127,7 +127,10 @@ class GlassesComponents(
                     // matches the crop encoder, same convention objectStore uses, so switching
                     // CropEncoderFactory.backend still needs no manual data wipe.
                     val thumbsDir = File(app.filesDir, "moment_thumbs").also { it.mkdirs() }
-                    val ms = QdrantEdgeMomentStore(app, namespace = CropEncoderFactory.namespace)
+                    // dim = cropEncoder.dim (Codex P2 fix): the store defaulted to a hard-coded
+                    // 512, which matches QNN_B32/ON_DEVICE but fails storeMoment's dim `require`
+                    // the moment CropEncoderFactory.backend is MAC_ENDPOINT (768-dim SigLIP2).
+                    val ms = QdrantEdgeMomentStore(app, namespace = CropEncoderFactory.namespace, dim = cropEncoder.dim)
                     momentStore = ms
                     momentCapture = MomentCapture(
                         scope = scope,

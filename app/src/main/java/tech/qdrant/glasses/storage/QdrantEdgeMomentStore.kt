@@ -39,7 +39,8 @@ import java.util.UUID
  * `Filter.must` list (standard Qdrant semantics: `must` = AND) for the filtered searches.
  *
  * **Named vectors (Spec §6/§8.4 unknown, RESOLVED):** the collection provisions BOTH `"clip"`
- * (512-dim cosine) and `"text"` (384-dim cosine) at creation. [VisionMemoryStore] already runs a
+ * ([dim]-dim cosine, 512 by default — see [dim]'s own doc) and `"text"` (384-dim cosine) at
+ * creation. [VisionMemoryStore] already runs a
  * 2-named-vector Edge collection in production on this exact AAR (`""`+`"text"`), and `EdgeConfig`
  * accepted the same `vectorData` map shape here on-device (see `QdrantEdgeMomentStoreTest`) — so the
  * assumed-unsupported fallback (`clip`-only) was NOT needed this stage. Frame/region points write
@@ -47,17 +48,23 @@ import java.util.UUID
  *
  * [namespace] picks the on-disk shard directory (`moments_shard_<namespace>`), same convention as
  * [QdrantEdgeStore] — different crop-encoder backends get separate collections.
+ *
+ * [dim] is the `clip` named-vector size (`text` stays fixed at [TEXT_DIM] — Stage 3/4's own
+ * encoder, not the crop encoder). Defaults to 512 (TinyCLIP/QNN_B32's space) so the existing
+ * instrumented test (which builds 512-dim unit vectors) is unaffected; `GlassesComponents.load()`
+ * passes `cropEncoder.dim` explicitly so a MAC_ENDPOINT build (768-dim SigLIP2) doesn't fail
+ * [storeMoment]'s dim `require` against a collection provisioned for the wrong backend.
  */
 class QdrantEdgeMomentStore(
     context: Context,
     namespace: String = "default",
+    dim: Int = 512,
 ) : MomentStore {
 
     companion object {
         private const val TAG = "QdrantEdgeMomentStore"
         private const val CLIP_FIELD = "clip"
         private const val TEXT_FIELD = "text"
-        private const val CLIP_DIM = 512
         private const val TEXT_DIM = 384
         private const val TYPE_FRAME = "frame"
         private const val TYPE_REGION = "region"
@@ -68,6 +75,11 @@ class QdrantEdgeMomentStore(
         private const val SCROLL_PAGE_SIZE = 256UL
     }
 
+    // The `clip` named-vector's dim, promoted from the constructor param to a property so every
+    // method below (storeMoment/storeRegion/channelSearch's `require`, plus `config` itself) can
+    // see it — a plain constructor param is only visible in property initializers.
+    private val clipDim: Int = dim
+
     // Kept as a field so deleteAll() can drop + recreate the shard on the same directory in-process,
     // exactly as QdrantEdgeStore does (no app relaunch needed for the demo wipe gesture).
     private val dir: String = File(context.filesDir, "moments_shard_$namespace")
@@ -75,7 +87,7 @@ class QdrantEdgeMomentStore(
     private val config = EdgeConfig(
         vectorData = mapOf(
             CLIP_FIELD to VectorDataConfig(
-                size = CLIP_DIM.toULong(), distance = Distance.COSINE,
+                size = clipDim.toULong(), distance = Distance.COSINE,
                 quantizationConfig = null, multivectorConfig = null, datatype = null, hnswConfig = null,
             ),
             TEXT_FIELD to VectorDataConfig(
@@ -101,7 +113,7 @@ class QdrantEdgeMomentStore(
     }
 
     override fun storeMoment(clipVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
-        require(clipVec.size == CLIP_DIM) { "dim ${clipVec.size} != $CLIP_DIM" }
+        require(clipVec.size == clipDim) { "dim ${clipVec.size} != $clipDim" }
         val id = UUID.randomUUID().toString()
         // Spec §6 / MomentPayload KDoc invariant: a frame's moment_id == its OWN id. The caller can't
         // know that id before this call generates it, so storeMoment stamps type+momentId itself
@@ -117,7 +129,7 @@ class QdrantEdgeMomentStore(
     }
 
     override fun storeRegion(clipVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
-        require(clipVec.size == CLIP_DIM) { "dim ${clipVec.size} != $CLIP_DIM" }
+        require(clipVec.size == clipDim) { "dim ${clipVec.size} != $clipDim" }
         require(payload.momentId.isNotBlank()) {
             "storeRegion requires payload.momentId = the parent frame's id (Spec §6: region.moment_id = parent's)"
         }
@@ -145,7 +157,7 @@ class QdrantEdgeMomentStore(
         sinceMs: Long?,
         untilMs: Long?,
     ): List<MomentHit> = synchronized(lock) {
-        require(qvec.size == CLIP_DIM) { "dim ${qvec.size} != $CLIP_DIM" }
+        require(qvec.size == clipDim) { "dim ${qvec.size} != $clipDim" }
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
             query = ScoringQuery.Vector(Query.Nearest(vector = qvec.toList(), using = CLIP_FIELD)),
