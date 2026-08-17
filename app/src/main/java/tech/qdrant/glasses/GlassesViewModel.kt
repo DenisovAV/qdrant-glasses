@@ -311,7 +311,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun frameCount(): Long =
-        components?.let { if (appMode == AppMode.OBJECTS) it.momentStore?.count() else it.store.count() } ?: 0L
+        // OBJECTS mode counts frame MOMENTS only (not region points) so this matches the timeline
+        // cells + the `indexed` counter; LEGACY's VisionMemoryStore has no regions, so count() there.
+        components?.let { if (appMode == AppMode.OBJECTS) it.momentStore?.frameCount() else it.store.count() } ?: 0L
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")
