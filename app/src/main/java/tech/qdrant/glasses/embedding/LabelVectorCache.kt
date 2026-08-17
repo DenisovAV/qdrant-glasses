@@ -1,0 +1,109 @@
+package tech.qdrant.glasses.embedding
+
+import android.util.Log
+import java.io.File
+import kotlin.math.sqrt
+
+/**
+ * Lazy, memoized cache of CLIP text-embedding vectors for a small, mostly-fixed label vocabulary
+ * (plan Task 2.1/2.2: the ~80 COCO labels used to CLIP-verify YOLO regions — Spec §2/§7). Every
+ * label is run through [encodeText] AT MOST ONCE per cache instance, however many times it is
+ * asked for: [B32ClipTextEncoder]'s text tower is the cold ~180ms CPU-int8 path (Global
+ * Constraints), and a region-heavy moment (Task 2.2's `REGIONS_MAX_PER_MOMENT`) would otherwise
+ * pay that cost repeatedly per capture for labels that recur constantly ("cup", "person", …).
+ *
+ * [persistFile], if given, survives the first-time cost across process restarts too — pay the
+ * ~180ms×80 labels ONCE per install, not once per app launch (Spec §7). On construction the file
+ * (one `label\tcsv-floats` line per cached vector — chosen over JSON for a trivial, streaming-
+ * append-friendly format) is loaded into memory; each newly-computed label is appended to it. A
+ * malformed/partial line (e.g. a torn write from a process killed mid-append) is skipped, not
+ * fatal — that one label just falls back to re-embedding, the rest of the cache stays usable.
+ *
+ * Label keys are normalized (trim + lowercase) so "Cup", " cup ", and "cup" share one cache entry
+ * and one [encodeText] call — callers don't need to pre-normalize COCO labels themselves.
+ */
+class LabelVectorCache(
+    private val encodeText: (String) -> FloatArray,
+    private val persistFile: File? = null,
+) {
+    // One coarse lock: labels are ~80 distinct strings total and gets are infrequent (per stored
+    // moment's regions, not per frame) — no need for finer-grained per-key locking. Guards against
+    // two concurrent callers for the SAME uncached label both paying the ~180ms encode.
+    private val lock = Any()
+    private val cache = HashMap<String, FloatArray>()
+
+    init {
+        persistFile?.let { loadPersisted(it) }
+    }
+
+    /** The cached (or freshly-embedded-then-cached) text vector for [label]. */
+    fun get(label: String): FloatArray {
+        val key = normalize(label)
+        synchronized(lock) {
+            cache[key]?.let { return it }
+            val t0 = System.currentTimeMillis()
+            val vec = encodeText(key)
+            Log.i(TAG, "encodeText label=\"$key\" ${System.currentTimeMillis() - t0}ms " +
+                "(cache miss, ${cache.size + 1} labels cached)")
+            cache[key] = vec
+            persistFile?.let { appendPersisted(it, key, vec) }
+            return vec
+        }
+    }
+
+    /** Cosine similarity between a region embedding and [label]'s (cached) text vector — the
+     *  CLIP-verify signal region tagging is built on (Spec §2, plan Task 2.2). 0f if either vector
+     *  is degenerate (all-zero) rather than dividing by zero — "not verified" is a safer failure
+     *  than a crash or a NaN silently poisoning the comparison. */
+    fun verify(regionVec: FloatArray, label: String): Float = cosine(regionVec, get(label))
+
+    private fun normalize(label: String): String = label.trim().lowercase()
+
+    private fun loadPersisted(file: File) {
+        if (!file.exists()) return
+        var loaded = 0
+        var skipped = 0
+        file.forEachLine { line ->
+            if (line.isBlank()) return@forEachLine
+            val tab = line.indexOf('\t')
+            val floats = if (tab < 0) null else line.substring(tab + 1).split(',').map { it.toFloatOrNull() }
+            if (tab < 0 || floats.isNullOrEmpty() || floats.any { it == null }) {
+                skipped++
+                return@forEachLine
+            }
+            cache[line.substring(0, tab)] = FloatArray(floats.size) { floats[it]!! }
+            loaded++
+        }
+        Log.i(TAG, "loaded $loaded persisted label vectors from ${file.path} ($skipped malformed lines skipped)")
+    }
+
+    private fun appendPersisted(file: File, key: String, vec: FloatArray) {
+        try {
+            file.parentFile?.mkdirs()
+            file.appendText("$key\t${vec.joinToString(",")}\n")
+        } catch (e: Throwable) {
+            // Persistence is a nice-to-have (survives restarts); an unwritable file must not lose
+            // the in-memory entry [get] already cached for the rest of this process's lifetime.
+            Log.w(TAG, "failed to persist label=\"$key\" to ${file.path}", e)
+        }
+    }
+
+    companion object {
+        private const val TAG = "LabelVectorCache"
+    }
+}
+
+/** Plain cosine similarity. 0f if either vector is degenerate (all-zero) rather than dividing by
+ *  zero — same convention as the private `cosine` in [tech.qdrant.glasses.pipeline.MomentCapture]. */
+private fun cosine(a: FloatArray, b: FloatArray): Float {
+    var dot = 0f
+    var na = 0f
+    var nb = 0f
+    for (i in a.indices) {
+        dot += a[i] * b[i]
+        na += a[i] * a[i]
+        nb += b[i] * b[i]
+    }
+    if (na <= 0f || nb <= 0f) return 0f
+    return (dot / (sqrt(na.toDouble()) * sqrt(nb.toDouble()))).toFloat()
+}
