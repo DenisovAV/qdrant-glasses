@@ -61,6 +61,11 @@ class QdrantEdgeMomentStore(
         private const val TEXT_DIM = 384
         private const val TYPE_FRAME = "frame"
         private const val TYPE_REGION = "region"
+        // timeline() pagination page size — see its KDoc for why this scans the whole frame
+        // channel instead of asking the shard to order/limit server-side. 256 keeps the number of
+        // native scroll() round trips low at demo scale (low hundreds of frames) while capping how
+        // much payload JSON is materialized per call.
+        private const val SCROLL_PAGE_SIZE = 256UL
     }
 
     // Kept as a field so deleteAll() can drop + recreate the shard on the same directory in-process,
@@ -174,24 +179,41 @@ class QdrantEdgeMomentStore(
     }
 
     /**
-     * Every stored `type=frame` moment, oldest-first (payload only, no vectors) — rebuilds the HUD
-     * timeline rail on connect, mirroring [QdrantEdgeStore.all]. Scrolls the frame channel only
-     * (no time filter — the full history) then sorts, same pattern as `all()`.
+     * The most-recent [limit] stored `type=frame` moments (payload only, no vectors), oldest-first
+     * — rebuilds the HUD timeline rail on connect as a chronological strip ending at "now".
+     *
+     * **Server-side `orderBy` was tried and rejected on-device**: `ScrollRequest.orderBy` exists in
+     * this AAR's FFI, but a live scroll with `OrderBy("timestamp_ms", Direction.DESC)` throws
+     * `EdgeException.OperationException("No range index for \`order_by\` key: \`timestamp_ms\`...")`
+     * — and `EdgeConfig` (see its fields) exposes no API to create one. So there is no way to get
+     * the shard to order by timestamp itself; this pages the ENTIRE `type=frame` channel via
+     * [ScrollRequest.offset]/[tech.qdrant.edge.ffi.ScrollResponse.nextOffset] (Qdrant's default
+     * point-ID order says nothing about recency, so a single `limit`-sized page could silently
+     * drop the newest frames once the channel exceeds `limit`), sorts every point by
+     * [MomentHit.timestampMs] client-side, and keeps only the most recent [limit]. Fine at demo
+     * scale (low hundreds of frames); a payload index on `timestamp_ms` — if this Edge FFI ever
+     * grows one — would let `orderBy` do this server-side instead and drop the full scan.
      */
     override fun timeline(limit: Int): List<MomentHit> = synchronized(lock) {
-        val resp = shard.scroll(ScrollRequest(
-            offset = null, limit = limit.toULong(),
-            filter = Filter(must = listOf(Condition.Field(FieldCondition(
-                key = "type", match = Match.Value(ValueVariants.String(TYPE_FRAME)),
-                range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
-            ))), should = null, mustNot = null),
-            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
-            orderBy = null,
-        ))
-        resp.records
-            .map { rec -> toHit(rec.id, rec.payload ?: "{}") }
-            .sortedBy { it.timestampMs }
-            .also { Log.i(TAG, "timeline(): ${it.size} stored frames") }
+        val frameFilter = Filter(must = listOf(Condition.Field(FieldCondition(
+            key = "type", match = Match.Value(ValueVariants.String(TYPE_FRAME)),
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+        ))), should = null, mustNot = null)
+        val all = mutableListOf<MomentHit>()
+        var offset: PointId? = null
+        do {
+            val resp = shard.scroll(ScrollRequest(
+                offset = offset, limit = SCROLL_PAGE_SIZE,
+                filter = frameFilter,
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+                orderBy = null,
+            ))
+            resp.records.mapTo(all) { rec -> toHit(rec.id, rec.payload ?: "{}") }
+            offset = resp.nextOffset
+        } while (offset != null)
+        all.sortedBy { it.timestampMs }
+            .takeLast(limit)
+            .also { Log.i(TAG, "timeline(): scanned ${all.size} stored frames, returning ${it.size} most recent") }
     }
 
     override fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }

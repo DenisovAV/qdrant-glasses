@@ -83,6 +83,34 @@ class QdrantEdgeMomentStoreTest {
         }
     }
 
+    /**
+     * Regression for the Codex P2: timeline(limit) used to scroll `limit` points in Qdrant's
+     * default point-ID order and THEN sort that arbitrary page by timestamp, so once the frame
+     * count exceeded `limit`, the rail could silently drop recent frames. With 5 stored frames and
+     * limit=3, the only correct answer is the 3 NEWEST, oldest-first — never an arbitrary subset.
+     */
+    @Test fun timelineReturnsNewestFramesWithinLimit() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val store = QdrantEdgeMomentStore(ctx, "momentstoretest_timeline")
+        try {
+            store.deleteAll()
+            val rnd = Random(11)
+
+            val timestamps = listOf(1_000_000L, 2_000_000L, 3_000_000L, 4_000_000L, 5_000_000L)
+            val ids = timestamps.map { ts -> store.storeMoment(unit(rnd), framePayload(ts)) }
+            Log.i(TAG, "stored ${ids.size} frames at $timestamps")
+
+            val tl = store.timeline(limit = 3)
+            // The 3 NEWEST frames (ts=3e6,4e6,5e6 / ids[2..4]), oldest-first.
+            assertEquals(listOf(ids[2], ids[3], ids[4]), tl.map { it.id })
+            assertEquals(listOf(timestamps[2], timestamps[3], timestamps[4]), tl.map { it.timestampMs })
+
+            Log.i(TAG, "timelineReturnsNewestFramesWithinLimit: PASS")
+        } finally {
+            store.deleteAll(); store.close()
+        }
+    }
+
     private fun framePayload(ts: Long) = MomentPayload(
         type = "frame", momentId = "", episodeId = ts, timestampMs = ts, tEndMs = ts,
         thumbPath = "/sdcard/moments/$ts.jpg", bbox = "", label = "", yoloConf = 0f, verifyCos = 0f, text = "",
