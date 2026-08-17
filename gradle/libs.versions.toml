@@ -20,8 +20,11 @@ onnxruntime = "1.26.0"
 coroutines = "1.11.0"
 litert = "1.4.0"
 qnn = "2.45.0"           # must be >= the QAIRT version of the qai-hub context binary (2.45)
-# ObjectBox on-device vector DB — only compiled into a VectorStoreFactory.backend=OBJECTBOX bench
-# build (the shipping demo stays on QDRANT_EDGE, which pulls none of this). 5.4.2 = latest stable
+# ObjectBox on-device vector DB — `benchmark`-flavor ONLY (VectorStoreFactory.backend=OBJECTBOX bench
+# build; see app/build.gradle.kts' productFlavors). The shipping `demo` flavor pulls NONE of this: no
+# ObjectBox/sqlite-vec deps, no arm64 native .so, no kapt codegen — verified against the demo APK's
+# actual contents, not just the dependency scoping (see the `plugins{}` block in app/build.gradle.kts
+# for how the io.objectbox Gradle plugin itself is kept flavor-clean). 5.4.2 = latest stable
 # (ships database core 5.3.2); its Gradle plugin runs codegen (MyObjectBox / <Entity>_ meta) and
 # packages the arm64 native lib at build time. Requires kapt — but this project uses AGP 9's
 # built-in Kotlin, and org.jetbrains.kotlin.kapt is INCOMPATIBLE with built-in Kotlin, so the
