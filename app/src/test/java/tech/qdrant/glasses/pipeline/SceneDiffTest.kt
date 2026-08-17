@@ -24,4 +24,12 @@ class SceneDiffTest {
         val edge = FloatArray(side * side) { i -> if ((i % side) < side / 2) 0f else 1f }
         assertTrue(sharpness(edge, side) > sharpness(flat, side))
     }
+    @Test fun downscaleHandlesSourceSmallerThanOut() {
+        // 2x2 source, default out=32 (source dims < out) must not throw and must fill every cell.
+        val argb = IntArray(4) { 0xFFFFFFFF.toInt() }
+        val g = downscaleLuma(argb, 2, 2, out = 32)
+        assertEquals(32 * 32, g.size)
+        assertTrue(g.all { it in 0f..1f })
+        assertEquals(1.0f, g[0], 1e-2f)
+    }
 }

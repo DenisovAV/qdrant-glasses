@@ -15,15 +15,19 @@ import kotlin.math.abs
 
 /** Mean luma (0..1, luminance/255) per cell of an [out]×[out] grid, block-averaged from an
  *  ARGB [argb] pixel buffer of size [w]×[h]. Cell bounds are computed with integer division of
- *  the source dimensions, so [w]/[h] need not divide evenly by [out]. */
+ *  the source dimensions, so [w]/[h] need not divide evenly by [out] (and may be smaller than
+ *  [out], e.g. a tiny crop upsampled into the grid). Every cell's start/end index is clamped into
+ *  `[0, w)` / `[0, h)` so no combination of [w]/[h]/[out] reads past the end of [argb]; a
+ *  zero-sized source returns an all-zero grid instead of indexing into an empty array. */
 fun downscaleLuma(argb: IntArray, w: Int, h: Int, out: Int = 32): FloatArray {
     val grid = FloatArray(out * out)
+    if (w <= 0 || h <= 0) return grid
     for (gy in 0 until out) {
-        val y0 = gy * h / out
-        val y1 = maxOf(y0 + 1, (gy + 1) * h / out)
+        val y0 = (gy * h / out).coerceIn(0, h - 1)
+        val y1 = maxOf(y0 + 1, (gy + 1) * h / out).coerceAtMost(h)
         for (gx in 0 until out) {
-            val x0 = gx * w / out
-            val x1 = maxOf(x0 + 1, (gx + 1) * w / out)
+            val x0 = (gx * w / out).coerceIn(0, w - 1)
+            val x1 = maxOf(x0 + 1, (gx + 1) * w / out).coerceAtMost(w)
             var sum = 0L
             var n = 0
             for (y in y0 until y1) {
