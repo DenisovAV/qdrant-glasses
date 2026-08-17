@@ -80,7 +80,10 @@ android {
     // build. "demo" is the product default (QDRANT_EDGE only, no extra deps/native libs);
     // "benchmark" additionally compiles src/benchmark (ObjectBoxStore, SqliteVecStore,
     // VectorStoreBenchmark, the flavor's own VectorStoreFactory wiring all three) and
-    // src/benchmarkAndroidTest (ComparisonBenchmarkTest, ObjectBoxStoreTest, SqliteVecStoreTest).
+    // src/androidTestBenchmark (ComparisonBenchmarkTest, ObjectBoxStoreTest, SqliteVecStoreTest) —
+    // AGP's naming convention for a flavor's instrumentation-test source set is
+    // `androidTest<Flavor>`, NOT `<flavor>AndroidTest`; the latter silently compiles to nothing
+    // (confirmed: garbage syntax dropped in src/benchmarkAndroidTest built clean).
     flavorDimensions += "engines"
     productFlavors {
         create("demo") { dimension = "engines"; isDefault = true }
