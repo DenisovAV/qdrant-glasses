@@ -2,10 +2,12 @@ package tech.qdrant.glasses.search
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Calendar
 import java.util.TimeZone
 
 class QueryTextTest {
@@ -53,6 +55,20 @@ class QueryTextTest {
         val w = extractTimeWindow("what did I see today", nowMs, utc)!!
         assertEquals(nowMs - 15 * HOUR, w.sinceMs)
         assertEquals(nowMs, w.untilMs)
+    }
+    @Test fun yesterdaySpansTheCorrectLocalDayAcrossDst() {
+        // 2026-03-08 is the US spring-forward day in America/New_York (clocks jump 02:00 →
+        // 03:00 EST → EDT), so that local day is only 23h long. A naive `sod - 24h` (the old
+        // implementation) would land an hour into March 7 instead of at March 8's midnight.
+        val nyZone = TimeZone.getTimeZone("America/New_York")
+        val cal = Calendar.getInstance(nyZone)
+        cal.set(2026, Calendar.MARCH, 9, 15, 0, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        val nowMsNy = cal.timeInMillis
+        val w = extractTimeWindow("what did I see yesterday", nowMsNy, nyZone)!!
+        val spanMs = w.untilMs!! - w.sinceMs!!
+        assertNotEquals(DAY, spanMs)
+        assertEquals(23 * HOUR, spanMs)
     }
     @Test fun lastHourIsRelative() {
         val w = extractTimeWindow("where did I put my keys an hour ago", nowMs, utc)!!

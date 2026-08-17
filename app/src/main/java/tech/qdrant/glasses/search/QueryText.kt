@@ -33,6 +33,16 @@ private fun startOfDay(nowMs: Long, zone: java.util.TimeZone): Long {
     return c.timeInMillis
 }
 
+/** Start of the previous local day. A fixed 86_400_000ms subtraction from [startOfDay] is
+ *  wrong across a DST transition (the prior local day is 23h or 25h, not 24h) — step the
+ *  Calendar a whole date back instead, so it lands on the correct local midnight either way. */
+private fun startOfPreviousDay(nowMs: Long, zone: java.util.TimeZone): Long {
+    val c = java.util.Calendar.getInstance(zone)
+    c.timeInMillis = startOfDay(nowMs, zone)
+    c.add(java.util.Calendar.DATE, -1)
+    return c.timeInMillis
+}
+
 /** Map a few spoken time phrases to a [TimeWindow]; null if the query names no time.
  *  Calendar-accurate for "today"/"yesterday" in [zone]; relative for hour-scale phrases. */
 fun extractTimeWindow(
@@ -43,7 +53,7 @@ fun extractTimeWindow(
     val q = raw.lowercase()
     val sod = startOfDay(nowMs, zone)
     return when {
-        Regex("\\byesterday\\b").containsMatchIn(q) -> TimeWindow(sod - 86_400_000L, sod)
+        Regex("\\byesterday\\b").containsMatchIn(q) -> TimeWindow(startOfPreviousDay(nowMs, zone), sod)
         Regex("\\b(today|this morning|this afternoon|earlier today)\\b").containsMatchIn(q) ->
             TimeWindow(sod, nowMs)
         Regex("\\b(an hour ago|last hour|in the last hour)\\b").containsMatchIn(q) ->
