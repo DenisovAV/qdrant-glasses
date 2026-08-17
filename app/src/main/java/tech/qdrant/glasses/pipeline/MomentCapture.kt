@@ -11,6 +11,7 @@ import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
+import tech.qdrant.glasses.storage.MomentType
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -450,7 +451,7 @@ class MomentCapture(
                 // documents on storeMoment(). The gate embedding above IS the stored vector: it is
                 // never re-embedded here or anywhere else on this path.
                 store.storeMoment(vec, MomentPayload(
-                    type = "frame",
+                    type = MomentType.FRAME,
                     momentId = "",
                     episodeId = episodeId,
                     timestampMs = ts,
@@ -492,7 +493,7 @@ class MomentCapture(
                 .format(cos))
             try {
                 onMoment?.invoke(MomentHit(
-                    id = id, score = 0f, type = "frame", momentId = id, timestampMs = ts,
+                    id = id, score = 0f, type = MomentType.FRAME, momentId = id, timestampMs = ts,
                     thumbPath = if (thumbOk) thumbFile.absolutePath else "", label = "", bbox = "",
                 ))
             } catch (e: Throwable) {
@@ -530,7 +531,7 @@ class MomentCapture(
                             Log.i(TAG, "region: label=${region.label} verifyCos=%.3f yoloConf=%.3f -> %s"
                                 .format(verifyCos, region.conf, if (verified) "stored" else "label-dropped"))
                             store.storeRegion(regionVec, MomentPayload(
-                                type = "region",
+                                type = MomentType.REGION,
                                 momentId = id,
                                 episodeId = episodeId,
                                 timestampMs = ts,

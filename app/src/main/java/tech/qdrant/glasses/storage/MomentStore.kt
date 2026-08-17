@@ -3,6 +3,18 @@ package tech.qdrant.glasses.storage
 import org.json.JSONObject
 
 /**
+ * The two [MomentPayload.type] wire values, shared so "frame"/"region" stop drifting as independent
+ * string literals across [MomentStore]'s implementations and callers (whole-branch review fix —
+ * [tech.qdrant.glasses.search.MomentFusion], [tech.qdrant.glasses.pipeline.MomentCapture], and
+ * [QdrantEdgeMomentStore] each spelled these out separately before this). The JSON wire values
+ * themselves are unchanged — this only centralizes the Kotlin-side string constants.
+ */
+object MomentType {
+    const val FRAME = "frame"
+    const val REGION = "region"
+}
+
+/**
  * One vector search hit against a moment collection (a frame OR a region point — see [MomentPayload.type]).
  * Mirrors [ObjectHit]'s shape, plus the fields the moment model adds: [type] (channel) and
  * [momentId] (the parent frame a region belongs to; a frame hit's own id), and (Task 2.3, Spec §3)
@@ -119,6 +131,14 @@ interface MomentStore : AutoCloseable {
 
     /** Total point count across ALL channels (frame + region + future speech/ocr). */
     fun count(): Long
+
+    /** Count of `type=frame` points only — the number of MOMENTS actually stored, distinct from
+     *  [count]'s raw point total (whole-branch review fix: a keyframe plus its up to
+     *  [tech.qdrant.glasses.pipeline.MomentCapture.REGIONS_MAX_PER_MOMENT] verified regions reads as
+     *  N+1 points via [count], but is still ONE moment). A caller reporting "moments stored" to the
+     *  user should use this, not [count]; switching the existing HUD/backfill call sites over to it
+     *  is a follow-up task, not part of this fix. */
+    fun frameCount(): Long
 
     /** Clear the whole collection in-process (the demo wipe gesture — see `wipe-demo-memory.sh`). */
     fun deleteAll()

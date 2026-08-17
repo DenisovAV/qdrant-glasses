@@ -66,8 +66,6 @@ class QdrantEdgeMomentStore(
         private const val CLIP_FIELD = "clip"
         private const val TEXT_FIELD = "text"
         private const val TEXT_DIM = 384
-        private const val TYPE_FRAME = "frame"
-        private const val TYPE_REGION = "region"
         // timeline() pagination page size — see its KDoc for why this scans the whole frame
         // channel instead of asking the shard to order/limit server-side. 256 keeps the number of
         // native scroll() round trips low at demo scale (low hundreds of frames) while capping how
@@ -118,7 +116,7 @@ class QdrantEdgeMomentStore(
         // Spec §6 / MomentPayload KDoc invariant: a frame's moment_id == its OWN id. The caller can't
         // know that id before this call generates it, so storeMoment stamps type+momentId itself
         // rather than asking every call site to pre-generate a UUID and pass it in twice.
-        val stamped = payload.copy(type = TYPE_FRAME, momentId = id)
+        val stamped = payload.copy(type = MomentType.FRAME, momentId = id)
         val named = Vector.Named(mapOf(CLIP_FIELD to NamedVector.Dense(clipVec.toList())))
         shard.update(UpdateOperation.upsertPoints(listOf(
             Point(id = PointId.Uuid(id), vector = named, payload = stamped.toJson())
@@ -134,7 +132,7 @@ class QdrantEdgeMomentStore(
             "storeRegion requires payload.momentId = the parent frame's id (Spec §6: region.moment_id = parent's)"
         }
         val id = UUID.randomUUID().toString()
-        val stamped = payload.copy(type = TYPE_REGION)
+        val stamped = payload.copy(type = MomentType.REGION)
         val named = Vector.Named(mapOf(CLIP_FIELD to NamedVector.Dense(clipVec.toList())))
         shard.update(UpdateOperation.upsertPoints(listOf(
             Point(id = PointId.Uuid(id), vector = named, payload = stamped.toJson())
@@ -145,10 +143,10 @@ class QdrantEdgeMomentStore(
     }
 
     override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
-        channelSearch(TYPE_FRAME, qvec, topK, sinceMs, untilMs)
+        channelSearch(MomentType.FRAME, qvec, topK, sinceMs, untilMs)
 
     override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
-        channelSearch(TYPE_REGION, qvec, topK, sinceMs, untilMs)
+        channelSearch(MomentType.REGION, qvec, topK, sinceMs, untilMs)
 
     private fun channelSearch(
         typeValue: String,
@@ -208,7 +206,7 @@ class QdrantEdgeMomentStore(
      */
     override fun timeline(limit: Int): List<MomentHit> = synchronized(lock) {
         val frameFilter = Filter(must = listOf(Condition.Field(FieldCondition(
-            key = "type", match = Match.Value(ValueVariants.String(TYPE_FRAME)),
+            key = "type", match = Match.Value(ValueVariants.String(MomentType.FRAME)),
             range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
         ))), should = null, mustNot = null)
         val all = mutableListOf<MomentHit>()
@@ -229,6 +227,14 @@ class QdrantEdgeMomentStore(
     }
 
     override fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }
+
+    // Whole-branch review fix: `count()` was being reported to callers as "moments stored", but it
+    // counts every point across BOTH channels — a keyframe plus its verified regions reads as N+1,
+    // not 1. Reuses [typeAndTimeFilter]'s type-only shape (no time bound) rather than hand-rolling a
+    // second `Filter.must` list, same as [searchFrames]/[searchRegions] already do via [channelSearch].
+    override fun frameCount(): Long = synchronized(lock) {
+        shard.count(CountRequest(filter = typeAndTimeFilter(MomentType.FRAME, null, null), exact = true)).toLong()
+    }
 
     override fun deleteAll(): Unit = synchronized(lock) {
         // Drop + recreate in-process, identical discipline to QdrantEdgeStore.deleteAll(): close the
@@ -275,7 +281,7 @@ class QdrantEdgeMomentStore(
             bbox = p.bbox,
             // Task 2.3 (Spec §3): region-only fields, needed for the soft tag boost. A frame point's
             // payload already stamps both 0f at capture time (MomentCapture.confirmAndStore), so this
-            // mapping is unconditional — no `if (p.type == TYPE_REGION)` needed to get "frame hits get
+            // mapping is unconditional — no `if (p.type == MomentType.REGION)` needed to get "frame hits get
             // 0f", same as [label]/[bbox] above are already mapped straight through regardless of type.
             yoloConf = p.yoloConf,
             verifyCos = p.verifyCos,

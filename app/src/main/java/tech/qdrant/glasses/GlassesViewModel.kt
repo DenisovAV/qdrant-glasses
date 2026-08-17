@@ -204,7 +204,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             Log.w(TAG, "startRecording ignored: not Idle (state=${session.state.value::class.simpleName})")
             return
         }
-        Log.i(TAG, "startRecording: indexed=${components?.store?.count() ?: 0}")
+        // frameCount() (whole-branch review fix), not components?.store?.count(): `store` is the
+        // retired LEGACY VisionMemoryStore, never written to in the shipped OBJECTS appMode — this
+        // log used to unconditionally print "indexed=0" regardless of how many moments were
+        // actually stored. frameCount() branches on appMode the same way it already does for
+        // MainActivity's HUD counter.
+        Log.i(TAG, "startRecording: indexed=${frameCount()}")
         session.beginRecording(viewModelScope)
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("recording"))
         legacy?.onRecordingStarted()
@@ -224,7 +229,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val elapsed = session.endRecording()
-        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} total=${components?.store?.count()}")
+        // frameCount(), not components?.store?.count() — same retired-LEGACY-store fix as startRecording.
+        Log.i(TAG, "stopRecording: ${elapsed}s indexed=${current.indexed} total=${frameCount()}")
         legacy?.onRecordingStopped()
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("idle"))
     }
