@@ -122,6 +122,29 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // momentCapture is null. Closes over `localPerception` (not the field) and runs
                     // BEFORE `perception = localPerception` below, on purpose.
                     c.momentCapture?.regionsProvider = { localPerception.latestConfirmedRegions }
+                    // Task 2.4 regression fix (Codex P2): retiring PerceptionPipeline's crop-embed
+                    // tail deleted the only caller of session.onMemoryIndexed() (it used to run
+                    // `withContext(inferLane) { onMemoryIndexed() }` right after a successful
+                    // store.upsert — see that deleted block's history), so the on-glasses
+                    // `indexed: N` counter stayed at 0 even though MomentCapture IS storing moments.
+                    // Wrap the HUD-forward callback GlassesComponents.load already wired onto
+                    // mc.onMoment rather than replace it — `session` is only reachable here, not
+                    // inside GlassesComponents.load's companion-object scope. onMoment fires once per
+                    // stored FRAME moment only — never per region (MomentCapture.confirmAndStore
+                    // invokes it inside the frame-store block, BEFORE the additive region layer runs)
+                    // — so counting it 1:1 already satisfies "one indexed item per moment, regions
+                    // don't double-count" with no extra bookkeeping needed. Marshalled onto inferLane
+                    // (session.onMemoryIndexed()'s hard requirement — see AppStateHolder's KDoc) even
+                    // though onMoment itself fires on embedLane. Reassigning the var here, BEFORE
+                    // `perception = localPerception` below publishes the field a camera frame could
+                    // reach momentCapture through, is safe for the same happens-before reason
+                    // regionsProvider's wiring above already documents — no @Volatile needed on
+                    // onMoment either.
+                    val hudOnMoment = c.momentCapture?.onMoment
+                    c.momentCapture?.onMoment = { hit ->
+                        hudOnMoment?.invoke(hit)
+                        viewModelScope.launch(inferLane) { session.onMemoryIndexed() }
+                    }
                     perception = localPerception
                     if (Config.MOMENT_MEMORY) {
                         momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)
