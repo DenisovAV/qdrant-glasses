@@ -64,6 +64,9 @@ function handle(ev) {
     setMode(ev.value, ev.query);
   } else if (ev.t === "results") {
     renderResults(ev.items);
+  } else if (ev.t === "moment") {
+    addToTimeline(ev.id, ev.ts);
+    $("moment-count").textContent = ev.count + (ev.count == 1 ? " moment" : " moments");
   }
 }
 
@@ -83,6 +86,32 @@ function addToRail(key, label) {
   rail.prepend(cell);
   console.log("[hud] rail now has", rail.children.length, "cells");
   while (rail.children.length > RAIL_CAP) rail.removeChild(rail.lastChild);
+}
+
+const TIMELINE_CAP = 60;
+// Moment timeline (Task 1.6, Codex P1 fix): mirrors addToRail's fetch/thumb/DOM approach
+// (same /thumb/<key> mechanism, same .cell markup) but APPENDS instead of prepending — a
+// timeline reads oldest-to-newest left-to-right, the opposite of the rail's newest-first grid.
+function addToTimeline(key, tsMs) {
+  const strip = $("timeline");
+  if (!strip) { console.error("[hud] #timeline element MISSING"); return; }
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  const img = document.createElement("img");
+  img.src = "/thumb/" + key;
+  img.onerror = () => console.warn("[hud] moment thumb failed to load:", img.src);
+  const span = document.createElement("span");
+  span.textContent = formatTime(tsMs);
+  cell.appendChild(img); cell.appendChild(span);
+  strip.appendChild(cell);
+  while (strip.children.length > TIMELINE_CAP) strip.removeChild(strip.firstChild);
+  strip.scrollLeft = strip.scrollWidth;   // keep the just-appended (newest) moment in view
+}
+
+function formatTime(ms) {
+  const d = new Date(ms);
+  const pad = (n) => n.toString().padStart(2, "0");
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
 }
 
 function setMode(value, query) {

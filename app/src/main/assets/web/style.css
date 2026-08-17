@@ -38,6 +38,16 @@ body { background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-u
    side column likewise scroll within their panel. align-content:flex-start keeps cells
    packed at the top instead of stretching to fill. */
 #rail { flex: 1 1 auto; min-height: 0; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; overflow-y: auto; }
+/* Moment timeline (Task 1.6, Codex P1 fix): a fixed-height strip below the object rail — unlike
+   the rail (wraps, newest PREPENDED first) this scrolls sideways and appends newest on the RIGHT,
+   oldest-to-newest left-to-right like an actual timeline. Fixed flex:0 0 auto height (not flex:1)
+   so it takes its own space out of #left-col without shrinking the object rail's share below
+   usability; #left-col's flex-column layout gives it that space automatically. */
+#timeline-panel { flex: 0 0 auto; }
+#timeline { display: flex; flex-direction: row; gap: 8px; overflow-x: auto; overflow-y: hidden; padding-bottom: 2px; }
+/* flex-shrink:0 — without it flex's default shrink-to-fit would squeeze cells narrower than
+   92px instead of overflowing into the scrollbar, defeating the filmstrip. */
+#timeline .cell { flex: 0 0 auto; }
 #results { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; max-height: calc(100vh - 140px); overflow-y: auto; }
 .cell { width: 92px; }
 .cell img { width: 92px; height: 92px; object-fit: cover; border-radius: 6px; background: #1d1d22; }
