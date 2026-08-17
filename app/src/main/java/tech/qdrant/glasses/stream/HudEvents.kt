@@ -5,9 +5,9 @@ import org.json.JSONObject
 import tech.qdrant.glasses.detect.Track
 
 /**
- * Pure builders for the 5 SSE event lines the HUD consumes. Each returns one compact
+ * Pure builders for the 6 SSE event lines the HUD consumes. Each returns one compact
  * JSON line (no trailing newline — the server adds the SSE "data: ...\n\n" framing).
- * Boxes carry the tracker's trackId as `id`; stored/results carry the thumb KEY as `id`.
+ * Boxes carry the tracker's trackId as `id`; stored/results/moment carry the thumb KEY as `id`.
  */
 object HudEvents {
     // [tags] (F3, whole-branch review fix, Spec §5): a fused moment hit's VERIFIED region label,
@@ -62,9 +62,15 @@ object HudEvents {
 
     /** One stored keyframe dropping onto the HUD's live timeline (episodic-memory plan Task 1.6,
      *  Spec §5). [key] is the thumb file's `nameWithoutExtension` (same `/thumb/<key>` convention
-     *  as [storedEvent]'s `id`). [tags] is the verified-region label layer — always empty in Stage 1
-     *  (regions are Stage 2) and omitted from the JSON entirely when empty, same null-omit
-     *  convention [modeEvent] uses for its optional `query`. */
+     *  as [storedEvent]'s `id`). [tags] is the verified-region label layer (Stage 2 has shipped —
+     *  this is no longer a forward-looking field), but callers still always leave it empty here in
+     *  practice: [tech.qdrant.glasses.pipeline.MomentCapture.onMoment] fires from inside
+     *  `confirmAndStore`'s frame-store block, BEFORE that same call's region layer runs (see its
+     *  KDoc), so no verified region label exists yet at the instant this event is built for a given
+     *  moment. A moment's verified tags DO reach the HUD once its regions exist — as a recall-card
+     *  chip via [resultsEvent]/[ResultItem.tags] (F3, whole-branch review fix) when the moment is
+     *  found again by a later search, not on this live timeline event. Omitted from the JSON
+     *  entirely when empty, same null-omit convention [modeEvent] uses for its optional `query`. */
     fun momentEvent(key: String, tsMs: Long, count: Long, tags: List<String> = emptyList()): String {
         val o = JSONObject().put("t", "moment").put("id", key).put("ts", tsMs).put("count", count)
         if (tags.isNotEmpty()) o.put("tags", JSONArray(tags))

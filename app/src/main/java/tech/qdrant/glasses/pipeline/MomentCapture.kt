@@ -30,7 +30,10 @@ import kotlin.math.sqrt
  *    verified on-device at the Stage gates, not by assertion — Spec §4's thresholds (and Task
  *    2.2's `VERIFY_COS`) are STARTING values pending an on-device calibration pass (Global
  *    Constraints), and the window/confirm/region logic needs a real camera feed to exercise
- *    meaningfully.
+ *    meaningfully. Doc-rot note: Spec §4 step 3 also specifies a `SHARPNESS_MIN` floor (reject a
+ *    window's sharpest sample if it's still below an absolute blur threshold) — that floor is NOT
+ *    implemented below; the window unconditionally keeps whichever sample scored highest, however
+ *    blurry, so `SHARPNESS_MIN` remains a Spec §8 unknown-#7 item with no code to calibrate yet.
  *
  * [MomentCapture] mirrors [PerceptionPipeline]'s lane/snapshot/recycle/backpressure discipline
  * (its KDoc) — NOT its store-search dedup: a moment's "dedup" IS the pre-gate + confirm below,
@@ -184,7 +187,12 @@ class MomentCapture(
         // Region layer (Task 2.2, Spec §2): at most this many confirmed tracker boxes get a region
         // embedding per stored moment, highest yolo_conf first — a bound on the extra NPU/store work
         // one keyframe can trigger, not a quality signal (a scene with more objects just loses the
-        // weakest-confidence ones). UNCALIBRATED — tuned at the Stage 2 gate (Spec §8.7).
+        // weakest-confidence ones). UNCALIBRATED — tuned at the Stage 2 gate. (Doc-rot fix: NOT one
+        // of Spec §8 unknown #7's listed calibration values — that list is CONFIRM_COSINE,
+        // SHARPNESS_MIN, VERIFY_COS, the frame-channel search gate, and TAG_BOOST_LAMBDA; this is an
+        // engineering bound on region work, not a threshold #7 is tracking. No §-citation, unlike
+        // MomentSearcher.kt's/MomentFusion.kt's "(Spec §7/§8 unknown #7)" constants, which ARE on
+        // that list.)
         const val REGIONS_MAX_PER_MOMENT = 6
         // CLIP-verify-the-label threshold (Spec §2/§7): a region embedding's cosine against its
         // YOLO label's CLIP text vector must clear this to keep the label as a display tag. Seeded
@@ -567,7 +575,7 @@ class MomentCapture(
     /** [PIXEL_SCALE_SIDE]-square gray copy → [GRID_SIDE]x[GRID_SIDE] luma grid (Spec §4 step 3's
      *  "~160 px gray copy"), used for both the pixel pre-gate similarity and the sharpness score so
      *  a candidate frame is only downscaled once. `createScaledBitmap`'s "may return the source
-     *  itself" contract (see [PerceptionPipeline.cropFrom]'s KDoc for the same gotcha) can't apply
+     *  itself" contract (see [cropFrom]'s KDoc, `CropGeometry.kt`, for the same gotcha) can't apply
      *  here since `bitmap` is always far larger than [PIXEL_SCALE_SIDE], but the guard costs
      *  nothing and matches the defensive idiom used everywhere else this call appears. */
     private fun gridOf(bitmap: Bitmap): FloatArray {

@@ -10,16 +10,22 @@ import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
 
 /**
- * OBJECTS-mode voice search: normalize the query → text-embed → vector search → hybrid
- * cosine-gate-OR-label-match filter → HUD push → map to [MomentCard]s. Moved VERBATIM out of
- * [tech.qdrant.glasses.GlassesViewModel.onVoiceResult]'s OBJECTS branch (Task 8 of the
- * God-object decomposition) — same normalization, same gate-OR-labelMatch filter, same
- * push-before-return-value ordering, same empty-result behavior (an empty [Outcome.Success]
- * list is a valid, honest "nothing found" — not [Outcome.Unavailable]).
+ * RETIRED (doc-rot fix, whole-branch review): this class's own [search] is no longer called from
+ * anywhere — Task 2.4 retired the crop-based [VectorStore] search path it queried in favor of
+ * [tech.qdrant.glasses.search.MomentSearcher]'s moment/region search, and
+ * [tech.qdrant.glasses.GlassesViewModel.onVoiceResult] now calls that instead. This class survives
+ * SOLELY so its nested [Outcome] type stays available — [MomentSearcher] deliberately reuses
+ * [ObjectSearcher.Outcome] rather than defining its own sealed type (see [MomentSearcher]'s KDoc)
+ * — so treat every doc/comment below this point as HISTORICAL: it describes the live OBJECTS-mode
+ * search path this class used to be, not current behavior.
  *
- * Threading: [search] MUST already be running on `inferLane` (the same lane as the OBJECTS
- * detect/embed pipeline, so a query text-embed serializes with the detect/embed hot path and
- * the store query) — this function does no dispatching of its own.
+ * (Original KDoc, kept for that history: OBJECTS-mode voice search — normalize the query →
+ * text-embed → vector search → hybrid cosine-gate-OR-label-match filter → HUD push → map to
+ * [MomentCard]s. Moved VERBATIM out of [tech.qdrant.glasses.GlassesViewModel.onVoiceResult]'s
+ * OBJECTS branch (Task 8 of the God-object decomposition) — same normalization, same
+ * gate-OR-labelMatch filter, same push-before-return-value ordering, same empty-result behavior
+ * (an empty [Outcome.Success] list is a valid, honest "nothing found" — not [Outcome.Unavailable]).
+ * Threading: [search] MUST already be running on `inferLane`.)
  */
 class ObjectSearcher(
     private val cropEncoder: CropEncoder,

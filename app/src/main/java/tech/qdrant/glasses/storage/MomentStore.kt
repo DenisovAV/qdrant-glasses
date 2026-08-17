@@ -125,8 +125,11 @@ interface MomentStore : AutoCloseable {
      *  the small-object recall path (Task 2.3 fuses this with [searchFrames] by parent [MomentHit.momentId]). */
     fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit>
 
-    /** Every stored `type=frame` moment, oldest-first (payload only, no vectors) — rebuilds the
-     *  HUD timeline rail on connect, mirroring [VectorStore.all]. */
+    /** The most-recent [limit] stored `type=frame` moments, oldest-first (payload only, no
+     *  vectors) — rebuilds the HUD timeline rail on connect, mirroring [VectorStore.all]. NOT
+     *  "every" stored frame moment despite the name: past [limit] points this returns a WINDOW
+     *  (the newest [limit]), not the full history — see `QdrantEdgeMomentStore.timeline`'s KDoc for
+     *  why (a client-side sort-then-trim over the whole `type=frame` channel; fine at demo scale). */
     fun timeline(limit: Int = 500): List<MomentHit>
 
     /** Total point count across ALL channels (frame + region + future speech/ocr). */

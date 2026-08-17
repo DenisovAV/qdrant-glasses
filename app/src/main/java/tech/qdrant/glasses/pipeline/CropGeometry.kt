@@ -25,12 +25,13 @@ const val CROP_PADDING = 0.20f
 
 /**
  * Crop [box] out of [frame] with [padding] context on each side (defaults to [CROP_PADDING]),
- * returning pixels the CALLER owns — never an alias of [frame]. Shared by
- * [tech.qdrant.glasses.pipeline.PerceptionPipeline]'s object-crop path and
- * [tech.qdrant.glasses.pipeline.MomentCapture]'s region-embed path (Task 2.2) — moved here
- * verbatim (same padded-rect computation, same alias guard) rather than duplicated, since both
- * callers recycle their own `frame` while a crop derived from it may still be in use on another
- * lane, and both need to survive the same `Bitmap.createBitmap` aliasing gotcha below.
+ * returning pixels the CALLER owns — never an alias of [frame]. Top-level here (not folded back
+ * into its one caller) because it was ORIGINALLY shared between two callers — PerceptionPipeline's
+ * object-crop path and [tech.qdrant.glasses.pipeline.MomentCapture]'s region-embed path (Task 2.2)
+ * — but the object-crop path was retired (`4272653`), leaving MomentCapture as the ONLY caller now.
+ * Left as a standalone top-level fn rather than moved back into MomentCapture: the padded-rect
+ * computation and the `Bitmap.createBitmap` aliasing guard below are self-contained and Bitmap/
+ * RectF-only (no MomentCapture state), so there's nothing to gain from re-inlining it.
  */
 fun cropFrom(frame: Bitmap, box: RectF, padding: Float = CROP_PADDING): Bitmap? =
     paddedCropRect(box, padding, frame.width, frame.height)?.let { r ->
@@ -41,12 +42,12 @@ fun cropFrom(frame: Bitmap, box: RectF, padding: Float = CROP_PADDING): Bitmap? 
             val b = Bitmap.createBitmap(frame, r.left, r.top, r.width(), r.height())
             // `Bitmap.createBitmap(src, …)` is documented to return THE SOURCE ITSELF when the
             // requested subset is the whole bitmap ("the new bitmap may be the same object as
-            // source"). That happens routinely with a large-enough padding (e.g. PerceptionPipeline's
-            // THUMB_PADDING grows a box by 120% per side, so anything past ~30% of the frame clamps
-            // to the full frame). A caller then recycles `frame` as soon as its own scope ends —
-            // while a crop derived from it may still be in use elsewhere — and an aliased crop dies
-            // with it ("Can't compress a recycled bitmap"). Force a copy so a crop NEVER aliases the
-            // frame it was cut from.
+            // source"). That can happen even at this file's modest [CROP_PADDING] (20% context per
+            // side): once [box] already covers most of [frame], padding it out clamps to the full
+            // frame on one or more edges (see [paddedCropRect]'s `coerceIn`). A caller then recycles
+            // `frame` as soon as its own scope ends — while a crop derived from it may still be in
+            // use elsewhere — and an aliased crop dies with it ("Can't compress a recycled bitmap").
+            // Force a copy so a crop NEVER aliases the frame it was cut from.
             if (b === frame) b.copy(frame.config ?: Bitmap.Config.ARGB_8888, false) else b
         } catch (_: Throwable) { null }
     }

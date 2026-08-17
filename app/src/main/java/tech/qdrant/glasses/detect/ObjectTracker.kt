@@ -21,8 +21,13 @@ data class Track(
  * in frame). Unmatched detections start new tracks. A track becomes eligible for embedding
  * once seen [confirmSightings] times, and is embedded at most once (dedup via [markEmbedded]).
  *
- * NOT thread-safe: [update], [confirmedUnembedded], and [markEmbedded] must all be called from
- * the same thread/coroutine lane (the ViewModel's inference lane).
+ * Doc-rot note: the embed-dedup pair above ([confirmedUnembedded]/[markEmbedded]/
+ * [unmarkEmbedded]) describes the RETIRED crop-embed-and-store path (Task 2.4) — nothing in the
+ * shipped OBJECTS pipeline calls them anymore; their only callers today are [ObjectTrackerTest].
+ * [confirmed] (below) is the live region-candidate source instead — see its own KDoc.
+ *
+ * NOT thread-safe: [update], [confirmedUnembedded], [markEmbedded], and [confirmed] must all be
+ * called from the same thread/coroutine lane (the ViewModel's inference lane).
  */
 class ObjectTracker(
     private val confirmSightings: Int = 3,
