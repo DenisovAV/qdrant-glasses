@@ -90,8 +90,11 @@ class QdrantEdgeStore(
     // every read of it happens inside the lock.
     private val lock = Any()
     private var shard: EdgeShard
-    // Guards against a second close(): the native shard is freed on the first, so calling count()
-    // or close() on it again is a use-after-free (an uncatchable native abort). Idempotent close.
+    // Guards close()/deleteAll() against touching an already-freed native shard — the handle is
+    // freed the instant shard.close() returns, so any further call on it is a use-after-free (an
+    // uncatchable native abort). Only close() and deleteAll() check this (both idempotent as a
+    // result); count()/search()/etc. do NOT — calling one of those after close() is still a
+    // use-after-free, it's on the caller not to.
     private var closed = false
 
     init {
@@ -100,6 +103,7 @@ class QdrantEdgeStore(
     }
 
     override fun upsert(vector: FloatArray, payload: ObjectPayload): String = synchronized(lock) {
+        require(vector.size == dim) { "dim ${vector.size} != $dim" }
         val id = UUID.randomUUID().toString()
         val named = Vector.Named(mapOf(FIELD to NamedVector.Dense(vector.toList())))
         shard.update(UpdateOperation.upsertPoints(listOf(
@@ -115,6 +119,7 @@ class QdrantEdgeStore(
         // (vs upsert()'s flush-per-call). Returns the generated ids in input order.
         val ids = ArrayList<String>(items.size)
         val points = items.map { (vector, payload) ->
+            require(vector.size == dim) { "dim ${vector.size} != $dim" }
             val id = UUID.randomUUID().toString()
             ids.add(id)
             Point(
@@ -150,7 +155,7 @@ class QdrantEdgeStore(
     ): List<ObjectHit> = synchronized(lock) {
         // Filter DURING the scan (a post-filtered top-k could return < k): a payload range condition
         // on timestamp_ms. Both bounds optional (null = open end). No bound → no filter at all.
-        // Caveat (see design §2): the shard has NO payload index on timestamp_ms, so this is a
+        // Caveat: the shard has NO payload index on timestamp_ms, so this is a
         // filter-during-brute-force-scan, not an indexed filter — the measured cost reflects that.
         val filter = if (sinceMs == null && untilMs == null) null else Filter(
             must = listOf(Condition.Field(FieldCondition(
@@ -215,18 +220,32 @@ class QdrantEdgeStore(
     override fun deleteAll(): Unit = synchronized(lock) {
         // Drop + recreate in-process (no app relaunch): close the native handle, wipe the shard
         // directory on disk, then reload an empty shard from the same config on the same dir.
+        check(!closed) { "deleteAll() called on a closed QdrantEdgeStore" }
         val before = runCatching { shard.count(CountRequest(filter = null, exact = false)).toLong() }.getOrDefault(-1L)
         shard.close()
-        File(dir).deleteRecursively()
+        // The handle is freed the instant shard.close() returns above: if the wipe or the reload
+        // below throws, `shard` is now dangling and MUST NOT be touched again. Mark closed=true
+        // right away so a later close()/deleteAll() sees the guard and skips it (an uncatchable
+        // native abort otherwise); only flip it back once the reload has actually succeeded.
+        closed = true
+        val wiped = File(dir).deleteRecursively()
+        check(wiped) {
+            "deleteAll: failed to fully wipe $dir (a locked/mmap'd file likely survived) — " +
+                "reloading a shard on top of leftover files would silently keep old points"
+        }
         File(dir).mkdirs()
         shard = EdgeShard.load(dir, config)
+        closed = false
         Log.i(TAG, "deleteAll: dropped $before points, shard recreated empty at $dir")
     }
 
     override fun buildIndex() {
-        // HNSW mode only: build the graph over everything inserted (a single native pass — the pricey
-        // step, ~5.5min@100k / ~1h46m@1M measured in the edge-scale bench, and NOT interruptible).
-        // Brute-force mode: no index → no-op.
+        // HNSW mode only: build the graph over everything inserted (a single native pass, NOT
+        // interruptible). The ~5.5min@100k / ~1h46m@1M figures from the edge-scale bench were
+        // measured under the OLD maxIndexingThreads=1 config; this store now passes 0 (auto, see
+        // above), which should cut the build time several-fold — NOT yet re-measured on this branch,
+        // so treat those numbers as stale/an upper bound, not current fact. Brute-force mode: no
+        // index → no-op.
         if (hnsw) synchronized(lock) { shard.optimize() }
     }
 
