@@ -91,9 +91,13 @@ class MomentSearcher(
             "hits=${hits.size}/${allHits.size} gate=$MOMENT_SEARCH_GATE top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
+        // Both branches keep the established top-5 contract: recall re-sorts by recency then trims;
+        // the non-recall branch is already score-sorted (inherited from allHits above) so trimming
+        // here is just the top-5 cap — a two-channel fetchK=5+5 can otherwise surface ~10 distinct
+        // moments after fuseAndCollapse.
         val ordered =
             if (isRecallLocationIntent(query)) hits.sortedByDescending { it.timestampMs }.take(5)
-            else hits
+            else hits.take(5)
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)
