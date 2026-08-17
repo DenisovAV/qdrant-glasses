@@ -171,7 +171,10 @@ class GlassesComponents(
                         mc.onMoment = { hit ->
                             val key = File(hit.thumbPath).nameWithoutExtension
                             hud.registerThumb(key, hit.thumbPath)
-                            hud.pushEvent(HudEvents.momentEvent(key, hit.timestampMs, ms.count()))
+                            // frameCount(), not count() (whole-branch review fix, F1): count() is
+                            // every point across BOTH channels (frame + region), so a keyframe with
+                            // its verified regions was reporting as up to ~7 "moments" per store.
+                            hud.pushEvent(HudEvents.momentEvent(key, hit.timestampMs, ms.frameCount()))
                         }
                     }
                     Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")

@@ -10,7 +10,13 @@ import tech.qdrant.glasses.detect.Track
  * Boxes carry the tracker's trackId as `id`; stored/results carry the thumb KEY as `id`.
  */
 object HudEvents {
-    data class ResultItem(val thumbKey: String, val label: String, val score: Float)
+    // [tags] (F3, whole-branch review fix, Spec §5): a fused moment hit's VERIFIED region label,
+    // surfaced separately from [label] so the browser can render it as a distinct tag chip on the
+    // recall card rather than folding it into the existing label+score line. Defaulted so every
+    // pre-F3 positional ResultItem(...) call site (ObjectSearcher, HudEventsTest) keeps compiling
+    // unchanged — ObjectSearcher never populates it (it has no verified-region concept), so its
+    // cards render with no chip, same as before this field existed.
+    data class ResultItem(val thumbKey: String, val label: String, val score: Float, val tags: List<String> = emptyList())
 
     /** scores maps trackId -> detection score for this frame; absent → score omitted. */
     fun boxesEvent(tracks: List<Track>, scores: Map<Int, Float>, frameW: Int, frameH: Int): String {
@@ -44,7 +50,13 @@ object HudEvents {
 
     fun resultsEvent(items: List<ResultItem>): String {
         val arr = JSONArray()
-        for (r in items) arr.put(JSONObject().put("id", r.thumbKey).put("label", r.label).put("score", r.score.toDouble()))
+        for (r in items) {
+            val o = JSONObject().put("id", r.thumbKey).put("label", r.label).put("score", r.score.toDouble())
+            // Same null-omit convention [momentEvent] uses for its optional `tags`/`query`-shaped
+            // fields — most ResultItems (any unverified moment, every ObjectSearcher hit) carry none.
+            if (r.tags.isNotEmpty()) o.put("tags", JSONArray(r.tags))
+            arr.put(o)
+        }
         return JSONObject().put("t", "results").put("items", arr).toString()
     }
 

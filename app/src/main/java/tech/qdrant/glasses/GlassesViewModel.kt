@@ -53,16 +53,30 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
 
     // The wired MjpegServer path used this to replay already-stored OBJECTS into a HUD that
     // connects/reconnects mid-session (crop-store path — retired, Task 2.4: no OBJECTS-mode
-    // VectorStore exists to replay from anymore). Moments have their own backfill instead:
-    // GlassesViewModel.init pushes momentStore.timeline() directly via HudEvents.momentEvent (see
-    // below) rather than through this railItems/broadcastRailSnapshot seam, because storedEvent's
-    // shape (`"t":"stored"`, label, count) is an OBJECT rail item — replaying moments through it
-    // would land them in the dashboard's object rail under the wrong event type. Left as an empty
-    // provider (not removed — HudPublisher's constructor still requires one for the wired path)
-    // rather than wired to momentStore: a HUD reconnecting to the wired path after the one-time
-    // init backfill below won't see a moment-rail replay — a known gap, not fixed by this task
-    // (Spec §5 flags dashboard-side rendering as a separate, cross-repo change).
-    private val hud = tech.qdrant.glasses.stream.HudPublisher(railItems = { emptyList() })
+    // VectorStore exists to replay from anymore). Left as an empty provider (not removed —
+    // HudPublisher's constructor still requires one for the wired path).
+    //
+    // Moments do NOT reuse this seam: storedEvent's shape (`"t":"stored"`, label, count) is an
+    // OBJECT rail item with no `ts` field — replaying moments through it would both land them in
+    // the dashboard's object rail under the wrong event type AND lose their timestamp. F2
+    // (whole-branch review fix) instead gives moments their OWN parallel seam —
+    // FrameSink.momentSnapshotProvider / HudEvents.momentEvent, wired via `momentItems` below — so
+    // a HUD that connects/reconnects to the wired path AFTER init (a browser refresh) still sees
+    // the stored timeline; see MjpegServer.serveEvents()'s momentSnapshotProvider replay block.
+    // The one-time init backfill further below (GlassesViewModel.init pushing
+    // momentStore.timeline() once, right after load() returns) stays too: it is what fills in a
+    // HUD that was ALREADY connected during the store's async (~10s) load — a gap this
+    // per-connection provider can't cover on its own, since it only fires on a NEW connection.
+    private val hud = tech.qdrant.glasses.stream.HudPublisher(
+        railItems = { emptyList() },
+        momentItems = {
+            components?.momentStore?.timeline()?.map {
+                tech.qdrant.glasses.stream.MjpegServer.MomentItem(
+                    File(it.thumbPath).nameWithoutExtension, it.thumbPath, it.timestampMs,
+                )
+            } ?: emptyList()
+        },
+    )
 
     fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) = hud.attach(s)
 
@@ -138,8 +152,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // though onMoment itself fires on embedLane. Reassigning the var here, BEFORE
                     // `perception = localPerception` below publishes the field a camera frame could
                     // reach momentCapture through, is safe for the same happens-before reason
-                    // regionsProvider's wiring above already documents — no @Volatile needed on
-                    // onMoment either.
+                    // regionsProvider's wiring above already documents — onMoment is @Volatile for
+                    // the identical belt-and-suspenders reason (see its own KDoc in MomentCapture.kt),
+                    // not because this ordering alone would be unsound without it.
                     val hudOnMoment = c.momentCapture?.onMoment
                     c.momentCapture?.onMoment = { hit ->
                         // Schedule the counter update BEFORE invoking hudOnMoment (Codex P2 fix):
@@ -159,11 +174,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // oldest-first, its own contract) directly via HudEvents.momentEvent — Task 2.4
                     // retired the crop-store equivalent (hud.broadcastRailSnapshot()/railItems: no
                     // OBJECTS-mode VectorStore left to replay from). count is fetched once (not per
-                    // item) — a single native round trip, not one per pushed event.
+                    // item) — a single native round trip, not one per pushed event. (A HUD that
+                    // connects/reconnects AFTER this point is covered separately, per-connection, by
+                    // the momentSnapshotProvider wired onto `hud` above — F2, whole-branch review fix.)
                     if (Config.MOMENT_MEMORY) {
                         val ms = c.momentStore
                         val moments = ms?.timeline() ?: emptyList()
-                        val momentCount = ms?.count() ?: 0L
+                        // frameCount(), not count() — same F1 fix as GlassesComponents' onMoment
+                        // forward: count() is every point across both channels (frame + region).
+                        val momentCount = ms?.frameCount() ?: 0L
                         for (m in moments) {
                             val key = File(m.thumbPath).nameWithoutExtension
                             hud.registerThumb(key, m.thumbPath)

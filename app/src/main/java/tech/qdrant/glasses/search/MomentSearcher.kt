@@ -110,7 +110,12 @@ class MomentSearcher(
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)
-            HudEvents.ResultItem(key, h.label, h.score)
+            // F3 (Spec §5): fuseAndCollapse only ever puts a NON-empty label on a fused hit when a
+            // VERIFIED region backs it (see its KDoc) — surface that as a recall-card tag chip. This
+            // is the SEARCH-time tag path only; the live timeline's momentEvent tags stay empty
+            // regardless (regions are stored after a frame's onMoment fires — see HudEvents.momentEvent's KDoc).
+            val tags = if (h.label.isNotEmpty()) listOf(h.label) else emptyList()
+            HudEvents.ResultItem(key, h.label, h.score, tags)
         }
         hud.pushEvent(HudEvents.resultsEvent(resultItems))
         return ObjectSearcher.Outcome.Success(ordered.map { toMomentCard(it) })

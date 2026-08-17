@@ -40,6 +40,9 @@ class MjpegPusher(private val relayBaseUrl: String) : FrameSink {
 
     // Only MjpegServer's /events replay uses this; the relay handles reconnect replay itself.
     override var railSnapshotProvider: (() -> List<MjpegServer.RailItem>)? = null
+    // Same story as railSnapshotProvider just above, for moments (F2, whole-branch review fix):
+    // only MjpegServer's /events replay reads this.
+    override var momentSnapshotProvider: (() -> List<MjpegServer.MomentItem>)? = null
 
     /** Fire-and-forget async POST — returns immediately so streamLane isn't held on the network. */
     override fun offerFrame(jpeg: ByteArray) {

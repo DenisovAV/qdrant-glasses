@@ -133,8 +133,14 @@ class MomentCapture(
     // Fired after a successful storeMoment(), on embedLane. Deliberately NOT a HudPublisher
     // reference — Task 1.6 wires the HUD timeline event through this callback so MomentCapture
     // stays unaware of the HUD (same seam style as ObjectSearcher not knowing about HudPublisher
-    // internals).
-    var onMoment: ((MomentHit) -> Unit)? = null,
+    // internals). @Volatile for the same reason as [regionsProvider] just below: GlassesViewModel
+    // reassigns this field AFTER GlassesComponents.load() has already constructed MomentCapture (to
+    // wrap the HUD forward in its own session.onMemoryIndexed() counter update — see
+    // GlassesViewModel.init), and a plain var write has no happens-before with embedLane's read of
+    // this field, so a camera-dispatched frame right after that reassignment could still observe
+    // the OLD callback. GlassesViewModel also orders the reassignment before `perception` itself is
+    // published, same belt-and-suspenders discipline regionsProvider's wiring documents.
+    @Volatile var onMoment: ((MomentHit) -> Unit)? = null,
     // Region source (Task 2.2, Spec §2 "CLIP-verify-the-label") — the tracker's CONFIRMED boxes at
     // the time confirmAndStore runs. Defaults to no regions so a bare MomentCapture (unit tests,
     // regions disabled) behaves exactly as before Task 2.2. A `var`, not a constructor-injected

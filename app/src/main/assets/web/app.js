@@ -131,7 +131,11 @@ function renderResults(items) {
   for (const r of items) {
     const d = document.createElement("div");
     d.className = "cell";
-    d.innerHTML = `<img src="/thumb/${r.id}" onerror="this.classList.add('broken')"><span>${r.label} ${(r.score*100|0)}%</span>`;
+    // F3 (whole-branch review fix, Spec §5): a verified region label rides in on `tags` (kept
+    // separate from `label`/score above so it can render as its own small chip). Only moment hits
+    // carry it today; absent/empty for a plain object/frame hit, so no chip shows then.
+    const tagHtml = (r.tags && r.tags.length) ? `<span class="tag-chip">${r.tags[0]}</span>` : "";
+    d.innerHTML = `<img src="/thumb/${r.id}" onerror="this.classList.add('broken')">${tagHtml}<span>${r.label} ${(r.score*100|0)}%</span>`;
     wrap.appendChild(d);
   }
 }

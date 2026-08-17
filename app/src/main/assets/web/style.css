@@ -53,5 +53,8 @@ body { background: #0c0c0e; color: #e8e8ea; font-family: ui-sans-serif, system-u
 .cell img { width: 92px; height: 92px; object-fit: cover; border-radius: 6px; background: #1d1d22; }
 .cell img.broken { visibility: hidden; }
 .cell span { display: block; font-size: 11px; color: #b8b8c0; margin-top: 3px; text-align: center; }
+/* F3 (whole-branch review fix, Spec §5): verified-region tag chip on a recall card — a small pill
+   distinct from the plain label+score line below it, same dark/green palette as .rec/#t-count. */
+.tag-chip { display: inline-block; font-size: 10px; padding: 1px 6px; margin-top: 3px; border-radius: 8px; background: #1d1d22; color: #15c46a; border: 1px solid #2a2a30; }
 .searching { color: #8a8a92; font-size: 13px; padding: 8px; }
 #search-query { color: #15c46a; }
