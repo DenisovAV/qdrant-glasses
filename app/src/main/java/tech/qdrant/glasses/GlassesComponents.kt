@@ -13,8 +13,8 @@ import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
 import tech.qdrant.glasses.search.MomentRetriever
 import tech.qdrant.glasses.search.SherpaVadAsr
+import tech.qdrant.glasses.storage.DbBenchRunner
 import tech.qdrant.glasses.storage.VectorStore
-import tech.qdrant.glasses.storage.VectorStoreBenchmark
 import tech.qdrant.glasses.storage.VectorStoreFactory
 import tech.qdrant.glasses.storage.VisionMemoryStore
 
@@ -92,12 +92,11 @@ class GlassesComponents(
                 // TinyCLIP have different cosine scales, so an absent query returns nothing).
                 retriever = MomentRetriever(store, visionMinScore = cropEncoder.visionMinScore)
                 Log.i(TAG, "object mode ready (store=${objectStore.name}, backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim}), objects=${objectStore.count()}")
-                // Optional in-app vector-DB benchmark (design §3), gated + off the main thread:
-                //   adb shell setprop debug.qdrant.dbbench 1   → runs the full matrix at next launch.
-                // Uses a DEDICATED bench namespace + wipes itself, so it never touches demo memory.
-                if (tech.qdrant.glasses.Config.sysprop("qdrant.dbbench") == "1") {
-                    VectorStoreBenchmark(app).launch()
-                }
+                // Optional in-app vector-DB benchmark, gated + off the main thread. This file
+                // compiles into both flavors, so the actual sysprop-check + launch is indirected
+                // through a flavor seam: a no-op in the demo flavor, the real thing in benchmark
+                // (see DbBenchRunner's KDoc, and its two flavor copies, for why).
+                DbBenchRunner.runIfEnabled(app)
                 // NOTE: the "fill any already-connected HUDs' rails" broadcast does NOT happen
                 // here — it needs `hud`, which the VM constructs independently of `components`.
                 // The VM's init calls hud.broadcastRailSnapshot() itself right after load() returns.

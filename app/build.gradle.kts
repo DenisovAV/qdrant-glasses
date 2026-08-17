@@ -3,8 +3,39 @@ import java.util.Properties
 plugins {
     alias(libs.plugins.android.application)
     // Order matters: android application first, then the kapt shim, then io.objectbox (its transform
-    // + annotation processor ride on kapt). Only pulled in for a VectorStoreFactory.backend=OBJECTBOX
-    // bench build; harmless (unused entity + codegen) in the default QDRANT_EDGE demo build.
+    // + annotation processor ride on kapt).
+    //
+    // These two ride the module's `plugins{}` block, which AGP applies to the WHOLE module — there is
+    // no per-flavor `apply()`. That's a real risk for the `demo`/`benchmark` flavor split (see
+    // productFlavors below): ObjectBoxEntities.kt (the only `@Entity`) lives ONLY in `src/benchmark`,
+    // so the naive worry is that the plugin, applied everywhere, leaks ObjectBox into `demo` too.
+    // Decompiling objectbox-gradle-plugin-5.4.2.jar (ObjectBoxGradlePlugin.apply) shows it does two
+    // things that matter here, and both turn out to be flavor-safe in practice — verified against
+    // this project, not assumed:
+    //   1. addDependencies() auto-adds `objectbox-android`/`objectbox-kotlin` to the base
+    //      `implementation` config — but ONLY if it can't already find an ObjectBox dependency
+    //      anywhere in the project's configurations. It finds ours (`benchmarkImplementation` below)
+    //      and skips. Verified: `./gradlew :app:dependencies --configuration demoDebugRuntimeClasspath`
+    //      contains zero `io.objectbox`/`androidx.sqlite` artifacts; `benchmarkDebugRuntimeClasspath`
+    //      has exactly the versions we pinned (no duplicate/second copy).
+    //   2. addDependenciesAnnotationProcessor() DOES unconditionally add `objectbox-processor` to the
+    //      base `kapt` configuration (no "already has" check) — but com.android.legacy-kapt's
+    //      per-flavor kapt configs (`kaptDemo`, `kaptBenchmark`) do NOT extend that base `kapt` config
+    //      once product flavors exist. Verified: `./gradlew :app:dependencyInsight --configuration
+    //      kaptDemo --dependency objectbox-processor` finds nothing, even though the base `kapt`
+    //      config (an orphan once flavors exist — nothing consumes it) does carry it.
+    //   3. The AGP-side bytecode transform it registers runs per-variant over EVERY variant's
+    //      compiled classes looking for `@Entity` — a no-op on `demo` (zero `@Entity` classes
+    //      compiled there) and adds no dependency of its own.
+    // Net result, checked against the actual APK: `assembleDemoDebug`'s APK has no `io/objectbox` or
+    // `androidx/sqlite` classes and no ObjectBox/sqlite-vec native libs (a `strings` scan of its dex
+    // finds exactly one match for "OBJECTBOX" — the `Backend.OBJECTBOX` enum constant's name in
+    // `VectorStoreFactory`, not any library code); `assembleBenchmarkDebug`'s APK has
+    // `libobjectbox-jni.so` + `libsqliteJni.so` + `libvec.so` and ObjectBox codegen ran
+    // (`MyObjectBox.java`, `ObjectBoxMemory_.java`). No conditional/gated `apply()` was needed — the
+    // combination of (a) never leaving these deps to the plugin's auto-add (explicit
+    // `benchmarkImplementation`/`kaptBenchmark` pins below) and (b) the entity source living only in
+    // `src/benchmark` was sufficient, and is far less fragile than gating `apply()` on task names.
     alias(libs.plugins.legacy.kapt)
     alias(libs.plugins.objectbox)
 }
@@ -43,6 +74,17 @@ android {
         release {
             isMinifyEnabled = false
         }
+    }
+
+    // Isolates the benchmark-only vector engines (ObjectBox, sqlite-vec) out of the shipping demo
+    // build. "demo" is the product default (QDRANT_EDGE only, no extra deps/native libs);
+    // "benchmark" additionally compiles src/benchmark (ObjectBoxStore, SqliteVecStore,
+    // VectorStoreBenchmark, the flavor's own VectorStoreFactory wiring all three) and
+    // src/benchmarkAndroidTest (ComparisonBenchmarkTest, ObjectBoxStoreTest, SqliteVecStoreTest).
+    flavorDimensions += "engines"
+    productFlavors {
+        create("demo") { dimension = "engines"; isDefault = true }
+        create("benchmark") { dimension = "engines" }
     }
 
     compileOptions {
@@ -110,21 +152,29 @@ dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
-    // ObjectBox (VectorStoreFactory.backend=OBJECTBOX bench builds). The io.objectbox Gradle plugin
-    // auto-adds these, but we pin them explicitly so the runtime AAR (arm64 native .so) and the kapt
-    // processor are wired deterministically under the legacy-kapt path (belt-and-suspenders; same
-    // 5.4.2 coordinates the plugin would add, so no version clash). objectbox-processor MUST go on the
-    // `kapt` configuration — that is the configuration com.android.legacy-kapt provides.
-    implementation("io.objectbox:objectbox-android:5.4.2")
-    implementation("io.objectbox:objectbox-kotlin:5.4.2")
-    kapt("io.objectbox:objectbox-processor:5.4.2")
+    // ObjectBox (VectorStoreFactory.backend=OBJECTBOX bench builds) — `benchmark`-flavor ONLY; the
+    // `demo` flavor pulls none of this (no runtime AAR, no arm64 native .so, no kapt codegen). The
+    // io.objectbox Gradle plugin auto-adds these to the module's base `implementation` config if it
+    // doesn't see them already, but we pin them explicitly, scoped to `benchmarkImplementation`, so
+    // (a) the runtime AAR (arm64 native .so) and the kapt processor are wired deterministically under
+    // the legacy-kapt path, same 5.4.2 coordinates the plugin would add (belt-and-suspenders, no
+    // version clash), and (b) they never land in `demo`'s classpath via the plugin's own auto-add —
+    // see the `plugins{}` block above for how the plugin itself is kept from doing that.
+    // objectbox-processor MUST go on a `kapt*` configuration — that's what com.android.legacy-kapt
+    // provides — and `kaptBenchmark` is its per-flavor form (only runs for the benchmark variant).
+    "benchmarkImplementation"("io.objectbox:objectbox-android:5.4.2")
+    "benchmarkImplementation"("io.objectbox:objectbox-kotlin:5.4.2")
+    "kaptBenchmark"("io.objectbox:objectbox-processor:5.4.2")
 
-    // sqlite-vec (VectorStoreFactory.backend=SQLITE_VEC bench builds). BundledSQLiteDriver ships its
-    // own SQLite (extensions enabled) and loads the vec0 loadable extension via addExtension(); the
-    // extension .so is shipped as jniLibs/arm64-v8a/libvec.so (renamed from the release's vec0.so so
-    // Android extracts it AND SQLite derives the entry point sqlite3_vec_init from the lib name).
-    implementation("androidx.sqlite:sqlite:2.7.0")
-    implementation("androidx.sqlite:sqlite-bundled:2.7.0")
+    // sqlite-vec (VectorStoreFactory.backend=SQLITE_VEC bench builds) — `benchmark`-flavor ONLY.
+    // BundledSQLiteDriver ships its own SQLite (extensions enabled) and loads the vec0 loadable
+    // extension via addExtension(); the extension .so is shipped as
+    // src/benchmark/jniLibs/arm64-v8a/libvec.so (renamed from the release's vec0.so so Android
+    // extracts it AND SQLite derives the entry point sqlite3_vec_init from the lib name).
+    // androidx.sqlite:sqlite (the plain API surface, not -bundled) is ALSO benchmark-only: nothing
+    // in `demo` (QdrantEdgeStore uses no SQLite) imports it — only SqliteVecStore does.
+    "benchmarkImplementation"("androidx.sqlite:sqlite:2.7.0")
+    "benchmarkImplementation"("androidx.sqlite:sqlite-bundled:2.7.0")
 
     // Instrumented tests (emulator/device) — used to verify each engine end-to-end
     // (insert / kNN / time-filter / recall) without booting the full NPU pipeline.
