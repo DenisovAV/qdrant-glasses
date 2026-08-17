@@ -165,4 +165,39 @@ class MomentFusionTest {
         val expected = 0.40f + 0.05f * 0.8f * 0.5f
         assertEquals(expected, boosted[0].score, 1e-6f)
     }
+
+    // ---- tagAcceptedMomentIds (calibration rehearsal, Change 2) ---------------------------------
+
+    @Test fun verifiedMatchingLabelIsTagAccepted() {
+        val cup = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cup), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun labelDroppedRegionIsNotTagAccepted() {
+        // Empty label == the region's verifyCos was below MomentCapture.VERIFY_COS at capture time
+        // (label dropped, vector kept) — it must not tag-accept even though the query would match
+        // what the (dropped) label would have been.
+        val unlabeled = regionHit("m1", score = 0.10f, label = "", yoloConf = 0.9f, verifyCos = 0.95f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(unlabeled), queryTokens = setOf("cup"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
+
+    @Test fun unverifiedZeroVerifyCosIsNotTagAccepted() {
+        // Defense-in-depth: a non-empty label with verifyCos == 0f (shouldn't occur via
+        // MomentCapture, but a synthetic/test hit could shape it this way) must not tag-accept.
+        val zeroVerify = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(zeroVerify), queryTokens = setOf("cup"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
+
+    @Test fun nonMatchingTokenIsNotTagAccepted() {
+        val cup = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cup), queryTokens = setOf("laptop"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
 }

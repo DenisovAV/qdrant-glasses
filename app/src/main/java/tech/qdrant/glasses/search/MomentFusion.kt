@@ -115,3 +115,28 @@ fun softBoost(
         hit.copy(score = hit.score + lambda * bestMatch.yoloConf * bestMatch.verifyCos)
     }
 }
+
+/**
+ * Moment ids [MomentSearcher.search] must accept regardless of fused vector score (calibration
+ * rehearsal, Change 2): a [regionHits] entry counts as "verified" the same way
+ * [tech.qdrant.glasses.pipeline.MomentCapture.confirmAndStore] decided it at capture time — non-
+ * empty [MomentHit.label] AND [MomentHit.verifyCos] `> 0` (an unverified region is stored with an
+ * empty label per that function's KDoc, so the `> 0` check is defense in depth, not the primary
+ * gate — but a synthetic/test hit could set a label without a verifyCos, and this must not treat
+ * that as verified). Of THOSE, only the ones whose label matches a query token
+ * ([labelMatchesQuery]) contribute their [MomentHit.momentId] to the result.
+ *
+ * This exists because raising [MomentSearcher]'s whole-frame score gate to clear the observed junk
+ * floor (see `MOMENT_SEARCH_GATE`'s KDoc) also raises it past some real, already-VERIFIED region
+ * hits — broad categories like "person" verify at only 0.21–0.23 on real crops (vs 0.26–0.28 for
+ * a distinctive object like a laptop), so a gate tuned to reject junk queries can reject a moment
+ * we already confirmed contains the thing being asked about. A moment in this set bypasses the
+ * gate entirely — same "gate OR exact label match" shape the retired `ObjectSearcher` used, but
+ * sourced from a CLIP-VERIFIED region label instead of YOLO's raw (unverified) one, so a YOLO
+ * mislabel can't force a false accept the way it could there.
+ */
+fun tagAcceptedMomentIds(regionHits: List<MomentHit>, queryTokens: Set<String>): Set<String> =
+    regionHits
+        .filter { it.label.isNotEmpty() && it.verifyCos > 0f && labelMatchesQuery(it.label, queryTokens) }
+        .map { it.momentId }
+        .toSet()
