@@ -53,7 +53,9 @@ class QueryTextTest {
         // start of today (UTC) = 2026-08-17 00:00:00 UTC = nowMs - 15h
         val startToday = nowMs - 15 * HOUR
         assertEquals(startToday - DAY, w.sinceMs)
-        assertEquals(startToday, w.untilMs)
+        // Exclusive of today's midnight (whole-branch review fix) — a keyframe stored at exactly
+        // startToday belongs to "today"'s window, not "yesterday"'s.
+        assertEquals(startToday - 1, w.untilMs)
     }
     @Test fun todayIsStartOfDayUntilNow() {
         val w = extractTimeWindow("what did I see today", nowMs, utc)!!
@@ -72,7 +74,8 @@ class QueryTextTest {
         val w = extractTimeWindow("what did I see yesterday", nowMsNy, nyZone)!!
         val spanMs = w.untilMs!! - w.sinceMs!!
         assertNotEquals(DAY, spanMs)
-        assertEquals(23 * HOUR, spanMs)
+        // -1ms for the exclusive-of-midnight upper bound (whole-branch review fix).
+        assertEquals(23 * HOUR - 1, spanMs)
     }
     @Test fun lastHourIsRelative() {
         val w = extractTimeWindow("where did I put my keys an hour ago", nowMs, utc)!!

@@ -54,7 +54,12 @@ fun extractTimeWindow(
     val q = raw.lowercase()
     val sod = startOfDay(nowMs, zone)
     return when {
-        Regex("\\byesterday\\b").containsMatchIn(q) -> TimeWindow(startOfPreviousDay(nowMs, zone), sod)
+        // Whole-branch review fix: `untilMs` is applied as an INCLUSIVE upper bound by the storage
+        // layer (RangeFloat's `lte`), so `sod` itself (today's midnight) used to double as
+        // yesterday's closing instant too — a keyframe stored at exactly local midnight matched
+        // BOTH "yesterday" and "today". `sod - 1` closes yesterday's window one ms before the
+        // boundary "today"'s window (which correctly starts AT `sod`, inclusive) opens.
+        Regex("\\byesterday\\b").containsMatchIn(q) -> TimeWindow(startOfPreviousDay(nowMs, zone), sod - 1)
         Regex("\\b(today|this morning|this afternoon|earlier today)\\b").containsMatchIn(q) ->
             TimeWindow(sod, nowMs)
         Regex("\\b(an hour ago|last hour|in the last hour)\\b").containsMatchIn(q) ->
