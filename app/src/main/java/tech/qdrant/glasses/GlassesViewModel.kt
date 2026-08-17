@@ -35,38 +35,34 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // unverified — serialize ALL inference + store work on one lane. A late ambient
     // segment encoding concurrently with a query encode is a real (demo-shaped) overlap.
     // This is ALSO the object-detection / tracker lane (ObjectTracker is not thread-safe:
-    // update/confirmedUnembedded/markEmbedded must all run here, single-threaded).
+    // update/confirmed must both run here, single-threaded).
     @OptIn(ExperimentalCoroutinesApi::class)
     private val inferLane = Dispatchers.Default.limitedParallelism(1)
 
-    // Every vision-encoder call (crop dedup embeds in PerceptionPipeline AND, opt-in, the moment
-    // confirm embeds in MomentCapture — Task 1.5, Spec §8.2) serializes on this ONE single-thread
-    // lane: OrtSession.run's concurrency under the QNN EP isn't verified safe. Owned here (not by
-    // PerceptionPipeline, which used to construct its own private `cropLane`) so GlassesComponents
-    // can hand the SAME instance to MomentCapture too.
+    // MomentCapture's vision-encoder calls (frame confirms + region embeds, Spec §8.2) serialize
+    // on this ONE single-thread lane: OrtSession.run's concurrency under the QNN EP isn't verified
+    // safe. Task 2.4 retired PerceptionPipeline's own crop embed (it used to share this lane too,
+    // via a private `cropLane` before that, then this shared instance) — MomentCapture is the only
+    // consumer now. Still owned here, not by MomentCapture, so GlassesComponents.load can hand the
+    // same instance to MomentCapture's constructor.
     @OptIn(ExperimentalCoroutinesApi::class)
     private val embedLane = Dispatchers.IO.limitedParallelism(1)
 
     // ---- Object mode -------------------------------------------------------------------
     private val appMode = AppMode.OBJECTS   // flip to LEGACY for the old whole-frame path
 
-    private val objectsDir by lazy {
-        File(getApplication<Application>().filesDir, "object_thumbs").also { it.mkdirs() }
-    }
-
-    // When a HUD connects, hand it the objects already in memory so its rail isn't empty after a
-    // restart. Read components?.objectStore lazily (it's created async, inside GlassesComponents);
-    // a HUD that connects before components exists just gets an empty list and is refilled by
-    // live `stored` events as usual.
-    private val hud = tech.qdrant.glasses.stream.HudPublisher(railItems = {
-        components?.objectStore?.all()?.map {
-            tech.qdrant.glasses.stream.MjpegServer.RailItem(
-                key = java.io.File(it.thumbPath).nameWithoutExtension,
-                label = it.label,
-                thumbPath = it.thumbPath,
-            )
-        } ?: emptyList()
-    })
+    // The wired MjpegServer path used this to replay already-stored OBJECTS into a HUD that
+    // connects/reconnects mid-session (crop-store path — retired, Task 2.4: no OBJECTS-mode
+    // VectorStore exists to replay from anymore). Moments have their own backfill instead:
+    // GlassesViewModel.init pushes momentStore.timeline() directly via HudEvents.momentEvent (see
+    // below) rather than through this railItems/broadcastRailSnapshot seam, because storedEvent's
+    // shape (`"t":"stored"`, label, count) is an OBJECT rail item — replaying moments through it
+    // would land them in the dashboard's object rail under the wrong event type. Left as an empty
+    // provider (not removed — HudPublisher's constructor still requires one for the wired path)
+    // rather than wired to momentStore: a HUD reconnecting to the wired path after the one-time
+    // init backfill below won't see a moment-rail replay — a known gap, not fixed by this task
+    // (Spec §5 flags dashboard-side rendering as a separate, cross-repo change).
+    private val hud = tech.qdrant.glasses.stream.HudPublisher(railItems = { emptyList() })
 
     fun attachStreamer(s: tech.qdrant.glasses.stream.FrameSink) = hud.attach(s)
 
@@ -77,22 +73,19 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // in the shipped OBJECTS config this stays null and every legacy?.xxx() call below is a no-op.
     @Volatile private var legacy: LegacyMomentPipeline? = null
 
-    // Object-mode hot path (detect→track→crop→embed→dedup→store), extracted verbatim in Task 7.
-    // Constructed only when appMode == OBJECTS (once GlassesComponents has loaded the detector/
-    // tracker/cropEncoder/objectStore); stays null in LEGACY and until load completes, so the
-    // OBJECTS branch of onFrame is a no-op until it's ready — the same null-guard the old inline
-    // `components?.detector ?: return` gave.
+    // Object-mode hot path (detect→track→stream boxes→hand off to MomentCapture), extracted
+    // verbatim in Task 7; Task 2.4 retired its crop-embed-and-store tail. Constructed only when
+    // appMode == OBJECTS (once GlassesComponents has loaded the detector/tracker); stays null in
+    // LEGACY and until load completes, so the OBJECTS branch of onFrame is a no-op until it's
+    // ready — the same null-guard the old inline `components?.detector ?: return` gave.
     @Volatile private var perception: PerceptionPipeline? = null
 
-    // OBJECTS voice search, extracted verbatim in Task 8 (returns an Outcome; the VM maps it to
-    // AppState). Constructed only when appMode == OBJECTS, alongside `perception` — same
-    // "nullable by mode, never by timing" lifecycle.
-    @Volatile private var searcher: tech.qdrant.glasses.search.ObjectSearcher? = null
-
-    // Moment-mode voice search (Task 1.6, episodic-memory plan Stage 1) — routed to INSTEAD of
-    // `searcher` when Config.MOMENT_MEMORY is on (see onVoiceResult). Constructed only when both
-    // appMode == OBJECTS AND the sysprop is on, same "nullable by mode/opt-in" rule as
-    // `components.momentStore`/`momentCapture`.
+    // OBJECTS voice search (Task 2.4: the ONLY OBJECTS-mode search path — the crop-based
+    // ObjectSearcher/VectorStore it queried are retired; see onVoiceResult). Constructed only when
+    // appMode == OBJECTS AND the sysprop doesn't disable the memory path (Config.MOMENT_MEMORY,
+    // default ON), same "nullable by mode/opt-out, never by timing" rule as
+    // `components.momentStore`/`momentCapture`. Null when disabled → onVoiceResult answers
+    // Unavailable rather than crashing (no fallback memory path exists anymore).
     @Volatile private var momentSearcher: tech.qdrant.glasses.search.MomentSearcher? = null
 
     init {
@@ -100,7 +93,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 // Loading order (store → LEGACY encoders → bge → OBJECTS detector/tracker/crop/
-                // objectStore/retriever → LEGACY ASR pre-warm) and per-mode nullability live in
+                // retriever/moment memory → LEGACY ASR pre-warm) and per-mode nullability live in
                 // GlassesComponents.load; it THROWS on failure (caught below, same as before).
                 val c = GlassesComponents.load(
                     app, appMode,
@@ -116,12 +109,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // published, a frame delivered the instant `perception` goes non-null can never
                     // observe MomentCapture's default empty provider.
                     val localPerception = PerceptionPipeline(
-                        viewModelScope, inferLane, c.detector!!, c.tracker!!, c.cropEncoder!!,
-                        c.objectStore!!, hud,
+                        viewModelScope, inferLane, c.detector!!, c.tracker!!, hud,
                         isRecording = { session.isRecording },
-                        onMemoryIndexed = { session.onMemoryIndexed() },
-                        objectThumbsDir = objectsDir,
-                        embedLane = embedLane,
                         momentCapture = c.momentCapture,
                     )
                     // Task 2.2: wire MomentCapture's region source to PerceptionPipeline's confirmed-
@@ -134,20 +123,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     // BEFORE `perception = localPerception` below, on purpose.
                     c.momentCapture?.regionsProvider = { localPerception.latestConfirmedRegions }
                     perception = localPerception
-                    searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
                     if (Config.MOMENT_MEMORY) {
                         momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)
                     }
-                    // The store is async (~10s); a HUD usually connected before now and got an
-                    // empty rail. Now that objects are loadable, fill any already-connected HUDs'
-                    // rails.
-                    hud.broadcastRailSnapshot()
-                    // Task 1.6: same backfill, for the moment timeline — momentStore is likewise
-                    // async-loaded, so a HUD that connected during that ~10s window got no moment
-                    // events either. MomentStore.timeline() is already oldest-first (its own
-                    // contract), so the rail fills in capture order, not reverse-chronological.
-                    // count is fetched once (not per item) — mirrors broadcastRailSnapshot()'s single
-                    // `items.size` above, not a native round trip per pushed event.
+                    // momentStore is async-loaded (~10s); a HUD that connected before now got an
+                    // empty timeline. Task 1.6: backfill it from MomentStore.timeline() (already
+                    // oldest-first, its own contract) directly via HudEvents.momentEvent — Task 2.4
+                    // retired the crop-store equivalent (hud.broadcastRailSnapshot()/railItems: no
+                    // OBJECTS-mode VectorStore left to replay from). count is fetched once (not per
+                    // item) — a single native round trip, not one per pushed event.
                     if (Config.MOMENT_MEMORY) {
                         val ms = c.momentStore
                         val moments = ms?.timeline() ?: emptyList()
@@ -256,13 +240,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
-                // Task 1.6: route to the moment (whole-frame, YOLO-independent) search path when
-                // the sysprop is on, else the existing crop-based ObjectSearcher — same
-                // Config.MOMENT_MEMORY switch PerceptionPipeline/GlassesComponents already gate the
-                // capture side on. Both return ObjectSearcher.Outcome (see MomentSearcher's KDoc for
-                // why it reuses that type instead of its own), so the branches are structurally
-                // identical.
-                val outcome = if (Config.MOMENT_MEMORY) momentSearcher!!.search(query) else searcher!!.search(query)
+                // Task 2.4: moments are the ONLY OBJECTS-mode search path now — the crop-based
+                // ObjectSearcher/VectorStore it queried are retired. `momentSearcher` is null only
+                // when the sysprop explicitly disables the memory path (debug.qdrant.memory=0, an
+                // A/B/regression kill switch — Config.MOMENT_MEMORY), so Unavailable here is an
+                // honest "no memory path", never a `!!` crash.
+                val outcome = momentSearcher?.search(query) ?: tech.qdrant.glasses.search.ObjectSearcher.Outcome.Unavailable
                 when (outcome) {
                     is tech.qdrant.glasses.search.ObjectSearcher.Outcome.Success -> session.setResults(query, outcome.cards)
                     tech.qdrant.glasses.search.ObjectSearcher.Outcome.Unavailable -> session.setIdle()
@@ -275,7 +258,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun frameCount(): Long =
-        components?.let { if (appMode == AppMode.OBJECTS) it.objectStore?.count() else it.store.count() } ?: 0L
+        components?.let { if (appMode == AppMode.OBJECTS) it.momentStore?.count() else it.store.count() } ?: 0L
 
     fun onVoiceError(error: String) {
         Log.w(TAG, "onVoiceError: $error")

@@ -39,15 +39,17 @@ object Config {
     val HUD_STREAM: Boolean = sysprop("qdrant.hud") == "1"
 
     /**
-     * Whether to run the opt-in whole-frame keyframe memory path (episodic-memory plan Stage 1,
-     * `PerceptionPipeline`'s [tech.qdrant.glasses.pipeline.MomentCapture] branch) ALONGSIDE the
-     * existing crop-store path, so the two can be A/B'd on one walk-through without disturbing
-     * the default demo. **OPT-IN — off by default.** The crop-store path stays the default until
-     * Stage 2 retires it.
+     * Whether to run the whole-frame + CLIP-verified-region keyframe memory path
+     * (`PerceptionPipeline`'s [tech.qdrant.glasses.pipeline.MomentCapture] branch).
+     * **DEFAULT ON** as of the episodic-memory plan's Task 2.4 (Stage 2): [MomentCapture] is now
+     * the ONLY OBJECTS-mode memory path — the old YOLO-crop-embed-and-store block it used to run
+     * alongside is retired. Turning this off is therefore a kill switch for A/B/regression
+     * testing, not a fallback to the old behavior (which no longer exists in this build): with it
+     * off, OBJECTS mode still detects/tracks/streams boxes but stores nothing at all.
      *
-     *   adb shell setprop debug.qdrant.memory 1     → enable MomentCapture
+     *   adb shell setprop debug.qdrant.memory 0     → disable MomentCapture (A/B / regression only)
      */
-    val MOMENT_MEMORY: Boolean = sysprop("qdrant.memory") == "1"
+    val MOMENT_MEMORY: Boolean = sysprop("qdrant.memory") != "0"
 
     /**
      * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).

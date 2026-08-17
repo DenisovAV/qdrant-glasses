@@ -20,8 +20,6 @@ import tech.qdrant.glasses.search.SherpaVadAsr
 import tech.qdrant.glasses.storage.DbBenchRunner
 import tech.qdrant.glasses.storage.MomentStore
 import tech.qdrant.glasses.storage.QdrantEdgeMomentStore
-import tech.qdrant.glasses.storage.VectorStore
-import tech.qdrant.glasses.storage.VectorStoreFactory
 import tech.qdrant.glasses.storage.VisionMemoryStore
 import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
@@ -44,11 +42,11 @@ class GlassesComponents(
     val detector: ObjectDetector?,
     val tracker: ObjectTracker?,
     val cropEncoder: CropEncoder?,
-    val objectStore: VectorStore?,
     val retriever: MomentRetriever?,
-    // Opt-in whole-frame keyframe memory (Task 1.5, Config.MOMENT_MEMORY). Both null unless the
-    // sysprop is on AND mode == OBJECTS — "nullable by mode/opt-in, never by timing", same rule
-    // as objectStore/retriever above.
+    // The memory path (Task 2.4: the ONLY OBJECTS-mode memory path, default ON via
+    // Config.MOMENT_MEMORY). Both null when mode != OBJECTS, or when the sysprop explicitly
+    // disables them (`debug.qdrant.memory=0`, a kill switch for A/B/regression) — "nullable by
+    // mode/opt-out, never by timing", same rule [retriever] above already follows.
     val momentStore: MomentStore?,
     val momentCapture: MomentCapture?,
 ) : AutoCloseable {
@@ -59,17 +57,18 @@ class GlassesComponents(
         /**
          * Runs on: IO (called from GlassesViewModel's init, inside viewModelScope.launch(Dispatchers.IO)).
          *
-         * [scope]/[embedLane]/[isRecording] are needed ONLY to build [MomentCapture] (Task 1.5) —
-         * it is constructed here, alongside its [QdrantEdgeMomentStore], so the OBJECTS branch
-         * owns the whole opt-in moment path in one place, the same way it already owns
-         * objectStore/retriever. [embedLane] must be the SAME dispatcher instance the caller later
-         * hands to [tech.qdrant.glasses.pipeline.PerceptionPipeline] (Spec §8.2 — one lane for
-         * every `OrtSession.run` call, crop or moment).
+         * [scope]/[embedLane]/[isRecording] are needed ONLY to build [MomentCapture] — it is
+         * constructed here, alongside its [QdrantEdgeMomentStore], so the OBJECTS branch owns the
+         * whole memory path in one place, the same way it already owns [ObjectTracker]/[CropEncoder].
+         * [embedLane] is [MomentCapture]'s OWN single-thread dispatcher for every `OrtSession.run`
+         * call it makes (frame confirms + region embeds, Spec §8.2) — Task 2.4 retired
+         * [tech.qdrant.glasses.pipeline.PerceptionPipeline]'s crop embed, so nothing else shares
+         * this lane anymore.
          *
          * [hud] is needed ONLY to forward [MomentCapture.onMoment] to the HUD timeline (Task 1.6) —
          * same instance the VM constructs independently of [GlassesComponents] and later hands to
-         * `PerceptionPipeline`/`ObjectSearcher` directly (see the "fill any already-connected HUDs'
-         * rails" comment below for why `hud` itself isn't owned here).
+         * `PerceptionPipeline`/`MomentSearcher` directly (see the "moment-timeline backfill" comment
+         * below for why `hud` itself isn't owned here).
          */
         fun load(
             app: Application,
@@ -109,7 +108,6 @@ class GlassesComponents(
             var detector: ObjectDetector? = null
             var tracker: ObjectTracker? = null
             var cropEncoder: CropEncoder? = null
-            var objectStore: VectorStore? = null
             var retriever: MomentRetriever? = null
             var momentStore: MomentStore? = null
             var momentCapture: MomentCapture? = null
@@ -117,23 +115,15 @@ class GlassesComponents(
                 detector = DetectorFactory.create(app)
                 tracker = ObjectTracker(confirmSightings = 3)
                 cropEncoder = CropEncoderFactory.create(app)
-                // The vector engine is the single build-time switch (VectorStoreFactory.backend);
-                // QDRANT_EDGE is the default → identical behavior to the former direct ObjectStore.
-                // Namespace stays per-crop-encoder so each variant keeps its own on-disk collection.
-                objectStore = VectorStoreFactory.create(
-                    app,
-                    dim = cropEncoder.dim,
-                    namespace = CropEncoderFactory.namespace,
-                )
                 // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
                 // TinyCLIP have different cosine scales, so an absent query returns nothing).
                 retriever = MomentRetriever(store, visionMinScore = cropEncoder.visionMinScore)
-                Log.i(TAG, "object mode ready (store=${objectStore.name}, backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim}), objects=${objectStore.count()}")
+                Log.i(TAG, "object mode ready (backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim})")
                 if (Config.MOMENT_MEMORY) {
-                    // Opt-in whole-frame keyframe path (Task 1.5, episodic-memory plan Stage 1),
-                    // running IN PARALLEL with the crop-store path above so the two can be A/B'd
-                    // on one walk-through (Config.MOMENT_MEMORY / debug.qdrant.memory). Namespace
-                    // matches the crop encoder, same convention objectStore uses, so switching
+                    // The whole-frame + CLIP-verified-region keyframe memory path (Task 2.4: the
+                    // ONLY OBJECTS-mode memory write path — the crop-embed-and-store block it used
+                    // to run alongside is retired). Namespace matches the crop encoder, same
+                    // convention every on-disk collection in this app uses, so switching
                     // CropEncoderFactory.backend still needs no manual data wipe.
                     val thumbsDir = File(app.filesDir, "moment_thumbs").also { it.mkdirs() }
                     // dim = cropEncoder.dim (Codex P2 fix): the store defaulted to a hard-coded
@@ -146,8 +136,8 @@ class GlassesComponents(
                     // Namespaced by CropEncoderFactory.namespace (Task 2.1 concern #2): a text vector
                     // from one crop-encoder backend's space is meaningless cosine'd against a region
                     // vector from another, so switching CropEncoderFactory.backend must not reuse a
-                    // stale file — same convention objectStore/momentStore already use for their
-                    // on-disk collections.
+                    // stale file — same convention momentStore already uses for its own on-disk
+                    // collection.
                     val labelCache = LabelVectorCache(
                         encodeText = { cropEncoder.encodeText(it) },
                         // Codex P1 fix: lets loadPersisted drop a truncated persisted line (a torn
@@ -166,22 +156,18 @@ class GlassesComponents(
                         labelCache = labelCache,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
-                        // thumb for /thumb/<key> BEFORE pushing the event, same call ORDER
-                        // PerceptionPipeline uses for the object rail (its ~line 287-288). On the
-                        // WIRED path (MjpegServer) that order is a real guarantee: registerThumb()
-                        // there is a synchronous in-memory map write, so it's always visible before
-                        // the event pushed right after it. On the WIRELESS path (MjpegPusher) it is
-                        // NOT — Codex review (P2, deferred): registerThumb/pushEvent are independent
+                        // thumb for /thumb/<key> BEFORE pushing the event. On the WIRED path
+                        // (MjpegServer) that order is a real guarantee: registerThumb() there is a
+                        // synchronous in-memory map write, so it's always visible before the event
+                        // pushed right after it. On the WIRELESS path (MjpegPusher) it is NOT —
+                        // Codex review (P2, deferred): registerThumb/pushEvent are independent
                         // fire-and-forget async OkHttp POSTs there (push_thumb / push_event) with no
                         // completion ordering between them, and neither HudPublisher nor MjpegPusher
                         // exposes a hook to make one wait on the other. Calling registerThumb first
                         // only narrows the race, it doesn't close it: a client can still see the
                         // `moment` event before the relay has the thumb and 404 once on
-                        // /thumb/<key>. PerceptionPipeline's object path has the SAME best-effort
-                        // ordering for the SAME reason, so this matches rather than fixes it — a
-                        // raced 404 just leaves one HUD thumbnail blank, the same non-fatal class of
-                        // failure MjpegPusher.registerThumb's own KDoc already accepts for a lost
-                        // thumb, never a reason to add a blocking wait onto embedLane here.
+                        // /thumb/<key> — a non-fatal class of failure (one blank HUD thumbnail),
+                        // never a reason to add a blocking wait onto embedLane here.
                         mc.onMoment = { hit ->
                             val key = File(hit.thumbPath).nameWithoutExtension
                             hud.registerThumb(key, hit.thumbPath)
@@ -195,9 +181,9 @@ class GlassesComponents(
                 // through a flavor seam: a no-op in the demo flavor, the real thing in benchmark
                 // (see DbBenchRunner's KDoc, and its two flavor copies, for why).
                 DbBenchRunner.runIfEnabled(app)
-                // NOTE: the "fill any already-connected HUDs' rails" broadcast does NOT happen
+                // NOTE: the moment-timeline backfill for an already-connected HUD does NOT happen
                 // here — it needs `hud`, which the VM constructs independently of `components`.
-                // The VM's init calls hud.broadcastRailSnapshot() itself right after load() returns.
+                // The VM's init pushes momentStore.timeline() itself right after load() returns.
             }
 
             // Pre-warm the ambient ASR model (~290MB) off the main thread so the first
@@ -217,7 +203,6 @@ class GlassesComponents(
                 detector = detector,
                 tracker = tracker,
                 cropEncoder = cropEncoder,
-                objectStore = objectStore,
                 retriever = retriever,
                 momentStore = momentStore,
                 momentCapture = momentCapture,
@@ -237,7 +222,6 @@ class GlassesComponents(
         store.close()
         detector?.close()
         cropEncoder?.close()
-        objectStore?.close()
         momentStore?.close()
     }
 }
