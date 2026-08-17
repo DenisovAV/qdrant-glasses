@@ -396,12 +396,21 @@ class MomentCapture(
             if (!thumbOk) thumbFile.delete()
 
             val storeT0 = System.currentTimeMillis()
-            try {
+            // storeMoment (native shard/flush) is the ONLY failure that may still delete thumbFile:
+            // nothing durable references it yet, so an orphan here is a real leak. Once storeMoment
+            // RETURNS, the persisted payload's thumbPath points at thumbFile — from that point on
+            // deleting it would break a durable timeline card instead of cleaning up after a failed
+            // one, so count()/onMoment below get their OWN try/catch that only logs (Codex P2 fix:
+            // this used to be one broad catch around all three calls, so a count()/onMoment failure
+            // AFTER a successful store deleted the thumb the just-persisted payload still points at,
+            // with the baseline already advanced — a durable card pointing at a missing file, no
+            // retry). Rethrows nothing either way: the outer `finally` below still recycles `bitmap`.
+            val id = try {
                 // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the
                 // new point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
                 // documents on storeMoment(). The gate embedding above IS the stored vector: it is
                 // never re-embedded here or anywhere else on this path.
-                val id = store.storeMoment(vec, MomentPayload(
+                store.storeMoment(vec, MomentPayload(
                     type = "frame",
                     momentId = "",
                     episodeId = episodeId,
@@ -414,31 +423,41 @@ class MomentCapture(
                     verifyCos = 0f,
                     text = "",
                 ))
-                val storeMs = System.currentTimeMillis() - storeT0
+            } catch (e: Throwable) {
+                // Nothing persisted — thumbFile is a genuine orphan. lastStoredGrid/Vec/Ms are
+                // untouched, so the next gate fire retries cleanly against the same last-known-good
+                // keyframe instead of a phantom one.
+                Log.w(TAG, "moment store failed, will retry on the next gate fire: ${e.message}")
+                if (thumbOk) thumbFile.delete()
+                return
+            }
+            val storeMs = System.currentTimeMillis() - storeT0
 
-                // Advance the baseline ONLY on a successful store — a failed embed/store above already
-                // returned early, leaving lastStoredGrid/lastStoredVec/lastStoreMs untouched so the
-                // NEXT gate fire retries against the same last-known-good keyframe, not a phantom one.
-                lastStoredGrid = grid
-                lastStoredVec = vec
-                lastStoreMs = ts
+            // Advance the baseline ONLY on a successful store — a failed embed/store above already
+            // returned early, leaving lastStoredGrid/lastStoredVec/lastStoreMs untouched so the
+            // NEXT gate fire retries against the same last-known-good keyframe, not a phantom one.
+            lastStoredGrid = grid
+            lastStoredVec = vec
+            lastStoreMs = ts
 
-                val count = store.count()
-                Log.i(TAG, "moment stored: id=$id decision=$decision cos=%.3f (embed=${embedMs}ms store=${storeMs}ms) total=$count"
-                    .format(cos))
+            // storeMoment succeeded: id/thumbPath are now durable. A count() or onMoment (Task 1.6's
+            // HUD forward) failure past this point is logged and swallowed, never rethrown and never
+            // a reason to touch thumbFile — the persisted payload already references it.
+            val count = try {
+                store.count()
+            } catch (e: Throwable) {
+                Log.w(TAG, "moment stored (id=$id) but count() failed: ${e.message}")
+                null
+            }
+            Log.i(TAG, "moment stored: id=$id decision=$decision cos=%.3f (embed=${embedMs}ms store=${storeMs}ms) total=${count ?: "?"}"
+                .format(cos))
+            try {
                 onMoment?.invoke(MomentHit(
                     id = id, score = 0f, type = "frame", momentId = id, timestampMs = ts,
                     thumbPath = if (thumbOk) thumbFile.absolutePath else "", label = "", bbox = "",
                 ))
             } catch (e: Throwable) {
-                // storeMoment (native shard/flush) or onMoment (Task 1.6's HUD forward) can throw.
-                // Left unguarded this escaped scope.launch(embedLane) UNCAUGHT (mirrors the crop-embed
-                // catch in PerceptionPipeline's onFrame) and orphaned the thumb just written above.
-                // Log + delete the orphan and DO NOT rethrow: lastStoredGrid/Vec/Ms are untouched
-                // (the advance above never ran), so the next gate fire retries cleanly against the
-                // same last-known-good keyframe instead of a phantom one.
-                Log.w(TAG, "moment store failed, will retry on the next gate fire: ${e.message}")
-                if (thumbOk) thumbFile.delete()
+                Log.w(TAG, "moment stored (id=$id) but onMoment callback failed: ${e.message}")
             }
         } finally {
             bitmap.recycle()
