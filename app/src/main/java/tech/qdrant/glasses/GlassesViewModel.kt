@@ -39,6 +39,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     @OptIn(ExperimentalCoroutinesApi::class)
     private val inferLane = Dispatchers.Default.limitedParallelism(1)
 
+    // Every vision-encoder call (crop dedup embeds in PerceptionPipeline AND, opt-in, the moment
+    // confirm embeds in MomentCapture — Task 1.5, Spec §8.2) serializes on this ONE single-thread
+    // lane: OrtSession.run's concurrency under the QNN EP isn't verified safe. Owned here (not by
+    // PerceptionPipeline, which used to construct its own private `cropLane`) so GlassesComponents
+    // can hand the SAME instance to MomentCapture too.
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val embedLane = Dispatchers.IO.limitedParallelism(1)
+
     // ---- Object mode -------------------------------------------------------------------
     private val appMode = AppMode.OBJECTS   // flip to LEGACY for the old whole-frame path
 
@@ -88,7 +96,11 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 // Loading order (store → LEGACY encoders → bge → OBJECTS detector/tracker/crop/
                 // objectStore/retriever → LEGACY ASR pre-warm) and per-mode nullability live in
                 // GlassesComponents.load; it THROWS on failure (caught below, same as before).
-                val c = GlassesComponents.load(app, appMode)
+                val c = GlassesComponents.load(
+                    app, appMode,
+                    scope = viewModelScope, embedLane = embedLane,
+                    isRecording = { session.isRecording },
+                )
                 components = c
                 if (appMode == AppMode.OBJECTS) {
                     perception = PerceptionPipeline(
@@ -97,6 +109,8 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         isRecording = { session.isRecording },
                         onMemoryIndexed = { session.onMemoryIndexed() },
                         objectThumbsDir = objectsDir,
+                        embedLane = embedLane,
+                        momentCapture = c.momentCapture,
                     )
                     searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
                     // The store is async (~10s); a HUD usually connected before now and got an

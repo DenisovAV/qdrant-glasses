@@ -39,6 +39,17 @@ object Config {
     val HUD_STREAM: Boolean = sysprop("qdrant.hud") == "1"
 
     /**
+     * Whether to run the opt-in whole-frame keyframe memory path (episodic-memory plan Stage 1,
+     * `PerceptionPipeline`'s [tech.qdrant.glasses.pipeline.MomentCapture] branch) ALONGSIDE the
+     * existing crop-store path, so the two can be A/B'd on one walk-through without disturbing
+     * the default demo. **OPT-IN — off by default.** The crop-store path stays the default until
+     * Stage 2 retires it.
+     *
+     *   adb shell setprop debug.qdrant.memory 1     → enable MomentCapture
+     */
+    val MOMENT_MEMORY: Boolean = sysprop("qdrant.memory") == "1"
+
+    /**
      * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).
      * persist.* matters because a glasses reboot silently reverted the app to compiled-in defaults
      * mid-rehearsal — twice. Read once at startup; an app restart applies a change.

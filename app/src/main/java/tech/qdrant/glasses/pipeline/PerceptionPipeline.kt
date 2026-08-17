@@ -28,9 +28,20 @@ import java.io.FileOutputStream
  *    NOT inferLane. The caller retains + recycles `bitmap`; this class snapshots it synchronously
  *    and never touches it after [onFrame] returns.
  *  - [tracker] is NOT thread-safe: update/confirmedUnembedded/markEmbedded/unmarkEmbedded all run
- *    on [inferLane] (its only legal lane). The crop embed (a network call) runs on a SEPARATE
- *    [cropLane] so it can't block detection; on success it marshals the counter bump / on failure
- *    the unmark BACK to [inferLane].
+ *    on [inferLane] (its only legal lane). The crop embed runs on a SEPARATE [embedLane] so it
+ *    can't block detection; on success it marshals the counter bump / on failure the unmark BACK
+ *    to [inferLane]. [embedLane] is INJECTED, not owned here (Task 1.5, Spec §8.2) — it is the
+ *    SAME single-thread dispatcher [tech.qdrant.glasses.pipeline.MomentCapture] confirms its
+ *    keyframes on, so every `OrtSession.run` call from either path (crop dedup embeds, moment
+ *    confirms) serializes on one lane — the QNN EP's concurrency isn't verified safe.
+ *  - [onFrame] additionally hands `bitmap` to [momentCapture] as a THIRD, independent branch
+ *    (Task 1.5, opt-in via `debug.qdrant.memory` — [tech.qdrant.glasses.Config.MOMENT_MEMORY]):
+ *    scene-change-gated keyframe capture, running only when the sysprop is on ([momentCapture]
+ *    is null otherwise, making the call a no-op). It shares no gate/copy with the stream/detect
+ *    branches below — [tech.qdrant.glasses.pipeline.MomentCapture.onFrame] owns its OWN
+ *    check-before-copy + backpressure gate and never touches `bitmap` after it returns (see its
+ *    KDoc), so no extra copy is needed at this layer; it runs unconditionally, BEFORE the detect
+ *    lane's busy-gate `return`, so a busy detect lane never silently skips a moment evaluation.
  *  - EVERY launch/withContext uses the injected [scope] (= viewModelScope) so the VM's onCleared
  *    drain joins in-flight work before the FFI/interpreter is closed.
  */
@@ -45,6 +56,12 @@ class PerceptionPipeline(
     private val isRecording: () -> Boolean,
     private val onMemoryIndexed: () -> Unit,
     private val objectThumbsDir: File,
+    // Shared with MomentCapture (Task 1.5) — see class KDoc "Threading" — injected rather than
+    // self-constructed so both paths land on the exact same dispatcher instance.
+    private val embedLane: CoroutineDispatcher,
+    // The opt-in whole-frame keyframe path (Task 1.5, Config.MOMENT_MEMORY). Null when the
+    // sysprop is off — the crop-store path above is untouched either way.
+    private val momentCapture: MomentCapture?,
 ) {
     companion object {
         private const val TAG = "GlassesVM"
@@ -73,11 +90,6 @@ class PerceptionPipeline(
         private const val THUMB_PADDING = 1.20f
     }
 
-    // Crop embedding is a network call (Mac endpoint). It runs on its OWN single-thread lane
-    // so a slow embed never blocks detection on inferLane. markEmbedded is marshalled BACK to
-    // inferLane (the tracker's only legal thread) after a successful embed+upsert.
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val cropLane = Dispatchers.IO.limitedParallelism(1)
     // Stream lane: JPEG-compress + offerFrame ONLY, decoupled from detection so the video stream
     // runs at its own (fast) rate instead of being serialized behind the ~110ms detect pipeline on
     // inferLane. CPU-bound (Default, not IO), single-thread to keep MJPEG frames in order.
@@ -100,10 +112,10 @@ class PerceptionPipeline(
      *
      * Called from the camera analyzer thread (FrameCaptureManager's single-thread executor),
      * NOT inferLane. ObjectTracker is NOT thread-safe, so the whole detect/track/confirm body
-     * is dispatched onto inferLane (the tracker's only legal thread). The crop embed (a network
-     * call to the Mac endpoint) runs on a SEPARATE cropLane so it can't block detection; on
-     * success it marshals markEmbedded BACK to inferLane — the dedup flag is part of tracker
-     * state and may only be mutated there.
+     * is dispatched onto inferLane (the tracker's only legal thread). The crop embed runs on a
+     * SEPARATE embedLane (shared with MomentCapture's confirm embeds, Task 1.5 — class KDoc) so
+     * it can't block detection; on success it marshals markEmbedded BACK to inferLane — the
+     * dedup flag is part of tracker state and may only be mutated there.
      */
     fun onFrame(bitmap: Bitmap) {
         if (!isRecording()) return
@@ -157,6 +169,19 @@ class PerceptionPipeline(
             streamCopy?.recycle()   // lane busy → drop this frame's copy (null = no HUD, none taken)
         }
 
+        // MOMENT LANE (Task 1.5, opt-in — Config.MOMENT_MEMORY / debug.qdrant.memory): purely
+        // additive scene-change-gated keyframe capture, running in PARALLEL with the crop-store
+        // path above and below, not replacing it this stage. Deliberately BEFORE the detect
+        // lane's busy-gate `return` right below — that gate governs only the detect/crop-embed
+        // branch, and a busy detect lane must never silently skip a moment evaluation.
+        // `momentCapture` is null when the sysprop is off, making this a single null-check per
+        // frame. When non-null, `bitmap` (the untouched original — streamCopy/frame above are
+        // independent COPIES of it) is handed straight to MomentCapture.onFrame: that call owns
+        // its own check-before-copy + backpressure gate and never touches `bitmap` after it
+        // returns (see its KDoc), so no extra copy/gate belongs at this layer, and the caller
+        // (GlassesViewModel.onFrame) only recycles `bitmap` once this whole method returns.
+        momentCapture?.onFrame(bitmap)
+
         // DETECT LANE: full detect → track → publish boxes → embed, at its own (slower) rate.
         // Backpressure (same as stream): if detection is still busy, drop this frame so the tracker
         // always sees the freshest frame and no backlog builds up behind a slow detect.
@@ -176,7 +201,8 @@ class PerceptionPipeline(
                 latestDetections = detections   // publish for the stream lane (volatile write)
                 Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
-                // Embed newly-confirmed objects on cropLane (network — must not block detection).
+                // Embed newly-confirmed objects on embedLane — shared with MomentCapture's confirm
+                //    embeds (Task 1.5, class KDoc) — so it can't block detection either way.
                 //    confirmedUnembedded() reads tracker state, so it stays on inferLane here.
                 //    cropFrom() returns pixels it OWNS — never an alias of `frame` (it forces a copy
                 //    when Bitmap.createBitmap hands the source back; see cropFrom). That ownership
@@ -185,7 +211,7 @@ class PerceptionPipeline(
                     val crop = cropFrom(frame, track.bbox) ?: continue
                     // Separate, wider crop for the visible thumbnail (see THUMB_PADDING), also ours.
                     val thumbCrop = cropFrom(frame, track.bbox, THUMB_PADDING) ?: crop
-                    // Thumb is written LATER (in cropLane, only if this isn't a semantic duplicate),
+                    // Thumb is written LATER (on embedLane, only if this isn't a semantic duplicate),
                     // so a deduped object never leaves a stray JPEG on disk.
                     val thumbFile = File(objectThumbsDir, "obj_${track.trackId}_${System.currentTimeMillis()}.jpg")
                     val bboxStr = "%.3f,%.3f,%.3f,%.3f".format(
@@ -195,10 +221,10 @@ class PerceptionPipeline(
                     // Mark embedded NOW (we're on inferLane). The embed is async (~hundreds of ms);
                     // if we waited to mark until it returned, confirmedUnembedded() would re-emit this
                     // same track on every frame in the meantime and launch a duplicate embed per frame
-                    // (~10 dupes per object). Mark up-front to claim it; the cropLane coroutine rolls it
+                    // (~10 dupes per object). Mark up-front to claim it; the embedLane coroutine rolls it
                     // back via unmarkEmbedded on failure so a failed embed is retried on a later sighting.
                     tracker.markEmbedded(tid)
-                    scope.launch(cropLane) {
+                    scope.launch(embedLane) {
                         val embedT0 = System.currentTimeMillis()
                         try {
                             val vec = cropEncoder.encode(crop)
@@ -298,7 +324,7 @@ class PerceptionPipeline(
                 // source"). That happens routinely here: THUMB_PADDING grows a box by 120% of its
                 // own size PER SIDE, so anything larger than ~30% of the frame clamps to the full
                 // frame. The caller then recycles `frame` as soon as the loop ends — while the
-                // cropLane coroutine is still running — and the crop dies with it:
+                // embedLane coroutine is still running — and the crop dies with it:
                 //     thumb write failed for laptop (track 49): Can't compress a recycled bitmap
                 // i.e. it silently broke thumbnails for exactly the biggest, most prominent objects.
                 // Force a copy so a crop NEVER aliases the frame, and every crop is ours to recycle.

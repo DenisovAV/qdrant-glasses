@@ -2,6 +2,8 @@ package tech.qdrant.glasses
 
 import android.app.Application
 import android.util.Log
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import tech.qdrant.glasses.detect.DetectorFactory
 import tech.qdrant.glasses.detect.ObjectDetector
 import tech.qdrant.glasses.detect.ObjectTracker
@@ -11,12 +13,16 @@ import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.EncoderFactory
 import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
+import tech.qdrant.glasses.pipeline.MomentCapture
 import tech.qdrant.glasses.search.MomentRetriever
 import tech.qdrant.glasses.search.SherpaVadAsr
 import tech.qdrant.glasses.storage.DbBenchRunner
+import tech.qdrant.glasses.storage.MomentStore
+import tech.qdrant.glasses.storage.QdrantEdgeMomentStore
 import tech.qdrant.glasses.storage.VectorStore
 import tech.qdrant.glasses.storage.VectorStoreFactory
 import tech.qdrant.glasses.storage.VisionMemoryStore
+import java.io.File
 
 /**
  * Bundles every model/store/detector GlassesViewModel depends on, plus their boot sequence
@@ -37,13 +43,33 @@ class GlassesComponents(
     val cropEncoder: CropEncoder?,
     val objectStore: VectorStore?,
     val retriever: MomentRetriever?,
+    // Opt-in whole-frame keyframe memory (Task 1.5, Config.MOMENT_MEMORY). Both null unless the
+    // sysprop is on AND mode == OBJECTS — "nullable by mode/opt-in, never by timing", same rule
+    // as objectStore/retriever above.
+    val momentStore: MomentStore?,
+    val momentCapture: MomentCapture?,
 ) : AutoCloseable {
 
     companion object {
         private const val TAG = "GlassesComponents"
 
-        /** Runs on: IO (called from GlassesViewModel's init, inside viewModelScope.launch(Dispatchers.IO)). */
-        fun load(app: Application, mode: AppMode): GlassesComponents {
+        /**
+         * Runs on: IO (called from GlassesViewModel's init, inside viewModelScope.launch(Dispatchers.IO)).
+         *
+         * [scope]/[embedLane]/[isRecording] are needed ONLY to build [MomentCapture] (Task 1.5) —
+         * it is constructed here, alongside its [QdrantEdgeMomentStore], so the OBJECTS branch
+         * owns the whole opt-in moment path in one place, the same way it already owns
+         * objectStore/retriever. [embedLane] must be the SAME dispatcher instance the caller later
+         * hands to [tech.qdrant.glasses.pipeline.PerceptionPipeline] (Spec §8.2 — one lane for
+         * every `OrtSession.run` call, crop or moment).
+         */
+        fun load(
+            app: Application,
+            mode: AppMode,
+            scope: CoroutineScope,
+            embedLane: CoroutineDispatcher,
+            isRecording: () -> Boolean,
+        ): GlassesComponents {
             Log.d(TAG, "load: opening VisionMemoryStore")
             val store = VisionMemoryStore(app)
             Log.d(TAG, "load: VisionMemoryStore OK, stored frames=${store.count()}")
@@ -76,6 +102,8 @@ class GlassesComponents(
             var cropEncoder: CropEncoder? = null
             var objectStore: VectorStore? = null
             var retriever: MomentRetriever? = null
+            var momentStore: MomentStore? = null
+            var momentCapture: MomentCapture? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 tracker = ObjectTracker(confirmSightings = 3)
@@ -92,6 +120,31 @@ class GlassesComponents(
                 // TinyCLIP have different cosine scales, so an absent query returns nothing).
                 retriever = MomentRetriever(store, visionMinScore = cropEncoder.visionMinScore)
                 Log.i(TAG, "object mode ready (store=${objectStore.name}, backend=${CropEncoderFactory.backend}, dim=${cropEncoder.dim}), objects=${objectStore.count()}")
+                if (Config.MOMENT_MEMORY) {
+                    // Opt-in whole-frame keyframe path (Task 1.5, episodic-memory plan Stage 1),
+                    // running IN PARALLEL with the crop-store path above so the two can be A/B'd
+                    // on one walk-through (Config.MOMENT_MEMORY / debug.qdrant.memory). Namespace
+                    // matches the crop encoder, same convention objectStore uses, so switching
+                    // CropEncoderFactory.backend still needs no manual data wipe.
+                    val thumbsDir = File(app.filesDir, "moment_thumbs").also { it.mkdirs() }
+                    val ms = QdrantEdgeMomentStore(app, namespace = CropEncoderFactory.namespace)
+                    momentStore = ms
+                    momentCapture = MomentCapture(
+                        scope = scope,
+                        embedLane = embedLane,
+                        cropEncoder = cropEncoder,
+                        store = ms,
+                        momentThumbsDir = thumbsDir,
+                        isRecording = isRecording,
+                    ).also { mc ->
+                        // Task 1.6 forwards this to the HUD timeline event; for now just prove
+                        // the capture path actually fires (Task 1.5 scope ends here).
+                        mc.onMoment = { hit ->
+                            Log.i(TAG, "moment: id=${hit.id} ts=${hit.timestampMs} thumb=${hit.thumbPath}")
+                        }
+                    }
+                    Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")
+                }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
                 // compiles into both flavors, so the actual sysprop-check + launch is indirected
                 // through a flavor seam: a no-op in the demo flavor, the real thing in benchmark
@@ -121,6 +174,8 @@ class GlassesComponents(
                 cropEncoder = cropEncoder,
                 objectStore = objectStore,
                 retriever = retriever,
+                momentStore = momentStore,
+                momentCapture = momentCapture,
             )
         }
     }
@@ -138,5 +193,6 @@ class GlassesComponents(
         detector?.close()
         cropEncoder?.close()
         objectStore?.close()
+        momentStore?.close()
     }
 }
