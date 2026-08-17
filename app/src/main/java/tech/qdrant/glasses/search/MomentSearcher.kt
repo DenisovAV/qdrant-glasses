@@ -9,12 +9,16 @@ import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
 
 /**
- * Moment-mode voice search (episodic-memory plan Task 1.6, Spec §3): normalize the query (same
- * [QueryText] helpers [searchPhrase]/[stripTimePhrases]/[extractTimeWindow]/[isRecallLocationIntent]
- * Task 0.1 already put on [ObjectSearcher]) → text-embed → whole-frame vector search over
- * [MomentStore.searchFrames] → per-channel score gate → HUD push → map to [MomentCard]s. This is
- * the YOLO-independent "real memory" recall path (Spec §2/§3) — Stage 1 only searches the `frame`
- * channel; region-channel fusion + tag boost land in Stage 2 (Task 2.3).
+ * Moment-mode voice search (episodic-memory plan Task 1.6 + Task 2.3, Spec §3): normalize the query
+ * (same [QueryText] helpers [searchPhrase]/[stripTimePhrases]/[extractTimeWindow]/[isRecallLocationIntent]
+ * Task 0.1 already put on [ObjectSearcher]) → text-embed → vector search over BOTH
+ * [MomentStore.searchFrames] and [MomentStore.searchRegions] → [fuseAndCollapse] to one hit per
+ * moment → [softBoost] a verified-tag match → per-channel score gate → HUD push → map to
+ * [MomentCard]s. This is the YOLO-independent "real memory" recall path (Spec §2/§3): the frame
+ * channel alone is Stage 1's whole-frame backbone; the region channel (Task 2.3) adds small-object
+ * recall on top WITHOUT YOLO ever gating — a region only ever raises a moment's score or attaches a
+ * display tag, never filters one out (a moment absent from both channels' hit lists just isn't a
+ * candidate at all, same as before).
  *
  * Deliberately reuses [ObjectSearcher.Outcome] rather than defining its own sealed type: the two
  * searchers are mutually exclusive per [tech.qdrant.glasses.Config.MOMENT_MEMORY] (never both
@@ -65,11 +69,22 @@ class MomentSearcher(
         }
         val encMs = System.currentTimeMillis() - t0
         val searchT0 = System.currentTimeMillis()
-        // Recall-intent queries need a wider pool than a display top-5 — see RECALL_FETCH_K.
+        // Recall-intent queries need a wider pool than a display top-5 — see RECALL_FETCH_K. Both
+        // channels share the same qvec/window/fetchK — a region is only ever a small-object find on
+        // the SAME query embedding, never a separately-tuned search.
         val fetchK = if (isRecallLocationIntent(query)) RECALL_FETCH_K else 5
-        val allHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
-        // Frame points carry no label in Stage 1 (regions/tags are Stage 2), so there is no
-        // label-match fallback here the way ObjectSearcher has one — cosine gate only.
+        val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
+        val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
+        // Task 2.3 (Spec §3): collapse the two channels to one hit per moment (client-side max —
+        // frame and region vectors share the same CLIP space), then a bounded soft nudge for a
+        // query-token match against a VERIFIED region label. Neither step can introduce a moment
+        // that wasn't already a hit on one of the two channels — YOLO tags never gate (Spec §3).
+        val fused = fuseAndCollapse(frameHits, regionHits)
+        val allHits = softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
+            .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
+        // Region points carry the only labels this channel has (frame points are unlabeled — Stage
+        // 1), so there is no label-match fallback here the way ObjectSearcher has one — cosine gate
+        // only (a verified-region label match already contributed via softBoost above, not here).
         val hits = allHits.filter { it.score >= MOMENT_SEARCH_GATE }
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +

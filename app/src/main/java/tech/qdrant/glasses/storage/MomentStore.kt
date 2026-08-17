@@ -4,8 +4,13 @@ import org.json.JSONObject
 
 /**
  * One vector search hit against a moment collection (a frame OR a region point — see [MomentPayload.type]).
- * Mirrors [ObjectHit]'s shape, plus the two fields the moment model adds: [type] (channel) and
- * [momentId] (the parent frame a region belongs to; a frame hit's own id).
+ * Mirrors [ObjectHit]'s shape, plus the fields the moment model adds: [type] (channel) and
+ * [momentId] (the parent frame a region belongs to; a frame hit's own id), and (Task 2.3, Spec §3)
+ * [yoloConf]/[verifyCos] — the region's detector confidence and CLIP label-verification cosine,
+ * needed by [tech.qdrant.glasses.search.softBoost]'s `λ·yolo_conf·verify_cos` re-rank. Both default
+ * to `0f`: a FRAME hit never carries them (a frame's own [MomentPayload.yoloConf]/[MomentPayload.verifyCos]
+ * are stamped 0 at capture — see [tech.qdrant.glasses.pipeline.MomentCapture.confirmAndStore]), and
+ * the default keeps every pre-Task-2.3 named-arg [MomentHit] construction site compiling unchanged.
  */
 data class MomentHit(
     val id: String,
@@ -16,6 +21,8 @@ data class MomentHit(
     val thumbPath: String,
     val label: String,
     val bbox: String,
+    val yoloConf: Float = 0f,
+    val verifyCos: Float = 0f,
 )
 
 /**

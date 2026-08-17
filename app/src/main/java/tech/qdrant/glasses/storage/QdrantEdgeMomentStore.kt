@@ -273,6 +273,12 @@ class QdrantEdgeMomentStore(
             thumbPath = p.thumbPath,
             label = p.label,
             bbox = p.bbox,
+            // Task 2.3 (Spec §3): region-only fields, needed for the soft tag boost. A frame point's
+            // payload already stamps both 0f at capture time (MomentCapture.confirmAndStore), so this
+            // mapping is unconditional — no `if (p.type == TYPE_REGION)` needed to get "frame hits get
+            // 0f", same as [label]/[bbox] above are already mapped straight through regardless of type.
+            yoloConf = p.yoloConf,
+            verifyCos = p.verifyCos,
         )
     }
 }
