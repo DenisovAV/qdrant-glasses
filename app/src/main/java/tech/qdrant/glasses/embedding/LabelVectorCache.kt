@@ -46,18 +46,21 @@ class LabelVectorCache(
         persistFile?.let { loadPersisted(it) }
     }
 
-    /** The cached (or freshly-embedded-then-cached) text vector for [label]. */
+    /** The cached (or freshly-embedded-then-cached) text vector for [label]. Returns a defensive
+     *  copy (whole-branch review fix) — both the hit and the miss path used to hand out the live
+     *  [FloatArray] held in [cache] itself; a caller mutating what it got back would silently
+     *  corrupt every future lookup of that label for the rest of this cache's lifetime. */
     fun get(label: String): FloatArray {
         val key = normalize(label)
         synchronized(lock) {
-            cache[key]?.let { return it }
+            cache[key]?.let { return it.copyOf() }
             val t0 = System.currentTimeMillis()
             val vec = encodeText(key)
             Log.i(TAG, "encodeText label=\"$key\" ${System.currentTimeMillis() - t0}ms " +
                 "(cache miss, ${cache.size + 1} labels cached)")
             cache[key] = vec
             persistFile?.let { appendPersisted(it, key, vec) }
-            return vec
+            return vec.copyOf()
         }
     }
 
@@ -65,7 +68,9 @@ class LabelVectorCache(
      *  CLIP-verify signal region tagging is built on (Spec §2, plan Task 2.2). 0f if either vector
      *  is degenerate (all-zero) rather than dividing by zero, or if the two vectors' lengths don't
      *  match (Codex P1 fix — see [cosine]) — "not verified" is a safer failure than a crash or a
-     *  NaN silently poisoning the comparison. */
+     *  NaN silently poisoning the comparison. Goes through [get] (defensive copy and all) rather
+     *  than reading [cache] directly — the copy is one small FloatArray per region-verify call, cheap
+     *  next to the cosine loop it feeds and not worth a second code path just to avoid it. */
     fun verify(regionVec: FloatArray, label: String): Float = cosine(regionVec, get(label))
 
     private fun normalize(label: String): String = label.trim().lowercase()
