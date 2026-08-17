@@ -16,6 +16,10 @@ class QueryTextTest {
         assertEquals("keys", searchPhrase("find the keys"))
         assertEquals("phone", searchPhrase("show me a phone"))
     }
+    @Test fun stripsRecallBoilerplate() {
+        assertEquals("wallet", searchPhrase("where did i leave my wallet"))
+        assertEquals("keys", searchPhrase("where did i put the keys"))
+    }
     @Test fun stripsLeadingArticleOnly() {
         assertEquals("cup", searchPhrase("the cup"))
     }

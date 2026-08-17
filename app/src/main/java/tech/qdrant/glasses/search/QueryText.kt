@@ -1,11 +1,12 @@
 package tech.qdrant.glasses.search
 
-/** "where is my laptop" → "laptop". SigLIP2's text→crop scale is compressed, so question
- *  boilerplate ("where is …") dips a real match under the gate — search the object phrase,
- *  display the full query. Falls back to the original query if stripping leaves nothing. */
+/** "where is my laptop" → "laptop", "where did i leave my wallet" → "wallet". SigLIP2's
+ *  text→crop scale is compressed, so question boilerplate ("where is …", "where did i leave …")
+ *  dips a real match under the gate — search the object phrase, display the full query.
+ *  Falls back to the original query if stripping leaves nothing. */
 fun searchPhrase(rawQuery: String): String =
     rawQuery.lowercase()
-        .replace(Regex("^(where\\s+(is|are)|what\\s+(is|are)|when\\s+(is|are)|that\\s+is|this\\s+is|find|show\\s+me|look\\s+for|search\\s+for)\\s+"), "")
+        .replace(Regex("^(where\\s+did\\s+i\\s+(leave|put|last\\s+see|drop)|where\\s+(is|are)|what\\s+(is|are)|when\\s+(is|are)|that\\s+is|this\\s+is|find|show\\s+me|look\\s+for|search\\s+for)\\s+"), "")
         .replace(Regex("^(my|the|a|an)\\s+"), "")
         .trim().ifBlank { rawQuery }
 
