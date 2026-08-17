@@ -142,8 +142,12 @@ class MomentCapture(
     // GlassesViewModel constructs PerceptionPipeline with `c.momentCapture` as one of ITS OWN
     // constructor args, so the two classes have a genuine circular dependency at wiring time. The
     // real provider ({ perception.latestConfirmedRegions }) is wired by GlassesViewModel right
-    // after PerceptionPipeline is constructed — see its init block.
-    var regionsProvider: () -> List<RegionCandidate> = { emptyList() },
+    // after PerceptionPipeline is constructed — see its init block. @Volatile (Codex P2 fix): a
+    // plain var write has no happens-before with [embedLane]'s read of this field, so a camera
+    // frame dispatched right after the assignment could still observe the default empty provider.
+    // GlassesViewModel also orders that assignment BEFORE `perception` itself is published, so the
+    // camera path can't even start moment capture until the real provider is already visible here.
+    @Volatile var regionsProvider: () -> List<RegionCandidate> = { emptyList() },
 ) {
     companion object {
         private const val TAG = "MomentCapture"

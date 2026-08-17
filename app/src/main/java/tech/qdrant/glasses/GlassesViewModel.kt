@@ -110,7 +110,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 components = c
                 if (appMode == AppMode.OBJECTS) {
-                    perception = PerceptionPipeline(
+                    // Built into a LOCAL first, not straight into the `perception` field (Codex P2
+                    // fix): the camera path only ever reads the @Volatile `perception` field below,
+                    // so as long as regionsProvider is wired from this local BEFORE that field is
+                    // published, a frame delivered the instant `perception` goes non-null can never
+                    // observe MomentCapture's default empty provider.
+                    val localPerception = PerceptionPipeline(
                         viewModelScope, inferLane, c.detector!!, c.tracker!!, c.cropEncoder!!,
                         c.objectStore!!, hud,
                         isRecording = { session.isRecording },
@@ -121,12 +126,14 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     )
                     // Task 2.2: wire MomentCapture's region source to PerceptionPipeline's confirmed-
                     // tracks snapshot ONLY NOW — not inside GlassesComponents.load(), where
-                    // momentCapture is actually constructed — because `perception` doesn't exist
-                    // until this line: PerceptionPipeline's OWN constructor above needs
-                    // `c.momentCapture` as an argument, so the two have a genuine circular
-                    // dependency at wiring time (see MomentCapture.regionsProvider's KDoc). No-op
-                    // when the sysprop is off / momentCapture is null.
-                    c.momentCapture?.regionsProvider = { perception?.latestConfirmedRegions ?: emptyList() }
+                    // momentCapture is actually constructed — because PerceptionPipeline doesn't
+                    // exist until the line above: its OWN constructor needs `c.momentCapture` as an
+                    // argument, so the two have a genuine circular dependency at wiring time (see
+                    // MomentCapture.regionsProvider's KDoc). No-op when the sysprop is off /
+                    // momentCapture is null. Closes over `localPerception` (not the field) and runs
+                    // BEFORE `perception = localPerception` below, on purpose.
+                    c.momentCapture?.regionsProvider = { localPerception.latestConfirmedRegions }
+                    perception = localPerception
                     searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
                     if (Config.MOMENT_MEMORY) {
                         momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)
