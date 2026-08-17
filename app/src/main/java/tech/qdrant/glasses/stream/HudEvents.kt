@@ -47,4 +47,15 @@ object HudEvents {
         for (r in items) arr.put(JSONObject().put("id", r.thumbKey).put("label", r.label).put("score", r.score.toDouble()))
         return JSONObject().put("t", "results").put("items", arr).toString()
     }
+
+    /** One stored keyframe dropping onto the HUD's live timeline (episodic-memory plan Task 1.6,
+     *  Spec §5). [key] is the thumb file's `nameWithoutExtension` (same `/thumb/<key>` convention
+     *  as [storedEvent]'s `id`). [tags] is the verified-region label layer — always empty in Stage 1
+     *  (regions are Stage 2) and omitted from the JSON entirely when empty, same null-omit
+     *  convention [modeEvent] uses for its optional `query`. */
+    fun momentEvent(key: String, tsMs: Long, count: Long, tags: List<String> = emptyList()): String {
+        val o = JSONObject().put("t", "moment").put("id", key).put("ts", tsMs).put("count", count)
+        if (tags.isNotEmpty()) o.put("tags", JSONArray(tags))
+        return o.toString()
+    }
 }
