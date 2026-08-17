@@ -149,9 +149,22 @@ class GlassesComponents(
                         isRecording = isRecording,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
-                        // thumb for /thumb/<key> BEFORE pushing the event, same ordering
-                        // PerceptionPipeline uses for the object rail (a client that receives the
-                        // event before the thumb is registered would 404 on the very first fetch).
+                        // thumb for /thumb/<key> BEFORE pushing the event, same call ORDER
+                        // PerceptionPipeline uses for the object rail (its ~line 287-288). On the
+                        // WIRED path (MjpegServer) that order is a real guarantee: registerThumb()
+                        // there is a synchronous in-memory map write, so it's always visible before
+                        // the event pushed right after it. On the WIRELESS path (MjpegPusher) it is
+                        // NOT — Codex review (P2, deferred): registerThumb/pushEvent are independent
+                        // fire-and-forget async OkHttp POSTs there (push_thumb / push_event) with no
+                        // completion ordering between them, and neither HudPublisher nor MjpegPusher
+                        // exposes a hook to make one wait on the other. Calling registerThumb first
+                        // only narrows the race, it doesn't close it: a client can still see the
+                        // `moment` event before the relay has the thumb and 404 once on
+                        // /thumb/<key>. PerceptionPipeline's object path has the SAME best-effort
+                        // ordering for the SAME reason, so this matches rather than fixes it — a
+                        // raced 404 just leaves one HUD thumbnail blank, the same non-fatal class of
+                        // failure MjpegPusher.registerThumb's own KDoc already accepts for a lost
+                        // thumb, never a reason to add a blocking wait onto embedLane here.
                         mc.onMoment = { hit ->
                             val key = File(hit.thumbPath).nameWithoutExtension
                             hud.registerThumb(key, hit.thumbPath)
