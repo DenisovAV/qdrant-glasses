@@ -22,6 +22,8 @@ import tech.qdrant.glasses.storage.QdrantEdgeMomentStore
 import tech.qdrant.glasses.storage.VectorStore
 import tech.qdrant.glasses.storage.VectorStoreFactory
 import tech.qdrant.glasses.storage.VisionMemoryStore
+import tech.qdrant.glasses.stream.HudEvents
+import tech.qdrant.glasses.stream.HudPublisher
 import java.io.File
 
 /**
@@ -62,6 +64,11 @@ class GlassesComponents(
          * objectStore/retriever. [embedLane] must be the SAME dispatcher instance the caller later
          * hands to [tech.qdrant.glasses.pipeline.PerceptionPipeline] (Spec §8.2 — one lane for
          * every `OrtSession.run` call, crop or moment).
+         *
+         * [hud] is needed ONLY to forward [MomentCapture.onMoment] to the HUD timeline (Task 1.6) —
+         * same instance the VM constructs independently of [GlassesComponents] and later hands to
+         * `PerceptionPipeline`/`ObjectSearcher` directly (see the "fill any already-connected HUDs'
+         * rails" comment below for why `hud` itself isn't owned here).
          */
         fun load(
             app: Application,
@@ -69,6 +76,7 @@ class GlassesComponents(
             scope: CoroutineScope,
             embedLane: CoroutineDispatcher,
             isRecording: () -> Boolean,
+            hud: HudPublisher,
         ): GlassesComponents {
             Log.d(TAG, "load: opening VisionMemoryStore")
             val store = VisionMemoryStore(app)
@@ -140,10 +148,14 @@ class GlassesComponents(
                         momentThumbsDir = thumbsDir,
                         isRecording = isRecording,
                     ).also { mc ->
-                        // Task 1.6 forwards this to the HUD timeline event; for now just prove
-                        // the capture path actually fires (Task 1.5 scope ends here).
+                        // Task 1.6: forward each stored keyframe to the HUD timeline — register the
+                        // thumb for /thumb/<key> BEFORE pushing the event, same ordering
+                        // PerceptionPipeline uses for the object rail (a client that receives the
+                        // event before the thumb is registered would 404 on the very first fetch).
                         mc.onMoment = { hit ->
-                            Log.i(TAG, "moment: id=${hit.id} ts=${hit.timestampMs} thumb=${hit.thumbPath}")
+                            val key = File(hit.thumbPath).nameWithoutExtension
+                            hud.registerThumb(key, hit.thumbPath)
+                            hud.pushEvent(HudEvents.momentEvent(key, hit.timestampMs, ms.count()))
                         }
                     }
                     Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")

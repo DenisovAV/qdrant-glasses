@@ -17,6 +17,6 @@ class HudPublisher(private val railItems: () -> List<MjpegServer.RailItem>) {
     }
     fun offerFrame(jpeg: ByteArray) { sink?.offerFrame(jpeg) }              // Runs on: streamLane
     fun pushEvent(line: String) { sink?.pushEvent(line) }                  // Runs on: any thread
-    fun registerThumb(key: String, path: String) { sink?.registerThumb(key, path) }  // cropLane/inferLane
+    fun registerThumb(key: String, path: String) { sink?.registerThumb(key, path) }  // cropLane/inferLane/embedLane/IO
     fun broadcastRailSnapshot() { sink?.broadcastRailSnapshot() }          // Runs on: init (IO)
 }

@@ -89,6 +89,12 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
     // "nullable by mode, never by timing" lifecycle.
     @Volatile private var searcher: tech.qdrant.glasses.search.ObjectSearcher? = null
 
+    // Moment-mode voice search (Task 1.6, episodic-memory plan Stage 1) — routed to INSTEAD of
+    // `searcher` when Config.MOMENT_MEMORY is on (see onVoiceResult). Constructed only when both
+    // appMode == OBJECTS AND the sysprop is on, same "nullable by mode/opt-in" rule as
+    // `components.momentStore`/`momentCapture`.
+    @Volatile private var momentSearcher: tech.qdrant.glasses.search.MomentSearcher? = null
+
     init {
         Log.i(TAG, "init: starting model + store loading")
         viewModelScope.launch(Dispatchers.IO) {
@@ -100,6 +106,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     app, appMode,
                     scope = viewModelScope, embedLane = embedLane,
                     isRecording = { session.isRecording },
+                    hud = hud,
                 )
                 components = c
                 if (appMode == AppMode.OBJECTS) {
@@ -113,10 +120,29 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         momentCapture = c.momentCapture,
                     )
                     searcher = tech.qdrant.glasses.search.ObjectSearcher(c.cropEncoder!!, c.objectStore!!, hud)
+                    if (Config.MOMENT_MEMORY) {
+                        momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)
+                    }
                     // The store is async (~10s); a HUD usually connected before now and got an
                     // empty rail. Now that objects are loadable, fill any already-connected HUDs'
                     // rails.
                     hud.broadcastRailSnapshot()
+                    // Task 1.6: same backfill, for the moment timeline — momentStore is likewise
+                    // async-loaded, so a HUD that connected during that ~10s window got no moment
+                    // events either. MomentStore.timeline() is already oldest-first (its own
+                    // contract), so the rail fills in capture order, not reverse-chronological.
+                    // count is fetched once (not per item) — mirrors broadcastRailSnapshot()'s single
+                    // `items.size` above, not a native round trip per pushed event.
+                    if (Config.MOMENT_MEMORY) {
+                        val ms = c.momentStore
+                        val moments = ms?.timeline() ?: emptyList()
+                        val momentCount = ms?.count() ?: 0L
+                        for (m in moments) {
+                            val key = File(m.thumbPath).nameWithoutExtension
+                            hud.registerThumb(key, m.thumbPath)
+                            hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.momentEvent(key, m.timestampMs, momentCount))
+                        }
+                    }
                 }
                 if (appMode == AppMode.LEGACY) {
                     legacy = LegacyMomentPipeline(
@@ -215,8 +241,15 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
         hud.pushEvent(tech.qdrant.glasses.stream.HudEvents.modeEvent("search", query))
         viewModelScope.launch(inferLane) {
             if (appMode == AppMode.OBJECTS) {
-                when (val o = searcher!!.search(query)) {
-                    is tech.qdrant.glasses.search.ObjectSearcher.Outcome.Success -> session.setResults(query, o.cards)
+                // Task 1.6: route to the moment (whole-frame, YOLO-independent) search path when
+                // the sysprop is on, else the existing crop-based ObjectSearcher — same
+                // Config.MOMENT_MEMORY switch PerceptionPipeline/GlassesComponents already gate the
+                // capture side on. Both return ObjectSearcher.Outcome (see MomentSearcher's KDoc for
+                // why it reuses that type instead of its own), so the branches are structurally
+                // identical.
+                val outcome = if (Config.MOMENT_MEMORY) momentSearcher!!.search(query) else searcher!!.search(query)
+                when (outcome) {
+                    is tech.qdrant.glasses.search.ObjectSearcher.Outcome.Success -> session.setResults(query, outcome.cards)
                     tech.qdrant.glasses.search.ObjectSearcher.Outcome.Unavailable -> session.setIdle()
                 }
                 return@launch
