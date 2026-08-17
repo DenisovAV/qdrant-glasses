@@ -14,11 +14,14 @@ import org.junit.runner.RunWith
  * on-disk artifacts never collide. Every engine writes `db_bench_<name>.md` + `db_bench_<name>_<scale>.csv`
  * to filesDir; pull them and assemble the comparison table.
  *
- * Run on the glasses (or any arm64 device):
- *   ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
- *   adb install -r <app.apk> ; adb install -r <androidTest.apk>
+ * Run on the glasses (or any arm64 device) — this test only exists in the `benchmark` flavor
+ * (see `build.gradle.kts`'s `engines` dimension), so the task names carry that flavor:
+ *   ./gradlew :app:assembleBenchmarkDebug :app:assembleBenchmarkDebugAndroidTest
+ *   adb install -r <benchmarkDebug.apk> ; adb install -r <benchmarkDebugAndroidTest.apk>
  *   adb shell am instrument -w -e class tech.qdrant.glasses.storage.ComparisonBenchmarkTest \
  *     -e maxScale 100000 tech.qdrant.glasses.test/androidx.test.runner.AndroidJUnitRunner
+ * or, in one step (build + install + run):
+ *   ./gradlew :app:connectedBenchmarkDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.maxScale=100000
  *
  * `maxScale` (instrumentation arg, default 10000) caps the scale sweep (1k→1M) so a quick first pass
  * stays short and a full run is one flag away.
@@ -42,9 +45,9 @@ class ComparisonBenchmarkTest {
         // several-fold faster — NOT yet re-measured), so treat those figures as stale/an upper bound.
         // The 100k cap stays conservative until a re-measurement confirms 500k/1M are practical; until
         // then they show as skipped, same honest limit ObjectBox hits via DNF.
-        bench.benchmark("qdrant-hnsw", minOf(max, 100_000L), "cmpqh") { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
-        bench.benchmark("objectbox", max, "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
-        bench.benchmark("sqlite-vec", max, "cmpsv") { ns -> SqliteVecStore(ctx, dim, ns) }
+        val qdrantHnsw = bench.benchmark("qdrant-hnsw", minOf(max, 100_000L), "cmpqh") { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
+        val objectBox = bench.benchmark("objectbox", max, "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
+        val sqliteVec = bench.benchmark("sqlite-vec", max, "cmpsv") { ns -> SqliteVecStore(ctx, dim, ns) }
 
         // The run must be able to FAIL — assert the deterministic, device-independent facts only
         // (never exact latency/RAM numbers, which vary with load; see VectorStoreBenchmark's
@@ -65,6 +68,23 @@ class ComparisonBenchmarkTest {
         assertTrue(
             "exact engine (qdrant-edge, brute-force) recall@5=${smallest.recallAtK} at the smallest scale, expected ~1.0",
             smallest.recallAtK >= 0.99,
+        )
+
+        // The other three engines must at least COMPLETE the smallest scale — this is what stops
+        // "all_engines" going green while 3 of 4 engines are fully broken (they used to be discarded
+        // unasserted). DNF is a legitimate outcome at LARGER scales (e.g. ObjectBox's HNSW build
+        // cost) but every engine here completes SCALES.first() (1000), so skipped/DNF/failed at the
+        // smallest scale is always a real bug, never a budget limit.
+        for ((name, summaries) in listOf("qdrant-hnsw" to qdrantHnsw, "objectbox" to objectBox, "sqlite-vec" to sqliteVec)) {
+            val s = summaries.first()
+            assertFalse("$name skipped its smallest scale — maxScale too low?", s.skipped)
+            assertFalse("$name DNF'd/failed at its smallest scale: $s", s.dnf || s.failed)
+        }
+        // sqlite-vec is exact brute-force too (like qdrant-edge) — same recall bar applies.
+        val sqliteSmallest = sqliteVec.first()
+        assertTrue(
+            "exact engine (sqlite-vec, brute-force) recall@5=${sqliteSmallest.recallAtK} at the smallest scale, expected ~1.0",
+            sqliteSmallest.recallAtK >= 0.99,
         )
     }
 }
