@@ -8,6 +8,10 @@ data class Track(
     val bbox: RectF,
     val sightings: Int,
     val embedded: Boolean,
+    // The MOST RECENT matched detection's confidence (Task 2.2 region layer — a region's
+    // `yolo_conf` payload field). Defaulted so every existing positional `Track(...)` call site
+    // (tests, HudEventsTest) keeps compiling unchanged; 0f for a track this field was never set on.
+    val conf: Float = 0f,
 )
 
 /**
@@ -30,7 +34,7 @@ class ObjectTracker(
 
     private data class State(
         val id: Int, val label: String, var bbox: RectF,
-        var sightings: Int, var embedded: Boolean, var lastSeenTick: Int,
+        var sightings: Int, var embedded: Boolean, var lastSeenTick: Int, var conf: Float,
     )
     private data class Candidate(val score: Float, val detIdx: Int, val trackIdx: Int)
 
@@ -55,21 +59,34 @@ class ObjectTracker(
         for (c in candidates) {
             if (claimedDet[c.detIdx] || claimedTrack[c.trackIdx]) continue
             claimedDet[c.detIdx] = true; claimedTrack[c.trackIdx] = true
-            tracks[c.trackIdx].apply { bbox = detections[c.detIdx].bbox; sightings++; lastSeenTick = tick }
+            tracks[c.trackIdx].apply {
+                bbox = detections[c.detIdx].bbox; sightings++; lastSeenTick = tick
+                conf = detections[c.detIdx].score
+            }
         }
         for (di in detections.indices) {
             if (!claimedDet[di]) {
                 val d = detections[di]
-                tracks.add(State(nextId++, d.label, d.bbox, 1, false, tick))
+                tracks.add(State(nextId++, d.label, d.bbox, 1, false, tick, d.score))
             }
         }
         tracks.removeAll { tick - it.lastSeenTick > MAX_MISSED_TICKS }
-        return tracks.map { Track(it.id, it.label, it.bbox, it.sightings, it.embedded) }
+        return tracks.map { Track(it.id, it.label, it.bbox, it.sightings, it.embedded, it.conf) }
     }
 
     fun confirmedUnembedded(): List<Track> =
         tracks.filter { it.sightings >= confirmSightings && !it.embedded }
-            .map { Track(it.id, it.label, it.bbox, it.sightings, it.embedded) }
+            .map { Track(it.id, it.label, it.bbox, it.sightings, it.embedded, it.conf) }
+
+    /** Confirmed tracks (`sightings >= confirmSightings`), regardless of [Track.embedded] — the
+     *  region-candidate source for [tech.qdrant.glasses.pipeline.MomentCapture] (Task 2.2). Unlike
+     *  [confirmedUnembedded], this NEVER touches the `embedded` flag: it is a read-only snapshot for
+     *  a caller that doesn't participate in the crop-store path's dedup bookkeeping (see
+     *  [tech.qdrant.glasses.pipeline.RegionCandidate]'s KDoc — confirmation here gates tag quality,
+     *  not memory admission, so there is nothing to mark/unmark). */
+    fun confirmed(): List<Track> =
+        tracks.filter { it.sightings >= confirmSightings }
+            .map { Track(it.id, it.label, it.bbox, it.sightings, it.embedded, it.conf) }
 
     fun markEmbedded(trackId: Int) {
         tracks.firstOrNull { it.id == trackId }?.embedded = true

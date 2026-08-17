@@ -80,10 +80,9 @@ class PerceptionPipeline(
         // (~30-40ms → smooth ~25 FPS). Height is derived from the frame's aspect ratio at runtime.
         private const val STREAM_WIDTH = 640
         private const val STREAM_QUALITY = 60
-        // Fraction of the bbox size to add as context padding on EACH side when cropping an object
-        // (0.20 = grow the box 20% left/right/top/bottom). Enough context to disambiguate the object
-        // and give the embedder scene cues, without letting the background dominate the crop.
-        private const val CROP_PADDING = 0.20f
+        // CROP_PADDING moved to CropGeometry.kt (shared with MomentCapture's region layer, Task
+        // 2.2) — this file's `cropFrom(frame, box, padding)` call sites below resolve to that
+        // top-level function unqualified (same package), defaulting to its CROP_PADDING.
         // The THUMBNAIL gets much wider context than the embed crop: the memory card should show
         // WHERE the object is (the cup on that corner of the desk), not a tight cutout. Kept
         // separate from CROP_PADDING so the search-score calibration (gates, dedup) is unaffected.
@@ -99,6 +98,14 @@ class PerceptionPipeline(
     // boxes. Immutable List + @Volatile ref = lock-free. Boxes lag the video by ~1 detect cycle
     // (~110ms); the tracker smooths positions so the lag is imperceptible.
     @Volatile private var latestDetections: List<tech.qdrant.glasses.detect.Detection> = emptyList()
+    // Region-candidate snapshot for MomentCapture's region layer (Task 2.2) — same lock-free
+    // publish pattern as [latestDetections] just above, read from a DIFFERENT lane (embedLane, via
+    // MomentCapture's regionsProvider) instead of streamLane. Read-only: MomentCapture never mutates
+    // the tracker through this, and this class never dedups/filters it beyond `confirmed()`'s own
+    // sightings gate — see [RegionCandidate]'s KDoc for why confirmation here is a TAG-QUALITY gate,
+    // not a memory-admission one.
+    @Volatile var latestConfirmedRegions: List<RegionCandidate> = emptyList()
+        private set
     // Backpressure: the camera pushes ~30 FPS but streamLane/inferLane are slower. Without a gate,
     // every camera frame launches a coroutine and they QUEUE UP unboundedly → the browser sees
     // frames seconds old (latency creeps to ~1s) and detection lags. These flags drop a new frame
@@ -199,6 +206,20 @@ class PerceptionPipeline(
                 val detMs = System.currentTimeMillis() - t0
                 val tracks = tracker.update(detections)
                 latestDetections = detections   // publish for the stream lane (volatile write)
+                // Publish for MomentCapture's region layer (Task 2.2) — confirmed() reads tracker
+                // state without touching `embedded`, so this is safe to build here on inferLane
+                // (the tracker's only legal thread) and hand off as an immutable List (volatile
+                // write, lock-free, same pattern as latestDetections above).
+                latestConfirmedRegions = tracker.confirmed().map {
+                    RegionCandidate(
+                        label = it.label,
+                        left = (it.bbox.left / frame.width).coerceIn(0f, 1f),
+                        top = (it.bbox.top / frame.height).coerceIn(0f, 1f),
+                        right = (it.bbox.right / frame.width).coerceIn(0f, 1f),
+                        bottom = (it.bbox.bottom / frame.height).coerceIn(0f, 1f),
+                        conf = it.conf,
+                    )
+                }
                 Log.d(TAG, "object frame: detect=${detMs}ms detections=${detections.size}")
 
                 // Embed newly-confirmed objects on embedLane — shared with MomentCapture's confirm
@@ -308,27 +329,34 @@ class PerceptionPipeline(
         }
     }
 
-    private fun cropFrom(frame: Bitmap, box: android.graphics.RectF, padding: Float = CROP_PADDING): Bitmap? =
-        // Grow the box by `padding` of its own size on each side so the crop carries some
-        // surrounding CONTEXT (a cup on a table, not a cup in a void). Context helps both the
-        // SigLIP/CLIP embedding (richer scene semantics → better search) and the rail thumbnail
-        // (more recognizable). Clamped to the frame so the padding never runs off the edge.
-        // The try/catch is DEFENSIVE (matches the pre-refactor cropFrom): createBitmap ALLOCATES
-        // and can throw OutOfMemoryError even with valid coords, and this codebase has a history
-        // of OOM crashes — swallow it → null → the caller's `?: continue` skips this track.
-        paddedCropRect(box, padding, frame.width, frame.height)?.let { r ->
-            try {
-                val b = Bitmap.createBitmap(frame, r.left, r.top, r.width(), r.height())
-                // `Bitmap.createBitmap(src, …)` is documented to return THE SOURCE ITSELF when the
-                // requested subset is the whole bitmap ("the new bitmap may be the same object as
-                // source"). That happens routinely here: THUMB_PADDING grows a box by 120% of its
-                // own size PER SIDE, so anything larger than ~30% of the frame clamps to the full
-                // frame. The caller then recycles `frame` as soon as the loop ends — while the
-                // embedLane coroutine is still running — and the crop dies with it:
-                //     thumb write failed for laptop (track 49): Can't compress a recycled bitmap
-                // i.e. it silently broke thumbnails for exactly the biggest, most prominent objects.
-                // Force a copy so a crop NEVER aliases the frame, and every crop is ours to recycle.
-                if (b === frame) b.copy(frame.config ?: Bitmap.Config.ARGB_8888, false) else b
-            } catch (_: Throwable) { null }
-        }
+    // cropFrom(frame, box, padding) now lives in CropGeometry.kt (Task 2.2 — shared with
+    // MomentCapture's region layer). Every call site above is unqualified and resolves to that
+    // top-level function (same package), unchanged behavior.
 }
+
+/**
+ * One CONFIRMED tracker box, snapshotted by [PerceptionPipeline] after each `tracker.update(...)`
+ * for [MomentCapture]'s region layer (plan Task 2.2, Spec §2 "CLIP-verify-the-label") to read
+ * WITHOUT touching [tech.qdrant.glasses.detect.ObjectTracker] directly — the tracker is
+ * inferLane-confined and NOT thread-safe (see its KDoc), while MomentCapture's region embeds run
+ * on embedLane. Built from [tech.qdrant.glasses.detect.ObjectTracker.confirmed] — NOT
+ * `confirmedUnembedded` — so reading this snapshot never touches the `embedded` flag the
+ * crop-store path above owns exclusively; confirmation here gates TAG QUALITY (a box seen enough
+ * times to trust its label), never memory admission (Spec §2: regions are additive vector points,
+ * search never gates on YOLO).
+ *
+ * `left`/`top`/`right`/`bottom` are normalized ([0,1] fractions of the DETECT frame's width/height,
+ * same convention [PerceptionPipeline.onFrame]'s `bboxStr` uses for the crop-store path) rather
+ * than a pixel [android.graphics.RectF] — a region candidate read at detect-frame time N is applied
+ * by [MomentCapture] against whichever LATER frame its sharpness-selection window picked as the
+ * keyframe (Spec §4's window is ~800ms; boxes drift only slightly over that span), so a
+ * resolution-independent bbox is what actually survives the hop between the two frames.
+ */
+data class RegionCandidate(
+    val label: String,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val conf: Float,
+)
