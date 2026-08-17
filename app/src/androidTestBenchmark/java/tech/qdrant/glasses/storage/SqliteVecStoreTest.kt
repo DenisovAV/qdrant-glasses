@@ -14,7 +14,7 @@ import kotlin.math.sqrt
 /**
  * On-emulator/on-device verification of [SqliteVecStore] alone — exercises the sqlite-vec engine
  * (vec0 virtual table via the bundled SQLite + loadable extension) WITHOUT booting the NPU pipeline.
- * Run: `./gradlew :app:connectedDebugAndroidTest` with an arm64 emulator attached.
+ * Run: `./gradlew :app:connectedBenchmarkDebugAndroidTest` with an arm64 emulator attached.
  */
 @RunWith(AndroidJUnit4::class)
 class SqliteVecStoreTest {

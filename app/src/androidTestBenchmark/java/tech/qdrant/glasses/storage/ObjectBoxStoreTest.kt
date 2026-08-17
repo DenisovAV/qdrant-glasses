@@ -14,7 +14,7 @@ import kotlin.math.sqrt
 /**
  * On-emulator/on-device verification of [ObjectBoxStore] alone — constructs the store directly, so
  * it exercises the ObjectBox engine (put / nearestNeighbors / range-filter / recall) WITHOUT booting
- * the NPU pipeline. Run: `./gradlew :app:connectedDebugAndroidTest` with an arm64 emulator attached.
+ * the NPU pipeline. Run: `./gradlew :app:connectedBenchmarkDebugAndroidTest` with an arm64 emulator attached.
  */
 @RunWith(AndroidJUnit4::class)
 class ObjectBoxStoreTest {
