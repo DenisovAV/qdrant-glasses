@@ -72,31 +72,41 @@ class LabelVectorCache(
 
     private fun loadPersisted(file: File) {
         if (!file.exists()) return
-        var loaded = 0
-        var skipped = 0
-        var skippedWrongDim = 0
-        file.forEachLine { line ->
-            if (line.isBlank()) return@forEachLine
-            val tab = line.indexOf('\t')
-            val floats = if (tab < 0) null else line.substring(tab + 1).split(',').map { it.toFloatOrNull() }
-            if (tab < 0 || floats.isNullOrEmpty() || floats.any { it == null }) {
-                skipped++
-                return@forEachLine
+        try {
+            var loaded = 0
+            var skipped = 0
+            var skippedWrongDim = 0
+            file.forEachLine { line ->
+                if (line.isBlank()) return@forEachLine
+                val tab = line.indexOf('\t')
+                val floats = if (tab < 0) null else line.substring(tab + 1).split(',').map { it.toFloatOrNull() }
+                if (tab < 0 || floats.isNullOrEmpty() || floats.any { it == null }) {
+                    skipped++
+                    return@forEachLine
+                }
+                if (floats.size != dim) {
+                    // A torn append (process killed mid-write) can leave a short-but-parseable
+                    // line ("cup\t0.1,0.2") — well-formed enough to pass the checks above, wrong
+                    // enough to index past the end if cached as-is and later compared against a
+                    // full-length vector (Codex P1 fix). Drop it exactly like a malformed line:
+                    // the label just falls back to a fresh [encodeText] call on the next [get].
+                    skippedWrongDim++
+                    return@forEachLine
+                }
+                cache[line.substring(0, tab)] = FloatArray(floats.size) { floats[it]!! }
+                loaded++
             }
-            if (floats.size != dim) {
-                // A torn append (process killed mid-write) can leave a short-but-parseable
-                // line ("cup\t0.1,0.2") — well-formed enough to pass the checks above, wrong
-                // enough to index past the end if cached as-is and later compared against a
-                // full-length vector (Codex P1 fix). Drop it exactly like a malformed line:
-                // the label just falls back to a fresh [encodeText] call on the next [get].
-                skippedWrongDim++
-                return@forEachLine
-            }
-            cache[line.substring(0, tab)] = FloatArray(floats.size) { floats[it]!! }
-            loaded++
+            Log.i(TAG, "loaded $loaded persisted label vectors from ${file.path} " +
+                "($skipped malformed, $skippedWrongDim wrong-dim lines skipped)")
+        } catch (e: Throwable) {
+            // Best-effort load (Codex P2 fix), matching appendPersisted's write-side convention:
+            // if persistFile exists but isn't actually readable (a directory, a permission error),
+            // forEachLine throws right out of the constructor — that must not make the WHOLE cache
+            // unusable for the rest of the process. Proceed with an empty in-memory cache; every
+            // label just re-embeds on its first [get], same as a fresh install with no persisted
+            // file at all.
+            Log.w(TAG, "failed to load persisted label vectors from ${file.path}", e)
         }
-        Log.i(TAG, "loaded $loaded persisted label vectors from ${file.path} " +
-            "($skipped malformed, $skippedWrongDim wrong-dim lines skipped)")
     }
 
     private fun appendPersisted(file: File, key: String, vec: FloatArray) {

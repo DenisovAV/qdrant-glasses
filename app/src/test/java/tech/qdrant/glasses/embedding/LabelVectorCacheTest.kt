@@ -180,6 +180,24 @@ class LabelVectorCacheTest {
         }
     }
 
+    @Test fun persistence_unreadablePersistFileDoesNotThrow() {
+        // Codex P2 fix: persistFile existing but not actually readable (here, a directory) must
+        // not throw out of the constructor — the load is best-effort, matching appendPersisted's
+        // existing best-effort write-side semantics. The cache just starts empty in memory.
+        val dir = File.createTempFile("label-vec-cache-dir", "").apply {
+            delete()
+            mkdirs()
+        }
+        try {
+            val encoder = CountingEncoder()
+            val cache = LabelVectorCache(encoder, dim = 8, persistFile = dir)
+            cache.get("cup")
+            assertEquals(1, encoder.calls)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     @Test fun persistence_nullFileIsInMemoryOnly() {
         val encoder = CountingEncoder()
         val cache = LabelVectorCache(encoder, dim = 8, persistFile = null)
