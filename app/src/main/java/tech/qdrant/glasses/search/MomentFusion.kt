@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.search
 
 import tech.qdrant.glasses.storage.MomentHit
+import tech.qdrant.glasses.storage.MomentType
 
 /**
  * Region-channel fusion + soft tag boost (episodic-memory plan Task 2.3, Spec §3). Frame and region
@@ -29,7 +30,15 @@ const val TAG_BOOST_LAMBDA = 0.05f
  * score is `max(its frame-hit score, its best region-hit score)` (Spec §3). The returned hit:
  *
  * - If a `frame` hit for that moment is in this result set, that hit WINS identity — its own [id]/
- *   [MomentHit.thumbPath]/[label]/[bbox] are kept, only [MomentHit.score] is raised to the max.
+ *   [MomentHit.thumbPath]/[bbox] are kept, and [MomentHit.score] is raised to the max. [label] (and
+ *   its [MomentHit.yoloConf]/[MomentHit.verifyCos]) is the one exception (whole-branch review fix):
+ *   a frame point's label is ALWAYS `""` (Stage 1 never labels a whole frame), so keeping it
+ *   verbatim meant a moment whose score got boosted by a verified region tag rendered with NO
+ *   label — the tag chip never showed for a frame+region moment, only a region-only one. If this
+ *   moment has a VERIFIED region hit (non-empty [label] — the SAME "verified" bar [softBoost] uses,
+ *   not just the best-SCORING region, which may not be verified at all), the best such region's
+ *   [label]/[MomentHit.yoloConf]/[MomentHit.verifyCos] (highest `yoloConf * verifyCos`, same "best
+ *   match" metric [softBoost] uses) are surfaced onto the fused hit instead.
  * - Otherwise (the moment was found ONLY via a region — the frame missed it, exactly the
  *   small-object case Task 2.3 exists for) the fused hit is SYNTHESIZED from the best-scoring region
  *   hit: [id]/[type] are overwritten to the PARENT moment's id / `"frame"` so a caller can't tell a
@@ -46,17 +55,28 @@ const val TAG_BOOST_LAMBDA = 0.05f
  */
 fun fuseAndCollapse(frameHits: List<MomentHit>, regionHits: List<MomentHit>): List<MomentHit> {
     val frameByMoment = frameHits.associateBy { it.momentId }
-    val bestRegionByMoment = regionHits
-        .groupBy { it.momentId }
-        .mapValues { (_, regionsForMoment) -> regionsForMoment.maxBy { it.score } }
+    val regionsByMoment = regionHits.groupBy { it.momentId }
+    val bestRegionByMoment = regionsByMoment.mapValues { (_, regionsForMoment) -> regionsForMoment.maxBy { it.score } }
+    // The best VERIFIED region per moment, independent of which region scored highest — a moment's
+    // fused SCORE can be driven by an unverified region hit (score gates, labels don't — Spec §3)
+    // while a DIFFERENT, verified region is the one actually worth showing as the card's tag chip.
+    val bestVerifiedByMoment = regionsByMoment.mapValues { (_, regionsForMoment) ->
+        regionsForMoment.filter { it.label.isNotEmpty() }.maxByOrNull { it.yoloConf * it.verifyCos }
+    }
     val momentIds = frameByMoment.keys + bestRegionByMoment.keys
     return momentIds.map { momentId ->
         val frame = frameByMoment[momentId]
         val bestRegion = bestRegionByMoment[momentId]
         when {
-            frame != null && bestRegion != null -> frame.copy(score = maxOf(frame.score, bestRegion.score))
+            frame != null && bestRegion != null -> {
+                val fused = frame.copy(score = maxOf(frame.score, bestRegion.score))
+                val verified = bestVerifiedByMoment[momentId]
+                if (verified != null)
+                    fused.copy(label = verified.label, yoloConf = verified.yoloConf, verifyCos = verified.verifyCos)
+                else fused
+            }
             frame != null -> frame
-            bestRegion != null -> bestRegion.copy(id = momentId, type = "frame", momentId = momentId)
+            bestRegion != null -> bestRegion.copy(id = momentId, type = MomentType.FRAME, momentId = momentId)
             else -> error("momentId $momentId present in neither frame nor region map")
         }
     }.sortedByDescending { it.score }

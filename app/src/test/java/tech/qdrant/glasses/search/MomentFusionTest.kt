@@ -65,6 +65,30 @@ class MomentFusionTest {
         assertEquals("parent-m2.jpg", hit.thumbPath)
     }
 
+    @Test fun frameAndRegionMomentCarriesTheBestVerifiedRegionLabel() {
+        // The best-SCORING region is unverified (empty label — it still drives the fused score,
+        // Spec §3's "labels never gate"), but a DIFFERENT, verified region for the same moment
+        // exists — its label/yoloConf/verifyCos, not the frame's always-empty label, must surface
+        // onto the fused hit so the card can show a tag chip (whole-branch review fix).
+        val frame = frameHit("m1", score = 0.30f)
+        val unverifiedTopScore = regionHit(
+            "m1", score = 0.50f, label = "", yoloConf = 0.5f, verifyCos = 0.1f, id = "m1-region-1")
+        val verified = regionHit(
+            "m1", score = 0.45f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f, id = "m1-region-2")
+        val fused = fuseAndCollapse(frameHits = listOf(frame), regionHits = listOf(unverifiedTopScore, verified))
+
+        assertEquals(1, fused.size)
+        // Score still comes from the best-SCORING region, verified or not.
+        assertEquals(0.50f, fused[0].score, 1e-6f)
+        // But the label/tag fields come from the best VERIFIED region.
+        assertEquals("cup", fused[0].label)
+        assertEquals(0.9f, fused[0].yoloConf, 1e-6f)
+        assertEquals(0.8f, fused[0].verifyCos, 1e-6f)
+        // Identity (id/thumb) is still the frame's.
+        assertEquals(frame.id, fused[0].id)
+        assertEquals(frame.thumbPath, fused[0].thumbPath)
+    }
+
     @Test fun distinctMomentsStayDistinct() {
         val frame1 = frameHit("m1", score = 0.30f)
         val frame2 = frameHit("m2", score = 0.60f)
