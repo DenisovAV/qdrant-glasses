@@ -155,3 +155,51 @@ private val RECALL_INTENT = Regex("where\\s+did\\s+i\\s+(leave|put|last\\s+see|d
 
 /** "where did I leave/put my X" — answer with the most RECENT sighting, not the best score. */
 fun isRecallLocationIntent(raw: String): Boolean = RECALL_INTENT.containsMatchIn(raw.lowercase())
+
+// [searchPhrase] and [stripTimePhrases] each fall back to their OWN input whenever their
+// internal stripping would otherwise leave nothing (see searchPhrase's kdoc) — by design,
+// neither ever turns a non-blank string blank. A pure-time query needs the opposite: once
+// [stripDateSpan] removes the date words, whatever question boilerplate is left ("what did i
+// see on") must collapse to genuinely blank BEFORE reaching those two, so [parseQuery] can tell
+// the searcher to skip embedding entirely instead of encoding "". Order matters: the dangling
+// preposition ("... on") is stripped first so the question-prefix regex's trailing boundary
+// isn't left stranded on a leftover connector word.
+private val DATE_QUESTION_PREFIX = Regex("^what\\s+did\\s+i\\s+see\\b\\s*")
+private val DATE_DANGLING_PREPOSITION = Regex("\\s+(on|in|at|from)$")
+
+private fun stripDateAdjacentBoilerplate(text: String): String =
+    text.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_QUESTION_PREFIX, "").trim()
+
+/** One structured query intent — the seam a future on-device mini-LLM parser can implement
+ *  without touching the searcher (`MomentSearcher` consumes this struct, not four separate
+ *  helper calls). [embedText] is what CLIP embeds; it is BLANK for a pure-time query — callers
+ *  must check [timeOnly] and skip `encodeText` rather than embedding an empty string. [window]
+ *  is an absolute date's window if the query named one, else a relative one, else null. */
+data class ParsedQuery(
+    val embedText: String,
+    val window: TimeWindow?,
+    val recallIntent: Boolean,
+    val timeOnly: Boolean,
+)
+
+/** Parse a raw voice/typed query into one structured intent. Composition order: (1) [window] —
+ *  an absolute date wins over a relative phrase if both somehow appear; (2) [embedText] — strip
+ *  the absolute-date span (if matched) and its adjacent boilerplate, then question/article
+ *  boilerplate ([searchPhrase]), then relative-time words ([stripTimePhrases]), lowercase, trim;
+ *  (3) [recallIntent] and [timeOnly] are read off independently ([timeOnly] = a window was found
+ *  and nothing object-like survived the strip). */
+fun parseQuery(
+    raw: String,
+    nowMs: Long,
+    zone: java.util.TimeZone = java.util.TimeZone.getDefault(),
+): ParsedQuery {
+    val dateMatch = extractAbsoluteDate(raw, nowMs, zone)
+    val window = dateMatch?.window ?: extractTimeWindow(raw, nowMs, zone)
+    val dateStripped = if (dateMatch != null) {
+        stripDateAdjacentBoilerplate(stripDateSpan(raw, dateMatch.matchedSpan))
+    } else raw
+    val embedText = stripTimePhrases(searchPhrase(dateStripped)).lowercase().trim()
+    val recallIntent = isRecallLocationIntent(raw)
+    val timeOnly = window != null && embedText.isBlank()
+    return ParsedQuery(embedText, window, recallIntent, timeOnly)
+}

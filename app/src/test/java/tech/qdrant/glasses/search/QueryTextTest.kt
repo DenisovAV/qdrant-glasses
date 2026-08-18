@@ -136,4 +136,21 @@ class QueryTextTest {
         // after removing the date span, only boilerplate remains — searchPhrase will finish the job
         assertEquals("what did i see on", stripDateSpan("what did i see on september 5", m.matchedSpan))
     }
+
+    @Test fun parseObjectPlusAbsoluteDate() {
+        val p = parseQuery("wallet on september 5", now2, utc)
+        assertEquals("wallet", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+    }
+    @Test fun parsePureTimeQuery() {
+        val p = parseQuery("what did i see on september 5", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+    @Test fun parseRelativeStillWorks() {
+        val p = parseQuery("where did i leave my keys yesterday", now2, utc)
+        assertEquals("keys", p.embedText); assertNotNull(p.window); assertTrue(p.recallIntent); assertFalse(p.timeOnly)
+    }
+    @Test fun parsePlainObjectNoTime() {
+        val p = parseQuery("laptop", now2, utc)
+        assertEquals("laptop", p.embedText); assertNull(p.window); assertFalse(p.timeOnly)
+    }
 }
