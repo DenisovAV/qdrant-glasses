@@ -89,12 +89,13 @@ class MomentSearcher(
             val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
             val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
             val fused = fuseAndCollapse(frameHits, regionHits)
-            val ranked = softBoost(fused, regionHits, queryTokens(embedPhrase), TAG_BOOST_LAMBDA)
+            val qTokens = queryTokens(embedPhrase)
+            val ranked = softBoost(fused, regionHits, qTokens, TAG_BOOST_LAMBDA)
                 .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
             // Change 2 of the calibration rehearsal: tagAcceptedIds is computed from the PRE-collapse
             // regionHits (fuseAndCollapse can drop an unverified-but-top-scoring region's label — see
             // its KDoc — so the verified label pool has to come from here, same as softBoost above).
-            ranked to tagAcceptedMomentIds(regionHits, queryTokens(embedPhrase))
+            ranked to tagAcceptedMomentIds(regionHits, qTokens)
         } catch (e: Throwable) {
             Log.e(TAG, "moment store search failed", e)
             return ObjectSearcher.Outcome.Unavailable
