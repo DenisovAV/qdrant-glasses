@@ -200,4 +200,35 @@ class MomentFusionTest {
 
         assertEquals(emptySet<String>(), ids)
     }
+
+    @Test fun multiRegionNonBestMatchIsStillTagAccepted() {
+        // Two verified regions for the SAME moment: the higher yoloConf*verifyCos one does NOT
+        // match the query, the lower-scored one DOES. tagAcceptedMomentIds must not collapse to a
+        // single "best" region the way fuseAndCollapse's bestVerifiedByMoment does — it has to
+        // check every verified region independently.
+        val nonMatchingBest = regionHit("m1", score = 0.10f, label = "lamp", yoloConf = 0.9f, verifyCos = 0.9f)
+        val matchingWorse = regionHit(
+            "m1", score = 0.10f, label = "cup", yoloConf = 0.5f, verifyCos = 0.5f, id = "m1-region-2")
+        val ids = tagAcceptedMomentIds(regionHits = listOf(nonMatchingBest, matchingWorse), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun crossMomentIsolationReturnsOnlyTheMatchingMoment() {
+        val matching = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val nonMatching = regionHit("m2", score = 0.10f, label = "lamp", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(matching, nonMatching), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun containmentMatchThroughTagAcceptedMomentIds() {
+        // The exact on-device case: querying "phone" hit a "cell phone" region. Exercises
+        // labelMatchesQuery's containment rule via tagAcceptedMomentIds itself, not just the
+        // shared helper in isolation (QueryTextTest already covers labelMatchesQuery directly).
+        val cellPhone = regionHit("m1", score = 0.10f, label = "cell phone", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cellPhone), queryTokens = queryTokens("phone"))
+
+        assertEquals(setOf("m1"), ids)
+    }
 }
