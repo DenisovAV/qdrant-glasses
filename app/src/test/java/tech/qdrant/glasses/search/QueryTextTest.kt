@@ -126,4 +126,14 @@ class QueryTextTest {
         val m = extractAbsoluteDate("wallet on september 5 please", now2, utc)!!
         assertEquals("september 5", "wallet on september 5 please".substring(m.matchedSpan))
     }
+
+    @Test fun stripDateLeavesTheObject() {
+        val m = extractAbsoluteDate("wallet on september 5", now2, utc)!!
+        assertEquals("wallet on", stripDateSpan("wallet on september 5", m.matchedSpan))
+    }
+    @Test fun stripDatePureTimeGoesBlankish() {
+        val m = extractAbsoluteDate("what did i see on september 5", now2, utc)!!
+        // after removing the date span, only boilerplate remains — searchPhrase will finish the job
+        assertEquals("what did i see on", stripDateSpan("what did i see on september 5", m.matchedSpan))
+    }
 }

@@ -136,6 +136,13 @@ fun extractAbsoluteDate(
     return DateMatch(TimeWindow(dayStart, dayStart + 86_400_000L - 1), match.range)
 }
 
+/** Remove the [span] a [DateMatch] occupied (e.g. "september 5") from [raw] and collapse the
+ *  resulting whitespace, so the date doesn't pollute the CLIP text embedding. Relative-phrase
+ *  stripping ("yesterday", "an hour ago") stays in [stripTimePhrases] — this is absolute-date-only. */
+fun stripDateSpan(raw: String, span: IntRange): String =
+    (raw.substring(0, span.first) + raw.substring(span.last + 1))
+        .replace(Regex("\\s+"), " ").trim()
+
 private val TIME_PHRASE = Regex(
     "\\b(yesterday|today|this morning|this afternoon|earlier today|an hour ago|last hour|" +
     "in the last hour|just now|a moment ago|a minute ago|recently)\\b")
