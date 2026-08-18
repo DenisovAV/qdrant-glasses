@@ -227,16 +227,21 @@ private val DATE_LEADING_PREPOSITION = Regex("^(on|in|at|from)\\s+")
 // strip below, leaving "on" behind so the query never collapses to blank and [timeOnly] stays false.
 private val TRAILING_PUNCTUATION = Regex("[\\s?!.,;]+$")
 
-private fun stripDateAdjacentBoilerplate(text: String): String =
+private fun stripDateAdjacentBoilerplate(text: String, dateWasStripped: Boolean): String {
     // Lowercase first: the final embedText is lowercased anyway, and the case-sensitive prefix/
     // preposition regexes below must fire on a natural-case query ("What did I see …") too, not just
-    // the lowercased smoke-test inputs.
-    text.lowercase()
-        .replace(TRAILING_PUNCTUATION, "")
-        .replace(DATE_DANGLING_PREPOSITION, "")
-        .replace(DATE_LEADING_PREPOSITION, "")
-        .replace(DATE_QUESTION_PREFIX, "")
+    // the lowercased smoke-test inputs. Trailing punctuation is always safe to drop (it is never a
+    // query term).
+    var t = text.lowercase().replace(TRAILING_PUNCTUATION, "")
+    // The preposition cleanups exist ONLY to remove a connector that removing a DATE span stranded
+    // ("... on <date>" → "... on", "on <date> ..." → "on ..."). Gate them on an actual date strip:
+    // run unconditionally they would wrongly drop a meaningful leading preposition from an ordinary
+    // no-date query ("in my backpack" → "backpack", "at home" → "home").
+    if (dateWasStripped)
+        t = t.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_LEADING_PREPOSITION, "")
+    return t.replace(DATE_QUESTION_PREFIX, "")
         .replace(TIME_PHRASE, "").replace(Regex("\\s+"), " ").trim()
+}
 
 /** One structured query intent — the seam a future on-device mini-LLM parser can implement
  *  without touching the searcher (`MomentSearcher` consumes this struct, not four separate
@@ -266,7 +271,7 @@ fun parseQuery(
     val dateMatch = extractAbsoluteDate(raw, nowMs, zone)
     val window = dateMatch?.window ?: extractTimeWindow(raw, nowMs, zone)
     val spanStripped = if (dateMatch != null) stripDateSpan(raw, dateMatch.matchedSpan) else raw
-    val dateStripped = stripDateAdjacentBoilerplate(spanStripped)
+    val dateStripped = stripDateAdjacentBoilerplate(spanStripped, dateWasStripped = dateMatch != null)
     val embedText = stripTimePhrases(searchPhrase(dateStripped)).lowercase().trim()
     val recallIntent = isRecallLocationIntent(raw)
     val timeOnly = window != null && embedText.isBlank()

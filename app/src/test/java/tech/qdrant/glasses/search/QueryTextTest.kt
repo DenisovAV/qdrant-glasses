@@ -227,6 +227,12 @@ class QueryTextTest {
         val p = parseQuery("on september 5 wallet", now2, utc)
         assertEquals("wallet", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
     }
+    // Re-review regression guard: the leading-preposition strip must fire ONLY when a date span was
+    // removed. An ordinary no-date query keeps its meaningful leading location word.
+    @Test fun noDateQueryPreservesLeadingPreposition() {
+        assertEquals("in my backpack", parseQuery("in my backpack", now2, utc).embedText)
+        assertEquals("at home", parseQuery("at home", now2, utc).embedText)
+    }
 
     // --- Coverage gap T1: a BARE object + relative time (no recall wrapper) must keep the object.
     // This is the concrete over-strip guard for stripDateAdjacentBoilerplate's unconditional
