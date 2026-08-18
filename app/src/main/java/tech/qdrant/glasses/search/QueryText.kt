@@ -158,13 +158,20 @@ fun extractAbsoluteDate(
     // A day that exists in NO year (Feb 31, Apr 31, Feb 30) never resolves and falls through to null.
     // Bounded to 10 steps: only Feb 29 needs more than one, and its leap gap is at most 8 years
     // (across a skipped century leap like 2100).
+    //
+    // The strict Calendar validates the day at NOON, not midnight: some zones spring forward AT local
+    // midnight (e.g. America/Sao_Paulo on 2018-11-04), so 00:00 is a skipped wall-clock instant on an
+    // otherwise-valid day and a strict read there would throw — misread as an impossible date and
+    // walked back a year. Noon is never skipped by any real DST transition, so it validates the
+    // day-of-month cleanly; startOfDay (lenient) then resolves the actual local day-start, rolling a
+    // skipped midnight forward to the day's first valid instant.
     var year = currentYear
     var resolvedStart: Long? = null
     var guard = 0
     while (guard < 10) {
         cal.clear()
         cal.isLenient = false
-        cal.set(year, monthIndex, day, 0, 0, 0)
+        cal.set(year, monthIndex, day, 12, 0, 0)
         val sod = try { startOfDay(cal.timeInMillis, zone) } catch (e: IllegalArgumentException) { null }
         if (sod != null && sod <= todayStart) { resolvedStart = sod; break }
         year--

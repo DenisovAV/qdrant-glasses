@@ -197,6 +197,17 @@ class QueryTextTest {
         assertEquals(dayWindow(2024, 1, 29, utc), m.window)
         assertEquals(dayWindow(2024, 1, 29, utc), extractAbsoluteDate("february 29", now2, utc)!!.window)
     }
+    // Re-review guard: a day whose LOCAL MIDNIGHT is skipped by a DST spring-forward is still a valid
+    // day and must resolve to THIS year, not walk back. America/Sao_Paulo sprang forward at 00:00 on
+    // 2018-11-04, so "november 4" asked days later must resolve to Nov 4 2018 (day-start = 01:00 local,
+    // the first valid instant), NOT Nov 4 2017. Validating at noon (never skipped) is what fixes this.
+    @Test fun dayWithSkippedLocalMidnightResolvesToThisYear() {
+        val sp = TimeZone.getTimeZone("America/Sao_Paulo")
+        val nowCal = Calendar.getInstance(sp).apply { clear(); set(2018, Calendar.NOVEMBER, 10, 12, 0, 0) }
+        val m = extractAbsoluteDate("what did i see on november 4", nowCal.timeInMillis, sp)!!
+        val refNoon = Calendar.getInstance(sp).apply { clear(); set(2018, Calendar.NOVEMBER, 4, 12, 0, 0) }
+        assertEquals(startOfDay(refNoon.timeInMillis, sp), m.window.sinceMs)   // Nov 4 2018, not 2017
+    }
     @Test fun impossibleDateFallsThroughParseQueryWithNoWindow() {
         // The whole pipeline must degrade gracefully: an impossible date isn't a window, and the
         // leftover text is embedded normally rather than the query silently searching March 3.
