@@ -168,4 +168,17 @@ class QueryTextTest {
         val p = parseQuery("laptop", now2, utc)
         assertEquals("laptop", p.embedText); assertNull(p.window); assertFalse(p.timeOnly)
     }
+
+    // Review fix: a RELATIVE pure-time query ("yesterday") must collapse to timeOnly too, the
+    // same way an ABSOLUTE pure-time query already does (parsePureTimeQuery above) — before this
+    // fix, embedText stayed "what did i see" (the un-stripped question stem) and timeOnly stayed
+    // false, so the searcher would CLIP-embed garbage instead of running a clean time-only scan.
+    @Test fun parseRelativePureTimeQueryIsTimeOnly() {
+        val p = parseQuery("what did i see yesterday", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+    @Test fun parseRelativePureTimeQueryTodayIsTimeOnly() {
+        val p = parseQuery("what did i see today", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
 }

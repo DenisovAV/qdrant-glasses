@@ -173,16 +173,22 @@ fun isRecallLocationIntent(raw: String): Boolean = RECALL_INTENT.containsMatchIn
 // [searchPhrase] and [stripTimePhrases] each fall back to their OWN input whenever their
 // internal stripping would otherwise leave nothing (see searchPhrase's kdoc) — by design,
 // neither ever turns a non-blank string blank. A pure-time query needs the opposite: once
-// [stripDateSpan] removes the date words, whatever question boilerplate is left ("what did i
-// see on") must collapse to genuinely blank BEFORE reaching those two, so [parseQuery] can tell
-// the searcher to skip embedding entirely instead of encoding "". Order matters: the dangling
-// preposition ("... on") is stripped first so the question-prefix regex's trailing boundary
-// isn't left stranded on a leftover connector word.
+// [stripDateSpan] removes an absolute date's words, whatever question boilerplate is left
+// ("what did i see on") must collapse to genuinely blank BEFORE reaching those two, so
+// [parseQuery] can tell the searcher to skip embedding entirely instead of encoding "". A
+// RELATIVE pure-time query ("what did i see yesterday") has no [stripDateSpan] step to remove
+// "yesterday" first, so this function also strips [TIME_PHRASE] itself here, unguarded (unlike
+// [stripTimePhrases]'s own call on the same regex) — otherwise "yesterday" would survive as the
+// sole leftover token and [stripTimePhrases]'s ifBlank-fallback would hand it right back instead
+// of letting it go blank. Order matters: the dangling preposition ("... on") is stripped first
+// so the question-prefix regex's trailing boundary isn't left stranded on a leftover connector
+// word.
 private val DATE_QUESTION_PREFIX = Regex("^what\\s+did\\s+i\\s+see\\b\\s*")
 private val DATE_DANGLING_PREPOSITION = Regex("\\s+(on|in|at|from)$")
 
 private fun stripDateAdjacentBoilerplate(text: String): String =
-    text.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_QUESTION_PREFIX, "").trim()
+    text.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_QUESTION_PREFIX, "")
+        .replace(TIME_PHRASE, "").replace(Regex("\\s+"), " ").trim()
 
 /** One structured query intent — the seam a future on-device mini-LLM parser can implement
  *  without touching the searcher (`MomentSearcher` consumes this struct, not four separate
@@ -198,10 +204,12 @@ data class ParsedQuery(
 
 /** Parse a raw voice/typed query into one structured intent. Composition order: (1) [window] —
  *  an absolute date wins over a relative phrase if both somehow appear; (2) [embedText] — strip
- *  the absolute-date span (if matched) and its adjacent boilerplate, then question/article
- *  boilerplate ([searchPhrase]), then relative-time words ([stripTimePhrases]), lowercase, trim;
- *  (3) [recallIntent] and [timeOnly] are read off independently ([timeOnly] = a window was found
- *  and nothing object-like survived the strip). */
+ *  the absolute-date span (if matched), then date/time-adjacent boilerplate
+ *  ([stripDateAdjacentBoilerplate] — the question stem AND any relative time word, run
+ *  unconditionally so a RELATIVE pure-time query collapses to blank the same way an absolute one
+ *  does), then question/article boilerplate ([searchPhrase]), then any residual relative-time
+ *  words ([stripTimePhrases]), lowercase, trim; (3) [recallIntent] and [timeOnly] are read off
+ *  independently ([timeOnly] = a window was found and nothing object-like survived the strip). */
 fun parseQuery(
     raw: String,
     nowMs: Long,
@@ -209,9 +217,8 @@ fun parseQuery(
 ): ParsedQuery {
     val dateMatch = extractAbsoluteDate(raw, nowMs, zone)
     val window = dateMatch?.window ?: extractTimeWindow(raw, nowMs, zone)
-    val dateStripped = if (dateMatch != null) {
-        stripDateAdjacentBoilerplate(stripDateSpan(raw, dateMatch.matchedSpan))
-    } else raw
+    val spanStripped = if (dateMatch != null) stripDateSpan(raw, dateMatch.matchedSpan) else raw
+    val dateStripped = stripDateAdjacentBoilerplate(spanStripped)
     val embedText = stripTimePhrases(searchPhrase(dateStripped)).lowercase().trim()
     val recallIntent = isRecallLocationIntent(raw)
     val timeOnly = window != null && embedText.isBlank()
