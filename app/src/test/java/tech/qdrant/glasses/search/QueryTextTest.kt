@@ -39,7 +39,7 @@ class QueryTextTest {
         assertFalse(labelMatchesQuery("cat", queryTokens("laptop")))
     }
 
-    // Fixed reference instant: 2026-08-17 15:00:00 UTC.
+    // Fixed reference instant: 2026-08-13 15:00:00 UTC (verified from the epoch ms).
     private val nowMs = 1_786_633_200_000L
     private val utc = TimeZone.getTimeZone("UTC")
     private val DAY = 86_400_000L
@@ -92,7 +92,7 @@ class QueryTextTest {
         assertFalse(isRecallLocationIntent("show me a laptop"))
     }
 
-    // Reference: 2026-08-18 12:00:00 UTC (a Tuesday). DAY = 86_400_000.
+    // Reference: 2026-08-17 12:00:00 UTC (a Monday, verified from the epoch ms). DAY = 86_400_000.
     private val now2 = 1_786_968_000_000L
 
     private fun dayWindow(y: Int, mo: Int, d: Int, zone: TimeZone): TimeWindow {
@@ -180,5 +180,84 @@ class QueryTextTest {
     @Test fun parseRelativePureTimeQueryTodayIsTimeOnly() {
         val p = parseQuery("what did i see today", now2, utc)
         assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+
+    // --- Review fix (Codex P2 #1): an IMPOSSIBLE calendar day must be REJECTED, not silently rolled
+    // by a lenient Calendar into a different real day (Feb 31 → Mar 3), which would both pollute the
+    // strip and filter the search to the wrong day. extractAbsoluteDate returns null → no window.
+    @Test fun impossibleDayReturnsNull() {
+        assertNull(extractAbsoluteDate("what did i see on february 31", now2, utc))   // Feb never has 31
+        assertNull(extractAbsoluteDate("what did i see on april 31", now2, utc))      // April has 30
+        assertNull(extractAbsoluteDate("что я видел 29 февраля", now2, utc))          // 2026 is a common year
+    }
+    @Test fun impossibleDateFallsThroughParseQueryWithNoWindow() {
+        // The whole pipeline must degrade gracefully: an impossible date isn't a window, and the
+        // leftover text is embedded normally rather than the query silently searching March 3.
+        val p = parseQuery("laptop on february 31", now2, utc)
+        assertNull(p.window); assertFalse(p.timeOnly)
+        // An impossible date is NOT a date: its span is left in the query as ordinary text (not
+        // stripped as if valid), and with no window the searcher just embeds it — no wrong-day filter.
+        assertTrue("february" in p.embedText)
+    }
+
+    // --- Review fix (Codex P2 #2): trailing punctuation and natural capitalization must not defeat
+    // the pure-time path. "What did I see on September 5?" is the user's literal use case.
+    @Test fun punctuatedPureTimeQueryIsTimeOnly() {
+        val p = parseQuery("what did i see on september 5?", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+    @Test fun naturalCasePureTimeQueryIsTimeOnly() {
+        val p = parseQuery("What did I see on September 5?", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+    @Test fun punctuatedObjectPlusDateStripsCleanly() {
+        val p = parseQuery("laptop on July 31?", now2, utc)
+        assertEquals("laptop", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+    }
+
+    // --- Coverage gap T8: symmetric leading-preposition strip for a date-FIRST phrasing.
+    @Test fun dateFirstPhrasingStripsLeadingPreposition() {
+        val p = parseQuery("on september 5 wallet", now2, utc)
+        assertEquals("wallet", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+    }
+
+    // --- Coverage gap T1: a BARE object + relative time (no recall wrapper) must keep the object.
+    // This is the concrete over-strip guard for stripDateAdjacentBoilerplate's unconditional
+    // TIME_PHRASE strip — "laptop" must survive "yesterday" being removed.
+    @Test fun bareObjectPlusRelativeTimeKeepsObject() {
+        val p1 = parseQuery("laptop yesterday", now2, utc)
+        assertEquals("laptop", p1.embedText); assertNotNull(p1.window); assertFalse(p1.timeOnly)
+        val p2 = parseQuery("keys today", now2, utc)
+        assertEquals("keys", p2.embedText); assertNotNull(p2.window); assertFalse(p2.timeOnly)
+    }
+
+    // --- Coverage gap T2: the year-rollback comparison is `>` (strictly future), so asking about
+    // TODAY'S own date by name must resolve to today, not roll back a year. now2 is 2026-08-17 UTC
+    // (verified from the epoch ms — the class's "2026-08-18" comment is stale), so "august 17" == today.
+    @Test fun namedDateEqualToTodayStaysThisYear() {
+        val m = extractAbsoluteDate("what did i see on august 17", now2, utc)!!
+        assertEquals(dayWindow(2026, 7, 17, utc), m.window)
+    }
+
+    // --- Coverage gap T3: ordinal day suffixes ("5th"), a KDoc-claimed supported form.
+    @Test fun ordinalDaySuffix() {
+        val m = extractAbsoluteDate("what did i see on sept 5th", now2, utc)!!
+        assertEquals(dayWindow(2025, 8, 5, utc), m.window)
+        assertEquals("sept 5th", "what did i see on sept 5th".substring(m.matchedSpan))
+    }
+
+    // --- Coverage gap T5: English DAY-FIRST order ("5 September" / "5th September"), previously only
+    // the Russian "5 сентября" exercised the day1/month1 regex branch.
+    @Test fun englishDayFirstOrder() {
+        assertEquals(dayWindow(2025, 8, 5, utc), extractAbsoluteDate("5 september", now2, utc)!!.window)
+        assertEquals(dayWindow(2025, 8, 5, utc), extractAbsoluteDate("the 5th september", now2, utc)!!.window)
+    }
+
+    // --- Coverage gap T7: when a query carries BOTH an absolute date and a relative phrase, the
+    // absolute date wins (parseQuery's `dateMatch?.window ?: extractTimeWindow`).
+    @Test fun absoluteDateWinsOverRelativePhrase() {
+        val p = parseQuery("keys yesterday on september 5", now2, utc)
+        assertEquals(dayWindow(2025, 8, 5, utc), p.window)   // Sept 5, NOT yesterday
+        assertEquals("keys", p.embedText); assertFalse(p.timeOnly)
     }
 }

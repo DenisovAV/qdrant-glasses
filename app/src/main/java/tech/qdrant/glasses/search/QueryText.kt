@@ -121,7 +121,13 @@ data class DateMatch(val window: TimeWindow, val matchedSpan: IntRange)
  *  deferred, not a bug). No year in the query, so the year resolves to the most-recent PAST
  *  occurrence: the date is built in the CURRENT year in [zone], and if that day's [startOfDay] is
  *  still after today's, it steps back one year — memory is retrospective, a future date is wrong.
- *  Returns null if the query names no absolute date. */
+ *  Returns null if the query names no absolute date, OR if the named day is IMPOSSIBLE for that
+ *  month (Feb 31, Feb 29 in a common year) — see the non-lenient Calendar below.
+ *  KNOWN LIMIT (deferred to a future mini-LLM parser, not a bug at this scale): the day+month
+ *  regex has no part-of-speech signal, so a query that happens to place a 1–2 digit number before
+ *  an English month-word that is also a common word ("5 may be enough", "3 march …") false-matches
+ *  as a date. No realistic object-memory voice query mixes a bare number with such a word, so this
+ *  is left unhandled rather than papered over with a brittle stop-word list. */
 fun extractAbsoluteDate(
     raw: String,
     nowMs: Long,
@@ -138,11 +144,24 @@ fun extractAbsoluteDate(
     cal.timeInMillis = nowMs
     val currentYear = cal.get(java.util.Calendar.YEAR)
     cal.clear()
+    // Reject an IMPOSSIBLE date ("February 31", or "February 29" in a common year) instead of
+    // letting a LENIENT Calendar silently roll it into a different real day (Feb 31 → Mar 3): a
+    // rolled date would be BOTH stripped from the embedding AND used to filter the search to the
+    // WRONG day. With leniency off, reading `timeInMillis` forces field validation and throws
+    // `IllegalArgumentException` on such a date — caught below and reported as "no date matched".
+    cal.isLenient = false
     cal.set(currentYear, monthIndex, day, 0, 0, 0)
-    if (startOfDay(cal.timeInMillis, zone) > startOfDay(nowMs, zone)) {
-        cal.set(java.util.Calendar.YEAR, currentYear - 1)
+    val dayStart = try {
+        // The future-date rollback (memory is retrospective — a bare named date resolves to its
+        // most-recent PAST occurrence) must RE-VALIDATE: Feb 29 is valid in a leap current year but
+        // impossible in `currentYear - 1`, so the second `timeInMillis` read can throw where the
+        // first did not.
+        if (startOfDay(cal.timeInMillis, zone) > startOfDay(nowMs, zone))
+            cal.set(java.util.Calendar.YEAR, currentYear - 1)
+        startOfDay(cal.timeInMillis, zone)
+    } catch (e: IllegalArgumentException) {
+        return null
     }
-    val dayStart = startOfDay(cal.timeInMillis, zone)
     // DST-safe upper bound — same reasoning as startOfPreviousDay: a fixed +86_400_000ms lands
     // short/long of midnight across a DST transition, so step a Calendar a whole date forward
     // instead and close one ms before that boundary.
@@ -183,11 +202,31 @@ fun isRecallLocationIntent(raw: String): Boolean = RECALL_INTENT.containsMatchIn
 // of letting it go blank. Order matters: the dangling preposition ("... on") is stripped first
 // so the question-prefix regex's trailing boundary isn't left stranded on a leftover connector
 // word.
+//
+// KNOWN LIMIT (deferred to a future mini-LLM parser, not a bug): exactly ONE recall stem
+// ("what did i see") collapses to blank here; another natural pure-time phrasing ("show me
+// september 5", "anything from sept 5") leaves a non-blank leftover, so [parseQuery] falls to the
+// normal vector path (window still applied, just semantically ranked) rather than the chronological
+// scroll. Graceful — no crash, correct window — so not chased with an ever-growing stem list.
 private val DATE_QUESTION_PREFIX = Regex("^what\\s+did\\s+i\\s+see\\b\\s*")
 private val DATE_DANGLING_PREPOSITION = Regex("\\s+(on|in|at|from)$")
+// Symmetric to [DATE_DANGLING_PREPOSITION] for a date-FIRST phrasing ("on september 5 wallet" →
+// after the span is cut → "on wallet"): drop the leading connector so the object embeds clean.
+private val DATE_LEADING_PREPOSITION = Regex("^(on|in|at|from)\\s+")
+// A trailing "?"/"!"/"." the date strip stranded ("what did i see on september 5?" → after the
+// date span is cut → "what did i see on ?") would otherwise block the $-anchored dangling-preposition
+// strip below, leaving "on" behind so the query never collapses to blank and [timeOnly] stays false.
+private val TRAILING_PUNCTUATION = Regex("[\\s?!.,;]+$")
 
 private fun stripDateAdjacentBoilerplate(text: String): String =
-    text.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_QUESTION_PREFIX, "")
+    // Lowercase first: the final embedText is lowercased anyway, and the case-sensitive prefix/
+    // preposition regexes below must fire on a natural-case query ("What did I see …") too, not just
+    // the lowercased smoke-test inputs.
+    text.lowercase()
+        .replace(TRAILING_PUNCTUATION, "")
+        .replace(DATE_DANGLING_PREPOSITION, "")
+        .replace(DATE_LEADING_PREPOSITION, "")
+        .replace(DATE_QUESTION_PREFIX, "")
         .replace(TIME_PHRASE, "").replace(Regex("\\s+"), " ").trim()
 
 /** One structured query intent — the seam a future on-device mini-LLM parser can implement

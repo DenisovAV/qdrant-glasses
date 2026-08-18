@@ -132,9 +132,14 @@ class QdrantEdgeMomentStoreTest {
             val f1 = store.storeMoment(unit(rnd), framePayload(t1))
             val f2 = store.storeMoment(unit(rnd), framePayload(t2))
             val f3 = store.storeMoment(unit(rnd), framePayload(t3))
-            Log.i(TAG, "stored frames: $f0@$t0 $f1@$t1 $f2@$t2 $f3@$t3")
+            // A REGION point INSIDE the [t1,t2] window and the open-ended set — framesInWindow is a
+            // frame-only path (type=frame filter, review gap T6), so it must never surface here even
+            // though it falls squarely within every window below.
+            val r2 = store.storeRegion(unit(rnd), regionPayload(f2, t2, "laptop"))
+            Log.i(TAG, "stored frames: $f0@$t0 $f1@$t1 $f2@$t2 $f3@$t3 + region $r2@$t2")
 
-            // A closed [t1, t2] window returns only f1, f2 — newest (f2) first.
+            // A closed [t1, t2] window returns only f1, f2 — newest (f2) first; the region at t2 is
+            // excluded despite being in range.
             val windowed = store.framesInWindow(sinceMs = t1, untilMs = t2)
             assertEquals(listOf(f2, f1), windowed.map { it.id })
             assertEquals(listOf(t2, t1), windowed.map { it.timestampMs })
