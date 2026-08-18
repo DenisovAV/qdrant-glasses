@@ -91,4 +91,39 @@ class QueryTextTest {
         assertTrue(isRecallLocationIntent("where did i put the keys"))
         assertFalse(isRecallLocationIntent("show me a laptop"))
     }
+
+    // Reference: 2026-08-18 12:00:00 UTC (a Tuesday). DAY = 86_400_000.
+    private val now2 = 1_786_968_000_000L
+
+    private fun dayWindow(y: Int, mo: Int, d: Int, zone: TimeZone): TimeWindow {
+        val c = java.util.Calendar.getInstance(zone)
+        c.clear(); c.set(y, mo, d, 0, 0, 0)          // mo is 0-based
+        val start = c.timeInMillis
+        return TimeWindow(start, start + 86_400_000L - 1)
+    }
+
+    @Test fun englishNamedMonthDate() {
+        val m = extractAbsoluteDate("what did I see on August 1", now2, utc)!!
+        assertEquals(dayWindow(2026, 7, 1, utc), m.window)     // Aug 1 already passed this year
+    }
+    @Test fun futureBareDateResolvesToLastYear() {
+        val m = extractAbsoluteDate("what did I see on September 5", now2, utc)!!
+        assertEquals(dayWindow(2025, 8, 5, utc), m.window)     // Sept 5 hasn't happened in 2026 yet
+    }
+    @Test fun russianNamedMonthDate() {
+        val m = extractAbsoluteDate("что я видел 5 сентября", now2, utc)!!
+        assertEquals(dayWindow(2025, 8, 5, utc), m.window)
+    }
+    @Test fun abbreviatedMonth() {
+        val m = extractAbsoluteDate("anything from sept 5", now2, utc)!!
+        assertEquals(dayWindow(2025, 8, 5, utc), m.window)
+    }
+    @Test fun noDateReturnsNull() {
+        assertNull(extractAbsoluteDate("where is my laptop", now2, utc))
+        assertNull(extractAbsoluteDate("what did I see yesterday", now2, utc))   // relative, not absolute
+    }
+    @Test fun matchedSpanCoversTheDateTokens() {
+        val m = extractAbsoluteDate("wallet on september 5 please", now2, utc)!!
+        assertEquals("september 5", "wallet on september 5 please".substring(m.matchedSpan))
+    }
 }
