@@ -2,6 +2,7 @@ package tech.qdrant.glasses.search
 
 import android.graphics.Bitmap
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -33,12 +34,21 @@ class MomentSearcherTest {
     private class FakeMomentStore(
         private val frameHits: List<MomentHit>,
         private val regionHits: List<MomentHit>,
+        private val windowHits: List<MomentHit> = emptyList(),
     ) : MomentStore {
+        // Records the exact bounds the pure-time branch passed, so a test can catch a since/until
+        // swap or drop (which returning canned windowHits unconditionally would otherwise hide).
+        var lastWindowSince: Long? = null; private set
+        var lastWindowUntil: Long? = null; private set
         override fun storeMoment(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun storeRegion(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = frameHits
         override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = regionHits
         override fun timeline(limit: Int): List<MomentHit> = emptyList()
+        override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> {
+            lastWindowSince = sinceMs; lastWindowUntil = untilMs
+            return windowHits
+        }
         override fun count(): Long = (frameHits.size + regionHits.size).toLong()
         override fun frameCount(): Long = frameHits.size.toLong()
         override fun deleteAll() {}
@@ -83,5 +93,35 @@ class MomentSearcherTest {
         val acceptedIds = outcome.cards.map { it.frame.id }.toSet()
 
         assertEquals(setOf("a", "c"), acceptedIds)
+    }
+
+    @Test fun searchPureTimeQuerySkipsGateAndReturnsWindowFrames() {
+        // Both BELOW MomentSearcher's 0.25 gate — if the pure-time branch fell through to the
+        // normal gate/fusion path (e.g. because parseQuery.timeOnly was ignored), these would be
+        // filtered out. framesInWindow returning them unfiltered proves the gate was skipped.
+        val windowHits = listOf(frameHit("d", score = 0.05f), frameHit("e", score = 0.01f))
+
+        // frameHits/regionHits deliberately non-empty: if the pure-time branch mistakenly fell
+        // through to searchFrames/searchRegions instead of framesInWindow, this hit ("a", 0.30,
+        // clears the gate on its own) would leak into the result and fail the id assertion below.
+        val store = FakeMomentStore(
+            frameHits = listOf(frameHit("a", score = 0.30f)),
+            regionHits = emptyList(),
+            windowHits = windowHits,
+        )
+        val searcher = MomentSearcher(cropEncoder = FakeCropEncoder(), store = store, hud = noopHud())
+
+        // "yesterday" strips to a blank embed phrase (parseQuery.timeOnly) — no object named.
+        val outcome = searcher.search("what did i see yesterday") as ObjectSearcher.Outcome.Success
+        val returnedIds = outcome.cards.map { it.frame.id }
+
+        assertEquals(listOf("d", "e"), returnedIds)
+        // Review gap T4: prove the window BOUNDS actually reached framesInWindow, not just that the
+        // branch was taken — a since/until swap or drop would pass the id assertion above unchanged.
+        // "yesterday" is a bounded past day, so both ends are non-null and sinceMs strictly precedes
+        // untilMs; a swapped call (untilMs, sinceMs) would invert this.
+        val since = store.lastWindowSince!!
+        val until = store.lastWindowUntil!!
+        assertTrue("since must precede until", since < until)
     }
 }
