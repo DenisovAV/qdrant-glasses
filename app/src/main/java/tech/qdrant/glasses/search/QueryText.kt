@@ -44,6 +44,16 @@ private fun startOfPreviousDay(nowMs: Long, zone: java.util.TimeZone): Long {
     return c.timeInMillis
 }
 
+/** Start of the day AFTER [nowMs]'s local day — same DST-safety rationale as
+ *  [startOfPreviousDay] (a fixed 86_400_000ms addition is wrong across a DST transition; the
+ *  local day can be 23h or 25h, not 24h), mirrored forward instead of back. */
+private fun startOfNextDay(nowMs: Long, zone: java.util.TimeZone): Long {
+    val c = java.util.Calendar.getInstance(zone)
+    c.timeInMillis = startOfDay(nowMs, zone)
+    c.add(java.util.Calendar.DATE, 1)
+    return c.timeInMillis
+}
+
 /** Map a few spoken time phrases to a [TimeWindow]; null if the query names no time.
  *  Calendar-accurate for "today"/"yesterday" in [zone]; relative for hour-scale phrases. */
 fun extractTimeWindow(
@@ -133,7 +143,11 @@ fun extractAbsoluteDate(
         cal.set(java.util.Calendar.YEAR, currentYear - 1)
     }
     val dayStart = startOfDay(cal.timeInMillis, zone)
-    return DateMatch(TimeWindow(dayStart, dayStart + 86_400_000L - 1), match.range)
+    // DST-safe upper bound — same reasoning as startOfPreviousDay: a fixed +86_400_000ms lands
+    // short/long of midnight across a DST transition, so step a Calendar a whole date forward
+    // instead and close one ms before that boundary.
+    val dayEndExclusive = startOfNextDay(dayStart, zone)
+    return DateMatch(TimeWindow(dayStart, dayEndExclusive - 1), match.range)
 }
 
 /** Remove the [span] a [DateMatch] occupied (e.g. "september 5") from [raw] and collapse the

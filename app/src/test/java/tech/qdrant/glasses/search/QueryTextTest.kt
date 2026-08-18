@@ -118,6 +118,21 @@ class QueryTextTest {
         val m = extractAbsoluteDate("anything from sept 5", now2, utc)!!
         assertEquals(dayWindow(2025, 8, 5, utc), m.window)
     }
+    @Test fun absoluteDateWindowSpansTheCorrectLocalDayAcrossDst() {
+        // Review fix: extractAbsoluteDate's upper bound used to be a fixed `+ 86_400_000L - 1`,
+        // the same DST bug yesterdaySpansTheCorrectLocalDayAcrossDst caught in extractTimeWindow
+        // (2026-03-08 is the US spring-forward day in America/New_York — a 23h local day, not
+        // 24h). Query "now" from the day after so the matched date resolves to March 8 itself.
+        val nyZone = TimeZone.getTimeZone("America/New_York")
+        val cal = Calendar.getInstance(nyZone)
+        cal.set(2026, Calendar.MARCH, 9, 15, 0, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        val nowMsNy = cal.timeInMillis
+        val m = extractAbsoluteDate("what did I see on March 8", nowMsNy, nyZone)!!
+        val spanMs = m.window.untilMs!! - m.window.sinceMs!!
+        assertNotEquals(DAY, spanMs)
+        assertEquals(23 * HOUR - 1, spanMs)
+    }
     @Test fun noDateReturnsNull() {
         assertNull(extractAbsoluteDate("where is my laptop", now2, utc))
         assertNull(extractAbsoluteDate("what did I see yesterday", now2, utc))   // relative, not absolute
