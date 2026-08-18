@@ -219,9 +219,6 @@ fun isRecallLocationIntent(raw: String): Boolean = RECALL_INTENT.containsMatchIn
 // scroll. Graceful — no crash, correct window — so not chased with an ever-growing stem list.
 private val DATE_QUESTION_PREFIX = Regex("^what\\s+did\\s+i\\s+see\\b\\s*")
 private val DATE_DANGLING_PREPOSITION = Regex("\\s+(on|in|at|from)$")
-// Symmetric to [DATE_DANGLING_PREPOSITION] for a date-FIRST phrasing ("on september 5 wallet" →
-// after the span is cut → "on wallet"): drop the leading connector so the object embeds clean.
-private val DATE_LEADING_PREPOSITION = Regex("^(on|in|at|from)\\s+")
 // A trailing "?"/"!"/"." the date strip stranded ("what did i see on september 5?" → after the
 // date span is cut → "what did i see on ?") would otherwise block the $-anchored dangling-preposition
 // strip below, leaving "on" behind so the query never collapses to blank and [timeOnly] stays false.
@@ -233,12 +230,15 @@ private fun stripDateAdjacentBoilerplate(text: String, dateWasStripped: Boolean)
     // the lowercased smoke-test inputs. Trailing punctuation is always safe to drop (it is never a
     // query term).
     var t = text.lowercase().replace(TRAILING_PUNCTUATION, "")
-    // The preposition cleanups exist ONLY to remove a connector that removing a DATE span stranded
-    // ("... on <date>" → "... on", "on <date> ..." → "on ..."). Gate them on an actual date strip:
-    // run unconditionally they would wrongly drop a meaningful leading preposition from an ordinary
-    // no-date query ("in my backpack" → "backpack", "at home" → "home").
+    // Only the DANGLING (trailing) preposition is stripped, and only when a DATE span was removed —
+    // it cleans up the connector the date left behind ("... on <date>" → "... on" → "..."). We do
+    // NOT strip a LEADING preposition: a query-initial "on/in/at/from" usually belongs to the object
+    // or location phrase, not the date ("at home on september 5" → keep "at home"; "in my backpack"
+    // → keep "in"), and only a contrived date-FIRST phrasing ("on september 5 wallet") would benefit
+    // — at the cost of corrupting the common case. A leading connector left by a date-first query is
+    // a harmless stopword the CLIP text encoder largely ignores.
     if (dateWasStripped)
-        t = t.replace(DATE_DANGLING_PREPOSITION, "").replace(DATE_LEADING_PREPOSITION, "")
+        t = t.replace(DATE_DANGLING_PREPOSITION, "")
     return t.replace(DATE_QUESTION_PREFIX, "")
         .replace(TIME_PHRASE, "").replace(Regex("\\s+"), " ").trim()
 }

@@ -222,13 +222,23 @@ class QueryTextTest {
         assertEquals("laptop", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
     }
 
-    // --- Coverage gap T8: symmetric leading-preposition strip for a date-FIRST phrasing.
-    @Test fun dateFirstPhrasingStripsLeadingPreposition() {
+    // --- Coverage gap T8 + re-review: a date-FIRST phrasing keeps a harmless leading stopword ("on")
+    // rather than risk stripping a meaningful leading preposition from an object/location phrase. The
+    // window and object are what matter; CLIP largely ignores the connector.
+    @Test fun dateFirstPhrasingKeepsWindowAndObject() {
         val p = parseQuery("on september 5 wallet", now2, utc)
-        assertEquals("wallet", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+        assertEquals(dayWindow(2025, 8, 5, utc), p.window)
+        assertTrue("wallet" in p.embedText); assertFalse(p.timeOnly)
     }
-    // Re-review regression guard: the leading-preposition strip must fire ONLY when a date span was
-    // removed. An ordinary no-date query keeps its meaningful leading location word.
+    // Re-review regression guard: a leading preposition that belongs to the OBJECT/LOCATION phrase
+    // must survive even when the query ALSO carries an absolute date later — only the date's own
+    // stranded trailing connector ("on") is removed ("at home on september 5" → "at home").
+    @Test fun objectWithLeadingPrepositionPlusDate() {
+        val p = parseQuery("at home on september 5", now2, utc)
+        assertEquals("at home", p.embedText)
+        assertEquals(dayWindow(2025, 8, 5, utc), p.window); assertFalse(p.timeOnly)
+    }
+    // And an ordinary NO-date query keeps its meaningful leading location word untouched.
     @Test fun noDateQueryPreservesLeadingPreposition() {
         assertEquals("in my backpack", parseQuery("in my backpack", now2, utc).embedText)
         assertEquals("at home", parseQuery("at home", now2, utc).embedText)
