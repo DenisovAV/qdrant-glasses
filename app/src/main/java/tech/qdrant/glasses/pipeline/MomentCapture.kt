@@ -195,14 +195,17 @@ class MomentCapture(
         // that list.)
         const val REGIONS_MAX_PER_MOMENT = 6
         // CLIP-verify-the-label threshold (Spec §2/§7): a region embedding's cosine against its
-        // YOLO label's CLIP text vector must clear this to keep the label as a display tag. Seeded
-        // from QnnB32CropEncoder.visionMinScore (0.22, the same encoder's absolute-cosine "is this
-        // a real match at all" floor for a completely different comparison — text query vs stored
-        // crop) as a plausible starting order of magnitude, NOT a calibrated value for THIS
-        // comparison (label text vs region crop, same modality gap but a different query distribution)
-        // — UNCALIBRATED, tuned at the Stage 2 gate. Below this, the region vector is still stored
-        // (it's still a valid recall signal) — only the label is dropped.
-        const val VERIFY_COS = 0.22f
+        // YOLO label's CLIP text vector must clear this to keep the label as a display tag.
+        // CALIBRATED from an on-device rehearsal (was 0.22, seeded from QnnB32CropEncoder's
+        // unrelated visionMinScore floor): distinctive objects verify well clear of either
+        // threshold (laptop 0.26–0.28, cell phone 0.28, cup 0.25), but a broad category like
+        // "person" verified at only 0.21–0.23 on real crops — straddling the old 0.22, so a real
+        // person's label flickered kept/dropped frame to frame. 0.20 keeps a real person's label
+        // stable while still well clear of a genuine non-match. Below this, the region vector is
+        // still stored (it's still a valid recall signal) — only the label is dropped. Affects
+        // FUTURE captures only — points already stored keep whatever verify_cos decision was made
+        // at their own capture time.
+        const val VERIFY_COS = 0.20f
     }
 
     private val busy = AtomicBoolean(false)

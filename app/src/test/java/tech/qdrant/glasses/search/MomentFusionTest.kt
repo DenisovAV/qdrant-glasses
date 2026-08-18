@@ -165,4 +165,70 @@ class MomentFusionTest {
         val expected = 0.40f + 0.05f * 0.8f * 0.5f
         assertEquals(expected, boosted[0].score, 1e-6f)
     }
+
+    // ---- tagAcceptedMomentIds (calibration rehearsal, Change 2) ---------------------------------
+
+    @Test fun verifiedMatchingLabelIsTagAccepted() {
+        val cup = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cup), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun labelDroppedRegionIsNotTagAccepted() {
+        // Empty label == the region's verifyCos was below MomentCapture.VERIFY_COS at capture time
+        // (label dropped, vector kept) — it must not tag-accept even though the query would match
+        // what the (dropped) label would have been.
+        val unlabeled = regionHit("m1", score = 0.10f, label = "", yoloConf = 0.9f, verifyCos = 0.95f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(unlabeled), queryTokens = setOf("cup"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
+
+    @Test fun unverifiedZeroVerifyCosIsNotTagAccepted() {
+        // Defense-in-depth: a non-empty label with verifyCos == 0f (shouldn't occur via
+        // MomentCapture, but a synthetic/test hit could shape it this way) must not tag-accept.
+        val zeroVerify = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(zeroVerify), queryTokens = setOf("cup"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
+
+    @Test fun nonMatchingTokenIsNotTagAccepted() {
+        val cup = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cup), queryTokens = setOf("laptop"))
+
+        assertEquals(emptySet<String>(), ids)
+    }
+
+    @Test fun multiRegionNonBestMatchIsStillTagAccepted() {
+        // Two verified regions for the SAME moment: the higher yoloConf*verifyCos one does NOT
+        // match the query, the lower-scored one DOES. tagAcceptedMomentIds must not collapse to a
+        // single "best" region the way fuseAndCollapse's bestVerifiedByMoment does — it has to
+        // check every verified region independently.
+        val nonMatchingBest = regionHit("m1", score = 0.10f, label = "lamp", yoloConf = 0.9f, verifyCos = 0.9f)
+        val matchingWorse = regionHit(
+            "m1", score = 0.10f, label = "cup", yoloConf = 0.5f, verifyCos = 0.5f, id = "m1-region-2")
+        val ids = tagAcceptedMomentIds(regionHits = listOf(nonMatchingBest, matchingWorse), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun crossMomentIsolationReturnsOnlyTheMatchingMoment() {
+        val matching = regionHit("m1", score = 0.10f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val nonMatching = regionHit("m2", score = 0.10f, label = "lamp", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(matching, nonMatching), queryTokens = setOf("cup"))
+
+        assertEquals(setOf("m1"), ids)
+    }
+
+    @Test fun containmentMatchThroughTagAcceptedMomentIds() {
+        // The exact on-device case: querying "phone" hit a "cell phone" region. Exercises
+        // labelMatchesQuery's containment rule via tagAcceptedMomentIds itself, not just the
+        // shared helper in isolation (QueryTextTest already covers labelMatchesQuery directly).
+        val cellPhone = regionHit("m1", score = 0.10f, label = "cell phone", yoloConf = 0.9f, verifyCos = 0.8f)
+        val ids = tagAcceptedMomentIds(regionHits = listOf(cellPhone), queryTokens = queryTokens("phone"))
+
+        assertEquals(setOf("m1"), ids)
+    }
 }
