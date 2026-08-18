@@ -33,13 +33,14 @@ class MomentSearcherTest {
     private class FakeMomentStore(
         private val frameHits: List<MomentHit>,
         private val regionHits: List<MomentHit>,
+        private val windowHits: List<MomentHit> = emptyList(),
     ) : MomentStore {
         override fun storeMoment(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun storeRegion(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = frameHits
         override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = regionHits
         override fun timeline(limit: Int): List<MomentHit> = emptyList()
-        override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> = emptyList()
+        override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> = windowHits
         override fun count(): Long = (frameHits.size + regionHits.size).toLong()
         override fun frameCount(): Long = frameHits.size.toLong()
         override fun deleteAll() {}
@@ -84,5 +85,31 @@ class MomentSearcherTest {
         val acceptedIds = outcome.cards.map { it.frame.id }.toSet()
 
         assertEquals(setOf("a", "c"), acceptedIds)
+    }
+
+    @Test fun searchPureTimeQuerySkipsGateAndReturnsWindowFrames() {
+        // Both BELOW MomentSearcher's 0.25 gate — if the pure-time branch fell through to the
+        // normal gate/fusion path (e.g. because parseQuery.timeOnly was ignored), these would be
+        // filtered out. framesInWindow returning them unfiltered proves the gate was skipped.
+        val windowHits = listOf(frameHit("d", score = 0.05f), frameHit("e", score = 0.01f))
+
+        val searcher = MomentSearcher(
+            cropEncoder = FakeCropEncoder(),
+            // frameHits/regionHits deliberately non-empty: if the pure-time branch mistakenly fell
+            // through to searchFrames/searchRegions instead of framesInWindow, this hit ("a", 0.30,
+            // clears the gate on its own) would leak into the result and fail the id assertion below.
+            store = FakeMomentStore(
+                frameHits = listOf(frameHit("a", score = 0.30f)),
+                regionHits = emptyList(),
+                windowHits = windowHits,
+            ),
+            hud = noopHud(),
+        )
+
+        // "yesterday" strips to a blank embed phrase (parseQuery.timeOnly) — no object named.
+        val outcome = searcher.search("what did i see yesterday") as ObjectSearcher.Outcome.Success
+        val returnedIds = outcome.cards.map { it.frame.id }
+
+        assertEquals(listOf("d", "e"), returnedIds)
     }
 }

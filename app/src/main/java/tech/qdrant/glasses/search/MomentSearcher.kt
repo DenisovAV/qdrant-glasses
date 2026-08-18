@@ -9,16 +9,19 @@ import tech.qdrant.glasses.stream.HudEvents
 import tech.qdrant.glasses.stream.HudPublisher
 
 /**
- * Moment-mode voice search (episodic-memory plan Task 1.6 + Task 2.3, Spec §3): normalize the query
- * (same [QueryText] helpers [searchPhrase]/[stripTimePhrases]/[extractTimeWindow]/[isRecallLocationIntent]
- * Task 0.1 already put on [ObjectSearcher]) → text-embed → vector search over BOTH
- * [MomentStore.searchFrames] and [MomentStore.searchRegions] → [fuseAndCollapse] to one hit per
- * moment → [softBoost] a verified-tag match → per-channel score gate → HUD push → map to
- * [MomentCard]s. This is the YOLO-independent "real memory" recall path (Spec §2/§3): the frame
- * channel alone is Stage 1's whole-frame backbone; the region channel (Task 2.3) adds small-object
- * recall on top WITHOUT YOLO ever gating — a region only ever raises a moment's score or attaches a
- * display tag, never filters one out (a moment absent from both channels' hit lists just isn't a
- * candidate at all, same as before).
+ * Moment-mode voice search (episodic-memory plan Task 1.6 + Task 2.3, Spec §3; query-understanding
+ * plan Task 5): normalize the query via [parseQuery] — ONE structured [ParsedQuery] instead of the
+ * four separate [searchPhrase]/[stripTimePhrases]/[extractTimeWindow]/[isRecallLocationIntent] calls
+ * Task 0.1 put on [ObjectSearcher] (that searcher is retired and still calls them directly — left
+ * alone, not migrated) — then either the PURE-TIME path ([ParsedQuery.timeOnly]: a moment scroll
+ * over [MomentStore.framesInWindow], no embedding, no gate) or the normal path: text-embed →
+ * vector search over BOTH [MomentStore.searchFrames] and [MomentStore.searchRegions] →
+ * [fuseAndCollapse] to one hit per moment → [softBoost] a verified-tag match → per-channel score
+ * gate → HUD push → map to [MomentCard]s. This is the YOLO-independent "real memory" recall path
+ * (Spec §2/§3): the frame channel alone is Stage 1's whole-frame backbone; the region channel
+ * (Task 2.3) adds small-object recall on top WITHOUT YOLO ever gating — a region only ever raises a
+ * moment's score or attaches a display tag, never filters one out (a moment absent from both
+ * channels' hit lists just isn't a candidate at all, same as before).
  *
  * Deliberately reuses [ObjectSearcher.Outcome] rather than defining its own sealed type: the two
  * searchers are mutually exclusive per [tech.qdrant.glasses.Config.MOMENT_MEMORY] (never both
@@ -59,14 +62,37 @@ class MomentSearcher(
 
     /** Runs on: inferLane. */
     fun search(query: String): ObjectSearcher.Outcome {
-        val phrase = searchPhrase(query)
-        val window = extractTimeWindow(query, System.currentTimeMillis())
-        val embedPhrase = stripTimePhrases(phrase)
-        if (embedPhrase != query.lowercase())
-            Log.i(TAG, "query normalized(moments): \"$query\" → \"$embedPhrase\" window=$window")
+        val pq = parseQuery(query, System.currentTimeMillis())
+        if (pq.embedText != query.lowercase())
+            Log.i(TAG, "query normalized(moments): \"$query\" → \"${pq.embedText}\" window=${pq.window}")
+
+        // Pure-time query (query-understanding plan Task 5): the query named a time and NOTHING
+        // object-like survived parseQuery's strip (see ParsedQuery.timeOnly's KDoc) — "what did I
+        // see yesterday" wants that day's moments, not a semantic match, so this skips encodeText
+        // and the whole gate/fusion pipeline below entirely and goes straight to a recency-ordered
+        // moment scroll. Same store-failure → Unavailable discipline as the normal path (a native
+        // EdgeException from framesInWindow must not crash the inferLane coroutine either).
+        if (pq.timeOnly) {
+            val ordered = try {
+                store.framesInWindow(pq.window?.sinceMs, pq.window?.untilMs, limit = 5)
+            } catch (e: Throwable) {
+                Log.e(TAG, "moment store framesInWindow failed", e)
+                return ObjectSearcher.Outcome.Unavailable
+            }
+            Log.i(TAG, "onVoiceResult(moments, time-only): window=${pq.window} returned=${ordered.size}")
+            val resultItems = ordered.map { h ->
+                val key = java.io.File(h.thumbPath).nameWithoutExtension
+                hud.registerThumb(key, h.thumbPath)
+                val tags = if (h.label.isNotEmpty()) listOf(h.label) else emptyList()
+                HudEvents.ResultItem(key, h.label, h.score, tags)
+            }
+            hud.pushEvent(HudEvents.resultsEvent(resultItems))
+            return ObjectSearcher.Outcome.Success(ordered.map { toMomentCard(it) })
+        }
+
         val t0 = System.currentTimeMillis()
         val qvec = try {
-            cropEncoder.encodeText(embedPhrase)
+            cropEncoder.encodeText(pq.embedText)
         } catch (e: Throwable) {
             Log.e(TAG, "moment query embed failed", e)
             return ObjectSearcher.Outcome.Unavailable
@@ -76,7 +102,7 @@ class MomentSearcher(
         // Recall-intent queries need a wider pool than a display top-5 — see RECALL_FETCH_K. Both
         // channels share the same qvec/window/fetchK — a region is only ever a small-object find on
         // the SAME query embedding, never a separately-tuned search.
-        val fetchK = if (isRecallLocationIntent(query)) RECALL_FETCH_K else 5
+        val fetchK = if (pq.recallIntent) RECALL_FETCH_K else 5
         // Task 2.3 (Spec §3): collapse the two channels to one hit per moment (client-side max —
         // frame and region vectors share the same CLIP space), then a bounded soft nudge for a
         // query-token match against a VERIFIED region label. Neither step can introduce a moment
@@ -86,10 +112,10 @@ class MomentSearcher(
         // store calls AND the fusion that consumes their results, same honest Unavailable the embed
         // failure above already gets.
         val (allHits, tagAcceptedIds) = try {
-            val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
-            val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = window?.sinceMs, untilMs = window?.untilMs)
+            val frameHits = store.searchFrames(qvec, topK = fetchK, sinceMs = pq.window?.sinceMs, untilMs = pq.window?.untilMs)
+            val regionHits = store.searchRegions(qvec, topK = fetchK, sinceMs = pq.window?.sinceMs, untilMs = pq.window?.untilMs)
             val fused = fuseAndCollapse(frameHits, regionHits)
-            val qTokens = queryTokens(embedPhrase)
+            val qTokens = queryTokens(pq.embedText)
             val ranked = softBoost(fused, regionHits, qTokens, TAG_BOOST_LAMBDA)
                 .sortedByDescending { it.score }   // softBoost can reorder what fuseAndCollapse sorted
             // Change 2 of the calibration rehearsal: tagAcceptedIds is computed from the PRE-collapse
@@ -121,7 +147,7 @@ class MomentSearcher(
         // here is just the top-5 cap — a two-channel fetchK=5+5 can otherwise surface ~10 distinct
         // moments after fuseAndCollapse.
         val ordered =
-            if (isRecallLocationIntent(query)) hits.sortedByDescending { it.timestampMs }.take(5)
+            if (pq.recallIntent) hits.sortedByDescending { it.timestampMs }.take(5)
             else hits.take(5)
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
