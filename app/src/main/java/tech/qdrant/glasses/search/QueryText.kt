@@ -120,9 +120,10 @@ data class DateMatch(val window: TimeWindow, val matchedSpan: IntRange)
  *  dates ("5/9") are deliberately NOT matched (D/M vs M/D is ambiguous with no locale signal;
  *  deferred, not a bug). No year in the query, so the year resolves to the most-recent PAST
  *  occurrence: the date is built in the CURRENT year in [zone], and if that day's [startOfDay] is
- *  still after today's, it steps back one year — memory is retrospective, a future date is wrong.
- *  Returns null if the query names no absolute date, OR if the named day is IMPOSSIBLE for that
- *  month (Feb 31, Feb 29 in a common year) — see the non-lenient Calendar below.
+ *  still after today's, it steps back a year (and "February 29" keeps stepping back to the most
+ *  recent PAST leap year — a real recurring date, not an impossible one).
+ *  Returns null if the query names no absolute date, OR if the named day exists in NO year for that
+ *  month (Feb 31, Feb 30, Apr 31) — see the non-lenient walk-back below.
  *  KNOWN LIMIT (deferred to a future mini-LLM parser, not a bug at this scale): the day+month
  *  regex has no part-of-speech signal, so a query that happens to place a 1–2 digit number before
  *  an English month-word that is also a common word ("5 may be enough", "3 march …") false-matches
@@ -143,25 +144,33 @@ fun extractAbsoluteDate(
     val cal = java.util.Calendar.getInstance(zone)
     cal.timeInMillis = nowMs
     val currentYear = cal.get(java.util.Calendar.YEAR)
-    cal.clear()
-    // Reject an IMPOSSIBLE date ("February 31", or "February 29" in a common year) instead of
-    // letting a LENIENT Calendar silently roll it into a different real day (Feb 31 → Mar 3): a
-    // rolled date would be BOTH stripped from the embedding AND used to filter the search to the
-    // WRONG day. With leniency off, reading `timeInMillis` forces field validation and throws
-    // `IllegalArgumentException` on such a date — caught below and reported as "no date matched".
-    cal.isLenient = false
-    cal.set(currentYear, monthIndex, day, 0, 0, 0)
-    val dayStart = try {
-        // The future-date rollback (memory is retrospective — a bare named date resolves to its
-        // most-recent PAST occurrence) must RE-VALIDATE: Feb 29 is valid in a leap current year but
-        // impossible in `currentYear - 1`, so the second `timeInMillis` read can throw where the
-        // first did not.
-        if (startOfDay(cal.timeInMillis, zone) > startOfDay(nowMs, zone))
-            cal.set(java.util.Calendar.YEAR, currentYear - 1)
-        startOfDay(cal.timeInMillis, zone)
-    } catch (e: IllegalArgumentException) {
-        return null
+    val todayStart = startOfDay(nowMs, zone)
+
+    // Resolve the (yearless) date to the MOST-RECENT occurrence of this month/day that is not in
+    // the future. Walk back year by year from the current year, skipping a year where the date is
+    // either still ahead of today OR does not exist that year (Feb 29 in a common year — a LENIENT
+    // Calendar would silently roll it to Mar 1, so leniency is off and the read throws instead). The
+    // first year that yields a real, non-future date wins:
+    //   • normal past date ("august 1") → current year;
+    //   • future-so-far this year ("september 5" asked in August) → last year;
+    //   • Feb 29 → the most recent PAST leap year (2024 when asked in 2026), NOT null — it is a real
+    //     recurring date, not an impossible one.
+    // A day that exists in NO year (Feb 31, Apr 31, Feb 30) never resolves and falls through to null.
+    // Bounded to 10 steps: only Feb 29 needs more than one, and its leap gap is at most 8 years
+    // (across a skipped century leap like 2100).
+    var year = currentYear
+    var resolvedStart: Long? = null
+    var guard = 0
+    while (guard < 10) {
+        cal.clear()
+        cal.isLenient = false
+        cal.set(year, monthIndex, day, 0, 0, 0)
+        val sod = try { startOfDay(cal.timeInMillis, zone) } catch (e: IllegalArgumentException) { null }
+        if (sod != null && sod <= todayStart) { resolvedStart = sod; break }
+        year--
+        guard++
     }
+    val dayStart = resolvedStart ?: return null
     // DST-safe upper bound — same reasoning as startOfPreviousDay: a fixed +86_400_000ms lands
     // short/long of midnight across a DST transition, so step a Calendar a whole date forward
     // instead and close one ms before that boundary.

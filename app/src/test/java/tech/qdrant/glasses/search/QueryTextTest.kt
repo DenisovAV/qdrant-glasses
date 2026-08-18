@@ -187,8 +187,15 @@ class QueryTextTest {
     // strip and filter the search to the wrong day. extractAbsoluteDate returns null → no window.
     @Test fun impossibleDayReturnsNull() {
         assertNull(extractAbsoluteDate("what did i see on february 31", now2, utc))   // Feb never has 31
+        assertNull(extractAbsoluteDate("what did i see on february 30", now2, utc))   // Feb never has 30
         assertNull(extractAbsoluteDate("what did i see on april 31", now2, utc))      // April has 30
-        assertNull(extractAbsoluteDate("что я видел 29 февраля", now2, utc))          // 2026 is a common year
+    }
+    // Feb 29 is a REAL recurring date, not an impossible one: with no year, it resolves to the most
+    // recent PAST leap year. now2 is 2026 (common), so the answer is Feb 29 2024, NOT null.
+    @Test fun leapDayResolvesToMostRecentPastLeapYear() {
+        val m = extractAbsoluteDate("что я видел 29 февраля", now2, utc)!!
+        assertEquals(dayWindow(2024, 1, 29, utc), m.window)
+        assertEquals(dayWindow(2024, 1, 29, utc), extractAbsoluteDate("february 29", now2, utc)!!.window)
     }
     @Test fun impossibleDateFallsThroughParseQueryWithNoWindow() {
         // The whole pipeline must degrade gracefully: an impossible date isn't a window, and the
