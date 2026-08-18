@@ -39,6 +39,7 @@ class MomentSearcherTest {
         override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = frameHits
         override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = regionHits
         override fun timeline(limit: Int): List<MomentHit> = emptyList()
+        override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> = emptyList()
         override fun count(): Long = (frameHits.size + regionHits.size).toLong()
         override fun frameCount(): Long = frameHits.size.toLong()
         override fun deleteAll() {}

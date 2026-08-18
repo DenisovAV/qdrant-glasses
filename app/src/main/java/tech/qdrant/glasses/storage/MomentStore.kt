@@ -132,6 +132,15 @@ interface MomentStore : AutoCloseable {
      *  why (a client-side sort-then-trim over the whole `type=frame` channel; fine at demo scale). */
     fun timeline(limit: Int = 500): List<MomentHit>
 
+    /** `type=frame` moments whose `timestamp_ms` falls in the optional `[sinceMs, untilMs]` range
+     *  (either bound null = open, same semantics as [searchFrames]'s window), MOST-RECENT first
+     *  (payload only, no vectors, no query vector) — the pure-time "what did I see on <day>"
+     *  retrieval path (query-understanding plan Task 4): a query that names only a time and no
+     *  object skips embedding entirely and asks for that window's moments directly. Open-ended
+     *  bounds (both null) behave like [timeline] restricted to `[limit]`, just newest-first instead
+     *  of oldest-first. */
+    fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int = 100): List<MomentHit>
+
     /** Total point count across ALL channels (frame + region + future speech/ocr). */
     fun count(): Long
 

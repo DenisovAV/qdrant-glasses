@@ -111,6 +111,57 @@ class QdrantEdgeMomentStoreTest {
         }
     }
 
+    /**
+     * [QdrantEdgeMomentStore.framesInWindow] (query-understanding plan Task 4): the pure-time "what
+     * did I see on <day>" path — a window filter with NO query vector, newest-first (the opposite
+     * order from [timeline], which is oldest-first for rail playback).
+     */
+    @Test fun framesInWindowFiltersAndOrdersNewestFirst() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val store = QdrantEdgeMomentStore(ctx, "momentstoretest_window")
+        try {
+            store.deleteAll()
+            val rnd = Random(13)
+
+            // Four frames at distinct, well-separated timestamps.
+            val t0 = 1_000_000L
+            val t1 = 2_000_000L
+            val t2 = 3_000_000L
+            val t3 = 4_000_000L
+            val f0 = store.storeMoment(unit(rnd), framePayload(t0))
+            val f1 = store.storeMoment(unit(rnd), framePayload(t1))
+            val f2 = store.storeMoment(unit(rnd), framePayload(t2))
+            val f3 = store.storeMoment(unit(rnd), framePayload(t3))
+            Log.i(TAG, "stored frames: $f0@$t0 $f1@$t1 $f2@$t2 $f3@$t3")
+
+            // A closed [t1, t2] window returns only f1, f2 — newest (f2) first.
+            val windowed = store.framesInWindow(sinceMs = t1, untilMs = t2)
+            assertEquals(listOf(f2, f1), windowed.map { it.id })
+            assertEquals(listOf(t2, t1), windowed.map { it.timestampMs })
+
+            // Open-ended bounds (both null) return every frame, newest-first — the same set as
+            // timeline() but reversed (timeline() is oldest-first for rail playback).
+            val all = store.framesInWindow(sinceMs = null, untilMs = null)
+            assertEquals(listOf(f3, f2, f1, f0), all.map { it.id })
+
+            // A one-sided lower bound (sinceMs only) excludes everything before it.
+            val sinceOnly = store.framesInWindow(sinceMs = t2, untilMs = null)
+            assertEquals(listOf(f3, f2), sinceOnly.map { it.id })
+
+            // A one-sided upper bound (untilMs only) excludes everything after it.
+            val untilOnly = store.framesInWindow(sinceMs = null, untilMs = t1)
+            assertEquals(listOf(f1, f0), untilOnly.map { it.id })
+
+            // limit is applied AFTER the newest-first sort, not before.
+            val limited = store.framesInWindow(sinceMs = null, untilMs = null, limit = 2)
+            assertEquals(listOf(f3, f2), limited.map { it.id })
+
+            Log.i(TAG, "framesInWindowFiltersAndOrdersNewestFirst: PASS")
+        } finally {
+            store.deleteAll(); store.close()
+        }
+    }
+
     private fun framePayload(ts: Long) = MomentPayload(
         type = "frame", momentId = "", episodeId = ts, timestampMs = ts, tEndMs = ts,
         thumbPath = "/sdcard/moments/$ts.jpg", bbox = "", label = "", yoloConf = 0f, verifyCos = 0f, text = "",

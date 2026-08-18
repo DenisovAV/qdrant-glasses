@@ -226,6 +226,35 @@ class QdrantEdgeMomentStore(
             .also { Log.i(TAG, "timeline(): scanned ${all.size} stored frames, returning ${it.size} most recent") }
     }
 
+    /**
+     * `type=frame` moments whose `timestamp_ms` is in the optional `[sinceMs, untilMs]` range,
+     * MOST-RECENT first — the pure-time "what did I see on <day>" retrieval path (query-
+     * understanding plan Task 4; no query vector). Reuses [typeAndTimeFilter] (the same combined
+     * type+range `Filter.must` [searchFrames] applies) and [timeline]'s scroll-the-whole-matching-
+     * set-then-sort-client-side pattern — see [timeline]'s KDoc for why this AAR can't order by
+     * `timestamp_ms` server-side. Sorted DESCENDING here (unlike [timeline]'s ascending): this
+     * answers "what did I see on <day>", where the newest sighting is what the user wants first,
+     * not oldest-first playback of the rail.
+     */
+    override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> = synchronized(lock) {
+        val filter = typeAndTimeFilter(MomentType.FRAME, sinceMs, untilMs)
+        val all = mutableListOf<MomentHit>()
+        var offset: PointId? = null
+        do {
+            val resp = shard.scroll(ScrollRequest(
+                offset = offset, limit = SCROLL_PAGE_SIZE,
+                filter = filter,
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+                orderBy = null,
+            ))
+            resp.records.mapTo(all) { rec -> toHit(rec.id, rec.payload ?: "{}") }
+            offset = resp.nextOffset
+        } while (offset != null)
+        all.sortedByDescending { it.timestampMs }
+            .take(limit)
+            .also { Log.i(TAG, "framesInWindow(): since=$sinceMs until=$untilMs matched=${all.size} returning=${it.size}") }
+    }
+
     override fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }
 
     // Whole-branch review fix: `count()` was being reported to callers as "moments stored", but it
