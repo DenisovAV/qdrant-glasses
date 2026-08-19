@@ -30,15 +30,41 @@ class SiglipCropEncoder(context: Context) : CropEncoder {
     // (integration Task 5) before trusting search precision — this is a starting value, not final.
     override val visionMinScore: Float = 0.09f
 
+    // Vision loads eagerly — it is the per-crop capture path, needed as soon as recording starts.
     private val vision = SiglipVisionEncoder(context)
-    private val text = SiglipTextEncoder(context)
+
+    // Text is DEFERRED. Constructing it at the SAME instant as the vision DSP-context load + the camera
+    // startup inrush spikes DSP+CPU+power together and reboots the AR1 — even though the STEADY-STATE of
+    // both encoders is only ~668 MB and fits the ~2.4 GB budget fine (measured, SiglipMemoryTest). It is
+    // the simultaneous LOADING transient at startup that kills it, not resident RAM. So build text lazily
+    // and warm it on a background thread a few seconds after startup, once vision + the camera have
+    // settled — it is ready before the first voice query without ever coinciding with the startup peak,
+    // and text is CPU-only so it never adds to the DSP load the vision context + detector already carry.
+    private val textLazy = lazy { SiglipTextEncoder(context) }
+
+    init {
+        Thread {
+            try {
+                Thread.sleep(WARM_DELAY_MS)
+                textLazy.value.encode("warm up")   // force the lazy load off the startup path
+            } catch (_: Throwable) { /* app closing / interrupted — encodeText will lazy-init on demand */ }
+        }.apply { isDaemon = true; name = "siglip-text-warm" }.start()
+    }
 
     override fun encode(crop: Bitmap): FloatArray = vision.encode(crop)
 
-    override fun encodeText(query: String): FloatArray = text.encode(query)
+    // If a query arrives before the background warm finished, this lazy-inits text here (one-time stall);
+    // in practice the ~8 s warm completes well before the first search.
+    override fun encodeText(query: String): FloatArray = textLazy.value.encode(query)
 
     override fun close() {
         vision.close()
-        text.close()
+        if (textLazy.isInitialized()) textLazy.value.close()
+    }
+
+    companion object {
+        // Long enough for the vision DSP-context load (~1.7 s) + camera startup inrush to clear before
+        // the text load's CPU/memory spike lands. Tunable if the reboot recurs.
+        private const val WARM_DELAY_MS = 8000L
     }
 }
