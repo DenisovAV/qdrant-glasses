@@ -31,6 +31,19 @@ qnn = "2.45.0"           # must be >= the QAIRT version of the qai-hub context b
 # annotation processor is wired through com.android.legacy-kapt (AGP-versioned, the documented AGP-9
 # kapt fallback ObjectBox's own getting-started prescribes) rather than the JetBrains kapt plugin.
 objectbox = "5.4.2"
+# DJL HuggingFace tokenizers (SiglipTextEncoder) — real Rust `tokenizers` crate via JNI, needed
+# because the SigLIP2 tokenizer.json is a Gemma/SentencePiece-BPE model with byte-fallback + a
+# 256k vocab: not something a hand-rolled BPE loop (see RankedBpeTokenizer, built for CLIP's much
+# smaller byte-BPE vocab) can reproduce correctly. `ai.djl.huggingface:tokenizers` pins the JNI
+# Java API; the matching native .so for Android arm64 ships in a SEPARATE artifact,
+# `ai.djl.android:tokenizer-native` — which is only published at 0.33.0 (the huggingface:tokenizers
+# artifact itself goes up to 0.36.0, but that has no matching Android native build), so both are
+# pinned to 0.33.0 to keep the JNI ABI in lock-step. Verified: the AAR's jni/arm64-v8a/
+# libdjl_tokenizer.so is real (8MB, present), and DJL's own LibUtils.loadLibrary() special-cases
+# Android (`System.getProperty("java.vendor.url") == "http://www.android.com/"`) to
+# System.loadLibrary("djl_tokenizer") instead of its normal desktop copy-from-jar dance — this is a
+# supported, not a hacked-around, path.
+djl = "0.33.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -49,6 +62,8 @@ litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version
 litert-gpu-api = { group = "com.google.ai.edge.litert", name = "litert-gpu-api", version.ref = "litert" }
 qnn-runtime = { group = "com.qualcomm.qti", name = "qnn-runtime", version.ref = "qnn" }
 qnn-litert-delegate = { group = "com.qualcomm.qti", name = "qnn-litert-delegate", version.ref = "qnn" }
+djl-tokenizers = { group = "ai.djl.huggingface", name = "tokenizers", version.ref = "djl" }
+djl-android-tokenizer-native = { group = "ai.djl.android", name = "tokenizer-native", version.ref = "djl" }
 
 [bundles]
 camerax = ["camerax-core", "camerax-camera2", "camerax-lifecycle"]
