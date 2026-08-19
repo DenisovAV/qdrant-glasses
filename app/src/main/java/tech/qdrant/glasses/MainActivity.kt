@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.drawToBitmap
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -192,7 +193,16 @@ class MainActivity : AppCompatActivity() {
             this, passthrough = true,
             onError = { e -> viewModel.reportFatal("camera: ${e.message ?: e.javaClass.simpleName}") },
         ) { bitmap -> viewModel.onFrame(bitmap) }
-        cameraManager.start(this)
+        // Start the camera ONLY AFTER the encoders finish loading (state leaves Loading → Idle). Loading
+        // the SigLIP encoders (269MB text + 96MB vision DSP context) AT THE SAME TIME as the camera startup
+        // inrush + the detector spikes DSP+CPU+power together and reboots the AR1 — the encoders alone fit
+        // (~668MB, measured), so sequencing encoder-load THEN camera-start keeps the two peaks from
+        // overlapping. (~2-3s wait for CLIP, ~15-20s for SigLIP — worth not rebooting.)
+        lifecycleScope.launch {
+            viewModel.state.first { it is AppState.Idle }
+            Log.i(TAG, "components ready → starting camera")
+            cameraManager.start(this@MainActivity)
+        }
     }
 
     private fun startStreamer() {
