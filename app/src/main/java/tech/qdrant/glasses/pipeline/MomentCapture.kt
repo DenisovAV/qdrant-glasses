@@ -7,6 +7,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
@@ -194,21 +195,20 @@ class MomentCapture(
         // MomentSearcher.kt's/MomentFusion.kt's "(Spec §7/§8 unknown #7)" constants, which ARE on
         // that list.)
         const val REGIONS_MAX_PER_MOMENT = 6
-        // CLIP-verify-the-label threshold (Spec §2/§7): a region embedding's cosine against its
-        // YOLO label's CLIP text vector must clear this to keep the label as a display tag.
-        // CALIBRATED from an on-device rehearsal (was 0.22, seeded from QnnB32CropEncoder's
-        // unrelated visionMinScore floor): distinctive objects verify well clear of either
-        // threshold (laptop 0.26–0.28, cell phone 0.28, cup 0.25), but a broad category like
-        // "person" verified at only 0.21–0.23 on real crops — straddling the old 0.22, so a real
-        // person's label flickered kept/dropped frame to frame. 0.20 keeps a real person's label
-        // stable while still well clear of a genuine non-match. Below this, the region vector is
-        // still stored (it's still a valid recall signal) — only the label is dropped. Affects
-        // FUTURE captures only — points already stored keep whatever verify_cos decision was made
-        // at their own capture time.
-        const val VERIFY_COS = 0.20f
+        // Region label-verify threshold (Spec §2/§7): a region embedding's cosine against its YOLO
+        // label's TEXT vector must clear the gate to keep the label as a display tag. This gate is
+        // now PER-BACKEND — see CropEncoderFactory.verifyGate — because it lives on the same
+        // text→image modality-gap scale as searchGate: a fixed CLIP-scale 0.20 silently dropped
+        // EVERY SigLIP region's label (SigLIP present-cosines ~0.11, not ~0.26). Below the gate the
+        // region vector is still stored (a valid recall signal); only the label is dropped, for
+        // FUTURE captures only — points already stored keep their own capture-time verify_cos.
     }
 
     private val busy = AtomicBoolean(false)
+
+    // Per-backend label-verify gate for the active crop encoder (read once; see the companion note
+    // and CropEncoderFactory.verifyGate). SigLIP's compressed scale needs ~0.10, CLIP ~0.20.
+    private val verifyGate: Float = CropEncoderFactory.verifyGate
 
     // Session-generation counter: bumped SYNCHRONOUSLY (on the CALLING thread, not embedLane) at
     // the very top of every startSession(), before its reset is even posted. onFrame() captures
@@ -542,9 +542,9 @@ class MomentCapture(
                         try {
                             val regionVec = cropEncoder.encode(crop)
                             val verifyCos = cache.verify(regionVec, region.label)
-                            val verified = verifyCos >= VERIFY_COS
+                            val verified = verifyCos >= verifyGate
                             // dedup-check-style diagnostic line (PerceptionPipeline's convention) so
-                            // VERIFY_COS can be calibrated on real data at the Stage 2 gate.
+                            // the per-backend verifyGate can be calibrated on real data at Stage 2.
                             Log.i(TAG, "region: label=${region.label} verifyCos=%.3f yoloConf=%.3f -> %s"
                                 .format(verifyCos, region.conf, if (verified) "stored" else "label-dropped"))
                             store.storeRegion(regionVec, MomentPayload(

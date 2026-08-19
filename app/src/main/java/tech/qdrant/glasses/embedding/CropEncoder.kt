@@ -33,7 +33,7 @@ interface CropEncoder : AutoCloseable {
  */
 object CropEncoderFactory {
     enum class Backend { MAC_ENDPOINT, CLOUD, ON_DEVICE, QNN_B32, SIGLIP_NPU }
-    val backend = Backend.QNN_B32
+    val backend = Backend.SIGLIP_NPU
     fun create(context: Context): CropEncoder = when (backend) {
         // Wireless: reach the Mac on its LAN IP; wired: localhost via adb reverse. One constant.
         Backend.MAC_ENDPOINT -> MacEndpointEncoder(baseUrl = tech.qdrant.glasses.Config.MAC_BASE_URL)
@@ -73,9 +73,34 @@ object CropEncoderFactory {
         Backend.ON_DEVICE -> 0.25f
         // ViT-B/32 W8A16 — uncalibrated on real crops; reuse the ON_DEVICE midpoint as a start.
         Backend.QNN_B32 -> 0.25f
-        // SigLIP2 on-device: present ~0.12 / absent-floor ~0.069 (A4 rehearsal) → 0.09 midpoint;
-        // recalibrate from a live on-device rehearsal (integration Task 5).
-        Backend.SIGLIP_NPU -> 0.09f
+        // SigLIP2 on-device — CALIBRATED (CropEncoderAbTest, Task 5): present-query top-1 cosines
+        // 0.064–0.119, absent distractors 0.049 (dog) / 0.080 (laptop). 0.09 dropped 7/12 present;
+        // 0.085 keeps the stronger 7/12 while rejecting both distractors. Bands OVERLAP (SigLIP's
+        // compressed scale) and N is small — a bigger distractor set would firm this.
+        Backend.SIGLIP_NPU -> 0.085f
         Backend.CLOUD -> 0.12f
+    }
+
+    /**
+     * Minimum cosine for a region's crop-embedding against its YOLO label's TEXT vector to KEEP the
+     * label as a display tag (MomentCapture's capture-time verify). Same text→image modality gap as
+     * [searchGate], so it is per-backend on the SAME compressed/uncompressed scale — a CLIP-scale
+     * gate silently drops EVERY SigLIP region's label (SigLIP present-object cosines are ~0.11, not
+     * ~0.26). Below this the region vector is still stored (a valid recall signal); only the label
+     * is dropped. CALIBRATED on-device (CropEncoderAbTest, 14 labeled crops, Task 5):
+     *  - QNN_B32 / ON_DEVICE (CLIP-scale): 0.20 — correct-label cosines 0.208–0.267 (min 0.208), so
+     *    0.20 keeps them; CLIP's own value, unchanged.
+     *  - SIGLIP_NPU / MAC_ENDPOINT (SigLIP2, compressed scale): 0.06. SigLIP correct-label cosines are
+     *    only 0.059–0.098 (mean 0.084) — an earlier 0.10 guess dropped EVERY real label (all < 0.10),
+     *    which is exactly why on-device regions came back label-less. 0.06 keeps 13/14 correct labels.
+     *    NOTE: SigLIP's label-verify barely discriminates here (correct mean 0.084 ≈ wrong-label max-cos
+     *    mean 0.082) — a coarse "on-topic" filter, not a fine one; label quality really comes from YOLO.
+     */
+    val verifyGate: Float get() = when (backend) {
+        Backend.MAC_ENDPOINT -> 0.06f
+        Backend.ON_DEVICE -> 0.20f
+        Backend.QNN_B32 -> 0.20f
+        Backend.SIGLIP_NPU -> 0.06f
+        Backend.CLOUD -> 0.20f
     }
 }

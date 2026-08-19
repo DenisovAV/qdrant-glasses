@@ -58,16 +58,14 @@ class SiglipTextEncoder(context: Context) : TextEncoder {
 
         latencyFile.appendText("=== siglip text session ${System.currentTimeMillis()} CPU(int8) ===\n")
         val t1 = System.currentTimeMillis()
-        // Memory-minimising options — this model is 269MB (69% is the 256k-token embedding table) and
-        // the full SIGLIP_NPU app (this + the 96MB NPU vision + camera + store) OOM/reboots the AR1 at
-        // startup. Default ORT over-reserves: the CPU arena grabs big blocks up front, mem-pattern
-        // pre-plans activation buffers, and weight pre-packing duplicates weights into a packed layout.
-        // Turn all three off — none change the vectors, they only cut peak resident RAM.
-        val opts = OrtSession.SessionOptions().apply {
-            setCPUArenaAllocator(false)            // allocate on demand, no big arena reservation
-            setMemoryPatternOptimization(false)    // don't pre-plan/pre-allocate activation memory
-            addConfigEntry("session.disable_prepacking", "1")  // don't duplicate weights in a packed layout
-        }
+        // Default ORT session options (CPU arena on, mem-pattern on, weight pre-packing on). An earlier
+        // version turned all three OFF to cut peak RAM, believing the full SIGLIP_NPU app OOM/rebooted the
+        // AR1 at startup — that was a MISDIAGNOSIS (measured on a clean device: lowmemorykiller reports
+        // "watermarks ok", zero memory pressure; the reboots were the AR1's own spontaneous reboot + a
+        // post-reboot camera-HAL wedge, see qdrant_glasses_private/a4-siglip-eval/FINDINGS.md Part
+        // 8-retracted). Pre-packing matters here: it speeds this model's int8 matmuls, and text runs on
+        // the once-per-query search path — and there is RAM headroom (steady-state ~668MB of ~2.4GB).
+        val opts = OrtSession.SessionOptions()
         session = env.createSession(extractAsset(context, MODEL_ASSET).absolutePath, opts)
         Log.i(TAG, "SigLIP-text ORT CPU session created in ${System.currentTimeMillis() - t1}ms")
     }

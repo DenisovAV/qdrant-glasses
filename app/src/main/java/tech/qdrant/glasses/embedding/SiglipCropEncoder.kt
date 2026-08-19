@@ -24,20 +24,23 @@ import android.graphics.Bitmap
 class SiglipCropEncoder(context: Context) : CropEncoder {
     override val dim: Int = 768
 
-    // SigLIP2's text→image cosine band on-device is compressed and shifted vs CLIP's — measured from
-    // the 14-crop A4 rehearsal: a query naming a PRESENT object scores ~0.12, an ABSENT object floors
-    // at ~0.069. 0.09 is the midpoint of that gap; recalibrate against a live on-device rehearsal
-    // (integration Task 5) before trusting search precision — this is a starting value, not final.
-    override val visionMinScore: Float = 0.09f
+    // Search-hit gate (feeds MomentRetriever via GlassesComponents). SigLIP2's text→image cosine band
+    // is compressed vs CLIP's. CALIBRATED on-device (CropEncoderAbTest, Task 5): present-query top-1
+    // cosines 0.064–0.119, absent distractors 0.049–0.080. 0.085 rejects both distractors and keeps the
+    // stronger 7/12 present; the bands OVERLAP so this trades some recall for precision. Kept in sync
+    // with CropEncoderFactory.searchGate (SIGLIP_NPU). A bigger distractor set would firm it.
+    override val visionMinScore: Float = 0.085f
 
-    // BOTH towers load EAGERLY here (in the ctor). Loading them at the SAME instant as the camera
-    // startup inrush + the detector spikes DSP+CPU+power together and reboots the AR1 — even though the
-    // encoders' STEADY-STATE is only ~668 MB and fits the ~2.4 GB budget fine (measured, SiglipMemoryTest).
-    // The fix is SEQUENCING, done at the app level: GlassesComponents.load (which constructs this encoder)
-    // runs to completion — loading both towers — BEFORE MainActivity starts the camera (it gates
-    // cameraManager.start() on the app leaving AppState.Loading). So both loads finish while the camera is
-    // still OFF; the two peaks never overlap. Do NOT reintroduce a lazy/deferred text load here — that put
-    // the text spike back in overlap with the running camera and still rebooted.
+    // BOTH towers load EAGERLY here (in the ctor) — and that is fine. Measured on a cleanly-rebooted
+    // AR1: switching the live backend to SIGLIP_NPU loads both towers (text ~10s: DJL tokenizer ~7s +
+    // ORT session ~3s), reaches AppState.Idle, runs steady-state (vision ~82–113ms/crop NPU, text
+    // ~600–780ms CPU) with the camera attached, and lowmemorykiller reports "watermarks ok" — ZERO
+    // memory pressure. Steady-state is ~668 MB, well under the ~2.4 GB budget. The 269 MB text tower
+    // does NOT OOM. An earlier note here claimed the simultaneous load "reboots the AR1" and required
+    // gating the camera on AppState.Loading — that was a MISDIAGNOSIS: the AR1 reboots spontaneously on
+    // its own (seen on a pure-CLIP build at 96% battery), and after ANY reboot the CameraX HAL wedges
+    // (blank preview), which read as a SigLIP crash. No eager-load sequencing is needed; the camera-gate
+    // was reverted (0ffa860). Evidence: qdrant_glasses_private/a4-siglip-eval/FINDINGS.md Part 8-retracted.
     private val vision = SiglipVisionEncoder(context)
     private val text = SiglipTextEncoder(context)
 
