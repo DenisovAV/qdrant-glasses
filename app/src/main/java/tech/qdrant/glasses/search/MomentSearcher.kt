@@ -2,6 +2,7 @@ package tech.qdrant.glasses.search
 
 import android.util.Log
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.storage.MemoryFrame
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentStore
@@ -46,18 +47,15 @@ class MomentSearcher(
         private const val RECALL_FETCH_K = 25
 
         /**
-         * Per-channel score gate for whole-frame moment search. CALIBRATED from an on-device
-         * rehearsal (Spec §7/§8 unknown #7): the CLIP modality gap is real at this scale — whole-
-         * frame top cosines for a query naming a PRESENT object ran 0.26–0.29 (laptop 0.29, phone
-         * 0.28, cup/keyboard/chair 0.26), but an ABSENT object's query landed at 0.236–0.246
-         * (elephant 0.236, banana 0.241, pizza/umbrella 0.246) — indistinguishable from a WEAK
-         * present-object hit (person/book 0.239). The old 0.20 gate passed EVERY absent-object
-         * query as a "hit". 0.25 is precision-first: it clears the observed junk floor (~0.246)
-         * while every strong present object still survives; a weak/broad present object that now
-         * misses this gate is recovered by an exact VERIFIED-tag match instead (see the
-         * tag-accept filter in [search] / [tagAcceptedMomentIds]), not by loosening the vector gate.
+         * The whole-frame moment-search score gate is PER-BACKEND — [CropEncoderFactory.searchGate]
+         * — because the text→image cosine scale differs by encoder (modality gap). CLIP (QNN_B32):
+         * 0.25, calibrated from an on-device rehearsal — present-object queries ran 0.26–0.29, the
+         * absent junk floor ~0.246, so 0.25 is precision-first. SigLIP2 (SIGLIP_NPU): 0.085 — its
+         * scale is ~3× more compressed (measured on-device: present ~0.11, absent ~0.069), so the
+         * CLIP 0.25 left EVERY SigLIP moment below the gate and search worked by verified-tag match
+         * ONLY. A weak/broad present object that still misses the gate is recovered by an exact
+         * VERIFIED-tag match (the tag-accept filter in [search] / [tagAcceptedMomentIds]).
          */
-        private const val MOMENT_SEARCH_GATE = 0.25f
     }
 
     /** Runs on: inferLane. */
@@ -126,7 +124,7 @@ class MomentSearcher(
             Log.e(TAG, "moment store search failed", e)
             return ObjectSearcher.Outcome.Unavailable
         }
-        // MOMENT_SEARCH_GATE's raised 0.25 is precision-first against the whole-frame junk floor,
+        // The per-backend search gate is precision-first against the whole-frame junk floor,
         // but it can also drop a moment whose region label we ALREADY verified at capture time,
         // just because that moment's fused vector score happens to miss the gate (broad categories
         // like "person" verify at 0.21–0.23, per VERIFY_COS's KDoc — nowhere near guaranteed to
@@ -135,10 +133,11 @@ class MomentSearcher(
         // above) — mirrors the retired ObjectSearcher's gate-OR-labelMatch, but sourced from
         // CLIP-verified region labels, not YOLO's raw output, so it can't be polluted by a raw
         // mislabel the way ObjectSearcher's version could.
-        val hits = allHits.filter { it.score >= MOMENT_SEARCH_GATE || it.momentId in tagAcceptedIds }
+        val gate = CropEncoderFactory.searchGate
+        val hits = allHits.filter { it.score >= gate || it.momentId in tagAcceptedIds }
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +
-            "hits=${hits.size}/${allHits.size} gate=$MOMENT_SEARCH_GATE tagAccepted=${tagAcceptedIds.size} " +
+            "hits=${hits.size}/${allHits.size} gate=$gate tagAccepted=${tagAcceptedIds.size} " +
             "top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
