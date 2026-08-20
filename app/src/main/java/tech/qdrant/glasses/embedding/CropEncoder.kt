@@ -103,4 +103,26 @@ object CropEncoderFactory {
         Backend.SIGLIP_NPU -> 0.06f
         Backend.CLOUD -> 0.20f
     }
+
+    /**
+     * Whole-frame scene-dedup cosine for MomentCapture's semantic confirm — a candidate keyframe with
+     * cosine >= this to the last stored keyframe is "not a new scene" and is SKIPPED. Per-backend
+     * because the whole-frame image↔image cosine scale differs by encoder. CALIBRATED on-device
+     * (CropEncoderAbTest.calibrateSceneDedup, 6 real stored keyframes):
+     *  - QNN_B32 / ON_DEVICE (CLIP-scale): 0.85 — CLIP's original value (different scenes sit well
+     *    below, same-scene above; kept).
+     *  - SIGLIP_NPU / MAC_ENDPOINT: 0.90. SigLIP whole-frame embeddings barely separate scenes —
+     *    DIFFERENT real scenes measured 0.774–0.924 (mean 0.834) while same-scene (live logs) is
+     *    0.85–0.94, so the bands OVERLAP and no threshold cleans them. 0.85 sat inside the different-
+     *    scene band and deduped genuinely-new views (too few moments captured). 0.90 lets almost all
+     *    different scenes store (only the strongest >0.90 dedup), trading a few same-scene near-dupes
+     *    for far better capture coverage. A weak discriminator — the real scene signal is region tags.
+     */
+    val sceneDedupCosine: Float get() = when (backend) {
+        Backend.MAC_ENDPOINT -> 0.90f
+        Backend.ON_DEVICE -> 0.85f
+        Backend.QNN_B32 -> 0.85f
+        Backend.SIGLIP_NPU -> 0.90f
+        Backend.CLOUD -> 0.85f
+    }
 }

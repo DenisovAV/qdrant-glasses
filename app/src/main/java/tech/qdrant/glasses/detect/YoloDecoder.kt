@@ -9,7 +9,10 @@ import android.graphics.RectF
  * to the frame, label, and NMS.
  */
 class YoloDecoder(
-    private val scoreThreshold: Float = 0.4f,
+    // 0.25 (was 0.4): 0.4 missed small/far objects entirely — a phone on a desk scored below it and
+    // never became a searchable region. 0.25 catches them; the CLIP/SigLIP label-verify (verifyGate)
+    // is the second gate that drops a genuinely-wrong low-confidence detection's label anyway.
+    private val scoreThreshold: Float = 0.25f,
     private val iouThreshold: Float = 0.45f,
 ) {
     fun decode(

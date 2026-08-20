@@ -150,6 +150,56 @@ class CropEncoderAbTest {
             wrongMax.max(), correct.min(), (wrongMax.max() + correct.min()) / 2f))
     }
 
+    /**
+     * Scene-dedup calibration (MomentCapture.CONFIRM_COSINE) for SigLIP. Encodes the REAL stored
+     * moment keyframes (`assets/scenes/`, pulled from the device — each is a DIFFERENT scene, they
+     * passed the 0.85 dedup) with on-device SigLIP whole-frame vision, then:
+     *  - DIFFERENT-scene band = pairwise cosine across the distinct keyframes (should be LOW).
+     *  - SAME-scene band = each keyframe vs a mild perturbation (crop/brightness) of itself (HIGH).
+     * CONFIRM_COSINE belongs between different-max and the real same-scene floor (~0.85 from live
+     * logs). If different-max reaches ~0.85, SigLIP whole-frames don't separate scenes → lower it.
+     * Read: `adb logcat -d -s AB_ENC:I`.
+     */
+    @Test fun calibrateSceneDedup() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val a = InstrumentationRegistry.getInstrumentation().context.assets
+        val scenes = (a.list("scenes") ?: arrayOf()).filter { it.endsWith(".jpg") }.sorted()
+        val enc = SiglipCropEncoder(ctx)
+        val bmps = scenes.associateWith { a.open("scenes/$it").use { s -> BitmapFactory.decodeStream(s) } }
+        val vecs = scenes.map { it to l2(enc.encode(bmps.getValue(it))) }
+        Log.i(TAG, "==== SCENE-DEDUP (SigLIP whole-frame, ${scenes.size} distinct stored moments) ====")
+        val diff = ArrayList<Float>()
+        for (i in vecs.indices) for (j in i + 1 until vecs.size) {
+            val c = cos(vecs[i].second, vecs[j].second); diff += c
+            Log.i(TAG, "  DIFF %s..%s = %.3f".format(vecs[i].first.drop(7).take(6), vecs[j].first.drop(7).take(6), c))
+        }
+        val same = ArrayList<Float>()
+        for ((s, v0) in vecs) for (kind in listOf("crop", "bright")) {
+            val c = cos(v0, l2(enc.encode(perturb(bmps.getValue(s), kind))))
+            same += c; Log.i(TAG, "  SAME %s/%s = %.3f".format(s.drop(7).take(6), kind, c))
+        }
+        enc.close()
+        Log.i(TAG, "SCENE-DEDUP SUMMARY: DIFFERENT[min=%.3f mean=%.3f max=%.3f] SAME-perturb[min=%.3f mean=%.3f] realSame~0.85-0.94(logs). CONFIRM_COSINE now=0.85".format(
+            diff.min(), diff.average(), diff.max(), same.min(), same.average()))
+        assertTrue("scene-dedup produced cosines", diff.isNotEmpty())
+    }
+
+    private fun perturb(b: Bitmap, kind: String): Bitmap = if (kind == "crop") {
+        val mx = (b.width * 0.06f).toInt(); val my = (b.height * 0.06f).toInt()
+        Bitmap.createBitmap(b, mx, my, b.width - 2 * mx, b.height - 2 * my)
+    } else {
+        val out = b.copy(Bitmap.Config.ARGB_8888, true)
+        val px = IntArray(out.width * out.height); out.getPixels(px, 0, out.width, 0, 0, out.width, out.height)
+        for (i in px.indices) {
+            val p = px[i]
+            val r = (((p shr 16) and 0xFF) * 1.15f).toInt().coerceAtMost(255)
+            val g = (((p shr 8) and 0xFF) * 1.15f).toInt().coerceAtMost(255)
+            val bl = ((p and 0xFF) * 1.15f).toInt().coerceAtMost(255)
+            px[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or bl
+        }
+        out.setPixels(px, 0, out.width, 0, 0, out.width, out.height); out
+    }
+
     private fun l2(v: FloatArray): FloatArray {
         var n = 0.0; for (x in v) n += (x * x).toDouble()
         val inv = if (n > 0) (1.0 / sqrt(n)).toFloat() else 0f

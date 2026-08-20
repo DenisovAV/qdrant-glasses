@@ -52,12 +52,21 @@ enum class Decision { SKIP, CAPTURE, HEARTBEAT }
 // Pixel pre-gate (Spec §4 step 2): a candidate whose 32x32 luma grid is at least this similar to
 // the LAST STORED keyframe's grid is "no visible change" -> no capture, unless a heartbeat is due.
 // Same value FrameCaptureManager used for its (now-superseded) whole-pipeline gate.
-private const val PREGATE_SIMILARITY = 0.85f
+// 0.98 (was 0.85): `sim < this -> CAPTURE`, so RAISING it lets MORE frames through, not fewer. The
+// pixel luma-grid vs the last STORED keyframe barely moves in a visually-uniform room — a whole-room
+// pan measured pregateSim 0.91–0.97, all >0.85, so every view was SKIPped before the embedding ran
+// (~1 keyframe stored). 0.98 passes anything with any real pixel change to the semantic CONFIRM
+// (sceneDedupCosine 0.90) stage — the actual scene discriminator; only a near-static frame (~0.99)
+// is pre-skipped (the 45s heartbeat still covers it). Trades a per-3s embedding for real coverage.
+private const val PREGATE_SIMILARITY = 0.98f
 
 // Minimum time between two STORES, regardless of scene change (Spec §4 step 5) — a hard flood cap
 // under heavy motion. Deliberately shorter than HEARTBEAT_MS so a heartbeat is never itself
 // throttled by the cooldown it just satisfied (see [decide]'s ordering).
-private const val CAPTURE_COOLDOWN_MS = 8000L
+// 3000 (was 8000): the cooldown is a HARD cap checked before every other gate, so at 8s an active
+// look-around the room stored only ~1 moment / 8s (a whole-room pan → ~3 keyframes). 3s gives a
+// richer memory during deliberate recording while still throttling the NPU/store on a static scene.
+private const val CAPTURE_COOLDOWN_MS = 3000L
 
 // Force a store even when the scene never visibly changes, so "what did I see N minutes ago"
 // stays answerable for a wearer standing still (Spec §4 step 5).
@@ -171,11 +180,11 @@ class MomentCapture(
         // ...at most this often, so a 30fps camera doesn't turn "sample the window" into "score
         // every single frame" (~4 samples over the 800ms window, matching the spec).
         private const val SELECT_SAMPLE_MS = 200L
-        // Semantic confirm (Spec §4 step 4): the chosen frame's CLIP cosine vs the last STORED
-        // keyframe vector must fall below this to count as a genuinely new scene. Bypassed for a
-        // HEARTBEAT decision (see confirmAndStore) — that path exists specifically to store an
-        // UNCHANGED scene, so re-gating it on cosine would defeat the heartbeat entirely.
-        private const val CONFIRM_COSINE = 0.85f
+        // Semantic confirm (Spec §4 step 4): the chosen frame's whole-frame cosine vs the last STORED
+        // keyframe must fall below the gate to count as a genuinely new scene. The gate is PER-BACKEND
+        // — see CropEncoderFactory.sceneDedupCosine — because the whole-frame image↔image cosine scale
+        // differs by encoder (SigLIP's is compressed: different scenes 0.77–0.92, so it needs 0.90 vs
+        // CLIP's 0.85). Bypassed for a HEARTBEAT decision (that path exists to store an UNCHANGED scene).
         // Grid side for BOTH the pixel pre-gate and the sharpness score — same value
         // FrameCaptureManager used for its ssimSize, and SceneDiff.downscaleLuma's default `out`.
         private const val GRID_SIDE = 32
@@ -209,6 +218,10 @@ class MomentCapture(
     // Per-backend label-verify gate for the active crop encoder (read once; see the companion note
     // and CropEncoderFactory.verifyGate). SigLIP's compressed scale needs ~0.10, CLIP ~0.20.
     private val verifyGate: Float = CropEncoderFactory.verifyGate
+
+    // Per-backend whole-frame scene-dedup cosine (read once; see CropEncoderFactory.sceneDedupCosine).
+    // SigLIP whole-frames barely separate scenes → 0.90 (vs CLIP 0.85) or genuinely-new views get deduped.
+    private val sceneDedupCosine: Float = CropEncoderFactory.sceneDedupCosine
 
     // Session-generation counter: bumped SYNCHRONOUSLY (on the CALLING thread, not embedLane) at
     // the very top of every startSession(), before its reset is even posted. onFrame() captures
@@ -379,7 +392,8 @@ class MomentCapture(
         lastCheckMs = now
         val grid = gridOf(frame)
         val decision = decide(lastStoredGrid, grid, lastStoreMs, now)
-        Log.d(TAG, "moment gate: decision=$decision")
+        val pregateSim = lastStoredGrid?.let { similarity(it, grid) } ?: -1f
+        Log.d(TAG, "moment gate: decision=$decision pregateSim=%.3f".format(pregateSim))
         when (decision) {
             Decision.SKIP -> frame.recycle()
             Decision.CAPTURE, Decision.HEARTBEAT -> {
@@ -426,9 +440,9 @@ class MomentCapture(
             // A HEARTBEAT decision exists specifically to force a store on an UNCHANGED scene
             // (Spec §4 step 5) — re-gating it on cosine here would reject it right back out and
             // defeat the entire point, so only CAPTURE goes through the confirm check.
-            if (decision == Decision.CAPTURE && prevVec != null && cos >= CONFIRM_COSINE) {
+            if (decision == Decision.CAPTURE && prevVec != null && cos >= sceneDedupCosine) {
                 Log.i(TAG, "moment confirm: not a new scene (cos=%.3f >= %.2f) — skip store"
-                    .format(cos, CONFIRM_COSINE))
+                    .format(cos, sceneDedupCosine))
                 return
             }
 
