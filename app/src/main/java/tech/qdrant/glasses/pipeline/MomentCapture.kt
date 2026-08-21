@@ -6,9 +6,11 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
+import tech.qdrant.glasses.ocr.OcrEngine
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
@@ -136,6 +138,12 @@ class MomentCapture(
     // regions matter; the nullability exists so a bare MomentCapture (unit tests, a hypothetical
     // frame-only deployment) needs no cache just to store keyframes.
     private val labelCache: LabelVectorCache? = null,
+    // Stage 3 "OCR read channel" (additive, like [labelCache]/the region layer): both null disables
+    // OCR entirely — no assets, no BGE model load required. GlassesComponents only builds a non-null
+    // pair when `ocr/` assets provisioned cleanly, so a device missing them still runs frame+region
+    // capture exactly as before Stage 3 (same nullable-optional-feature contract as [labelCache]).
+    private val ocrEngine: OcrEngine? = null,
+    private val bgeEncoder: BgeTextEncoder? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -529,6 +537,74 @@ class MomentCapture(
                 ))
             } catch (e: Throwable) {
                 Log.w(TAG, "moment stored (id=$id) but onMoment callback failed: ${e.message}")
+            }
+
+            // OCR "read channel" (Stage 3, additive): recognize any text lines in the SAME keyframe
+            // pixels just stored above, embed each line's text with BGE into the 384-dim `text`
+            // named-vector space, and store as `type=ocr` points sharing this moment's id. The frame
+            // moment is ALREADY durable at this point (id/thumbPath persisted, baseline advanced
+            // above), so — same contract as the region layer right below — a failure here is only
+            // ever logged, never allowed to look like a frame-store failure. Takes its OWN bitmap
+            // copy (not the region layer's `crop`s) because `bitmap` is unconditionally recycled by
+            // the outer `finally` the instant this whole method returns, and OCR runs as a
+            // SEPARATELY launched coroutine on [embedLane] (queued behind whatever's already pending,
+            // not run inline) so it never extends the critical path that just stored the frame. id/ts/
+            // episodeId are captured into locals before the launch — not read again once the
+            // coroutine actually runs — so a startSession() reset racing in behind this launch can't
+            // attribute the OCR points to the wrong session.
+            val ocr = ocrEngine
+            val bge = bgeEncoder
+            if (ocr != null && bge != null) {
+                val ocrMomentId = id
+                val ocrTs = ts
+                val ocrEpisodeId = episodeId
+                val ocrBitmap = try {
+                    bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "moment $id: ocr bitmap copy failed: ${e.message}")
+                    null
+                }
+                if (ocrBitmap != null) {
+                    val w = bitmap.width.toFloat()
+                    val h = bitmap.height.toFloat()
+                    scope.launch(embedLane) {
+                        try {
+                            val lines = ocr.recognize(ocrBitmap)
+                            var stored = 0
+                            for (line in lines) {
+                                if (line.text.isBlank()) continue
+                                val vec = bge.encode(line.text)
+                                store.storeOcr(vec, MomentPayload(
+                                    type = MomentType.OCR,
+                                    momentId = ocrMomentId,
+                                    episodeId = ocrEpisodeId,
+                                    timestampMs = ocrTs,
+                                    tEndMs = ocrTs,
+                                    // No thumb of its own — an OCR hit is folded into an existing
+                                    // frame/region hit by momentId at search time (MomentSearcher),
+                                    // never displayed as its own HUD card, so it needs no thumbPath.
+                                    thumbPath = "",
+                                    // Same normalized-fraction convention as the region layer's bbox
+                                    // just below (OcrLine.box is in ORIGINAL-image pixel coords).
+                                    bbox = "%.3f,%.3f,%.3f,%.3f".format(
+                                        line.box.left / w, line.box.top / h,
+                                        line.box.right / w, line.box.bottom / h,
+                                    ),
+                                    label = "",
+                                    yoloConf = 0f,
+                                    verifyCos = 0f,
+                                    text = line.text,
+                                ))
+                                stored++
+                            }
+                            Log.i(TAG, "ocr: momentId=$ocrMomentId lines=${lines.size} stored=$stored")
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "moment $ocrMomentId: ocr failed: ${e.message}")
+                        } finally {
+                            ocrBitmap.recycle()
+                        }
+                    }
+                }
             }
 
             // Region layer (Task 2.2, Spec §2 "CLIP-verify-the-label"): CLIP-verified YOLO

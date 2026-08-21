@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.search
 
 import android.util.Log
+import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.storage.MemoryFrame
@@ -38,6 +39,13 @@ class MomentSearcher(
     private val cropEncoder: CropEncoder,
     private val store: MomentStore,
     private val hud: HudPublisher,
+    // Stage 3 "OCR read channel": null disables the text-search fan-out entirely (mirrors
+    // MomentCapture's ocrEngine/bgeEncoder nullable-optional-feature contract) — GlassesViewModel
+    // only passes a non-null encoder when GlassesComponents.load() built one. Note this is the SAME
+    // BgeTextEncoder instance MomentCapture uses to write the `ocr` channel — searching with a
+    // different encoder instance would still work (it's a fixed pretrained model, not fine-tuned
+    // per-session) but there is exactly one instance in the app either way (GlassesComponents.bgeEncoder).
+    private val bgeEncoder: BgeTextEncoder? = null,
 ) {
     companion object {
         private const val TAG = "GlassesVM"
@@ -45,6 +53,15 @@ class MomentSearcher(
         /** Same widened-pool rationale as [ObjectSearcher]'s RECALL_FETCH_K: a recall-intent
          *  query's true most-recent sighting may not be a top-5 cosine hit. */
         private const val RECALL_FETCH_K = 25
+
+        // BGE cosine gate for the OCR "read channel" (Stage 3) — a DIFFERENT scale than
+        // CropEncoderFactory.searchGate (BGE sentence embeddings, not CLIP/SigLIP image-text), so
+        // this is its own constant, not reused from there. A real text match (query text actually
+        // appears in a recognized OCR line) should score high on BGE's own scale; 0.5 is an
+        // UNCALIBRATED starting value — TODO: calibrate on-device against real OCR'd text once
+        // Stage 3 has been exercised on the glasses (same "starting value pending calibration"
+        // status as CONFIRM_COSINE/VERIFY_COS/searchGate/TAG_BOOST_LAMBDA elsewhere in this plan).
+        private const val OCR_GATE = 0.5f
 
         /**
          * The whole-frame moment-search score gate is PER-BACKEND — [CropEncoderFactory.searchGate]
@@ -124,6 +141,29 @@ class MomentSearcher(
             Log.e(TAG, "moment store search failed", e)
             return ObjectSearcher.Outcome.Unavailable
         }
+        // Stage 3 "OCR read channel": a SEPARATE search — OCR hits live in the BGE 384-dim `text`
+        // space, not the crop encoder's `clip` space [allHits] above is scored in, so they can NOT
+        // be folded into fuseAndCollapse's client-side max (different scale entirely). Treated like
+        // [tagAcceptedIds] instead: collect the momentIds of OCR hits whose score clears [OCR_GATE]
+        // and OR-accept those into the final gate below. Additive + optional (mirrors
+        // MomentCapture's ocrEngine/bgeEncoder nullable contract on the write side) — a null
+        // [bgeEncoder] or an embed/store failure here must never fail the whole voice query, so this
+        // gets its OWN try/catch that falls back to an empty set rather than Unavailable.
+        val ocrAcceptedIds = try {
+            val bge = bgeEncoder
+            if (bge != null) {
+                val bgeVec = bge.encode(pq.embedText)
+                val ocrHits = store.searchText(
+                    bgeVec, topK = fetchK, sinceMs = pq.window?.sinceMs, untilMs = pq.window?.untilMs,
+                )
+                ocrHits.filter { it.score >= OCR_GATE }.mapTo(mutableSetOf()) { it.momentId }
+            } else {
+                emptySet()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "moment ocr search failed (non-fatal): ${e.message}")
+            emptySet()
+        }
         // The per-backend search gate is precision-first against the whole-frame junk floor,
         // but it can also drop a moment whose region label we ALREADY verified at capture time,
         // just because that moment's fused vector score happens to miss the gate (broad categories
@@ -134,11 +174,13 @@ class MomentSearcher(
         // CLIP-verified region labels, not YOLO's raw output, so it can't be polluted by a raw
         // mislabel the way ObjectSearcher's version could.
         val gate = CropEncoderFactory.searchGate
-        val hits = allHits.filter { it.score >= gate || it.momentId in tagAcceptedIds }
+        val hits = allHits.filter {
+            it.score >= gate || it.momentId in tagAcceptedIds || it.momentId in ocrAcceptedIds
+        }
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +
             "hits=${hits.size}/${allHits.size} gate=$gate tagAccepted=${tagAcceptedIds.size} " +
-            "top=${allHits.firstOrNull()?.score}")
+            "ocrAccepted=${ocrAcceptedIds.size} top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
         // Both branches keep the established top-5 contract: recall re-sorts by recency then trims;

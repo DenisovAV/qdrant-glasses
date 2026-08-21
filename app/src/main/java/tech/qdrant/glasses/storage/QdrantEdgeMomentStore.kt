@@ -142,23 +142,47 @@ class QdrantEdgeMomentStore(
         id
     }
 
+    override fun storeOcr(textVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
+        require(textVec.size == TEXT_DIM) { "dim ${textVec.size} != $TEXT_DIM" }
+        require(payload.momentId.isNotBlank()) {
+            "storeOcr requires payload.momentId = the parent frame's id (same convention as storeRegion)"
+        }
+        val id = UUID.randomUUID().toString()
+        val stamped = payload.copy(type = MomentType.OCR)
+        val named = Vector.Named(mapOf(TEXT_FIELD to NamedVector.Dense(textVec.toList())))
+        shard.update(UpdateOperation.upsertPoints(listOf(
+            Point(id = PointId.Uuid(id), vector = named, payload = stamped.toJson())
+        )))
+        shard.flush()
+        Log.d(TAG, "storeOcr: id=$id momentId=${payload.momentId} text=\"${payload.text}\"")
+        id
+    }
+
     override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
-        channelSearch(MomentType.FRAME, qvec, topK, sinceMs, untilMs)
+        channelSearch(MomentType.FRAME, CLIP_FIELD, clipDim, qvec, topK, sinceMs, untilMs)
 
     override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
-        channelSearch(MomentType.REGION, qvec, topK, sinceMs, untilMs)
+        channelSearch(MomentType.REGION, CLIP_FIELD, clipDim, qvec, topK, sinceMs, untilMs)
 
+    override fun searchText(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> =
+        channelSearch(MomentType.OCR, TEXT_FIELD, TEXT_DIM, qvec, topK, sinceMs, untilMs)
+
+    // Parameterized over the named-vector field + its dim (Stage 3: the `ocr` channel lives in the
+    // BGE `text` 384-dim space, not the crop encoder's `clip` space) so searchFrames/searchRegions/
+    // searchText share one query shape instead of three near-identical copies.
     private fun channelSearch(
         typeValue: String,
+        field: String,
+        dim: Int,
         qvec: FloatArray,
         topK: Int,
         sinceMs: Long?,
         untilMs: Long?,
     ): List<MomentHit> = synchronized(lock) {
-        require(qvec.size == clipDim) { "dim ${qvec.size} != $clipDim" }
+        require(qvec.size == dim) { "dim ${qvec.size} != $dim" }
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = qvec.toList(), using = CLIP_FIELD)),
+            query = ScoringQuery.Vector(Query.Nearest(vector = qvec.toList(), using = field)),
             prefetches = emptyList(),
             withVector = null, withPayload = WithPayload.Bool(true),
             filter = typeAndTimeFilter(typeValue, sinceMs, untilMs),
@@ -314,6 +338,9 @@ class QdrantEdgeMomentStore(
             // 0f", same as [label]/[bbox] above are already mapped straight through regardless of type.
             yoloConf = p.yoloConf,
             verifyCos = p.verifyCos,
+            // Stage 3: only a `type=ocr` payload ever has a non-empty text — frame/region points
+            // stamp "" at capture time, so this mapping is unconditional like label/bbox above.
+            text = p.text,
         )
     }
 }

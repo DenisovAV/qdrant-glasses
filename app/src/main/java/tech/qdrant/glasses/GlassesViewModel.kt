@@ -167,7 +167,9 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     perception = localPerception
                     if (Config.MOMENT_MEMORY) {
-                        momentSearcher = tech.qdrant.glasses.search.MomentSearcher(c.cropEncoder!!, c.momentStore!!, hud)
+                        momentSearcher = tech.qdrant.glasses.search.MomentSearcher(
+                            c.cropEncoder!!, c.momentStore!!, hud, bgeEncoder = c.bgeEncoder,
+                        )
                     }
                     // momentStore is async-loaded (~10s); a HUD that connected before now got an
                     // empty timeline. Task 1.6: backfill it from MomentStore.timeline() (already

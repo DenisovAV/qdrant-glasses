@@ -42,8 +42,14 @@ class MomentSearcherTest {
         var lastWindowUntil: Long? = null; private set
         override fun storeMoment(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun storeRegion(clipVec: FloatArray, payload: MomentPayload) = error("not used")
+        override fun storeOcr(textVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = frameHits
         override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = regionHits
+        // Stage 3 OCR channel — MomentSearcherTest never wires a bgeEncoder into MomentSearcher, so
+        // this branch is never reached; kept as `error()` like the other unused write-path methods
+        // above so a future test that DOES wire OCR search finds out immediately if it forgets to
+        // stub this.
+        override fun searchText(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = error("not used")
         override fun timeline(limit: Int): List<MomentHit> = emptyList()
         override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> {
             lastWindowSince = sinceMs; lastWindowUntil = untilMs

@@ -12,6 +12,7 @@ import org.json.JSONObject
 object MomentType {
     const val FRAME = "frame"
     const val REGION = "region"
+    const val OCR = "ocr"
 }
 
 /**
@@ -35,6 +36,9 @@ data class MomentHit(
     val bbox: String,
     val yoloConf: Float = 0f,
     val verifyCos: Float = 0f,
+    // Stage 3 (OCR read channel): the recognized line's text, non-empty only on a `type=ocr` hit.
+    // Defaults to "" so every pre-Stage-3 named-arg MomentHit construction site keeps compiling.
+    val text: String = "",
 )
 
 /**
@@ -117,6 +121,10 @@ interface MomentStore : AutoCloseable {
     /** Upsert one region point (a CLIP-verified YOLO box within an already-stored moment). → id. */
     fun storeRegion(clipVec: FloatArray, payload: MomentPayload): String
 
+    /** Upsert one OCR text-line point (Stage 3, "read channel") — [textVec] lives in the BGE
+     *  384-dim `text` named-vector space, NOT the crop encoder's `clip` space. → id. */
+    fun storeOcr(textVec: FloatArray, payload: MomentPayload): String
+
     /** k-nearest among `type=frame` points only, optionally restricted to `timestamp_ms` in
      *  [sinceMs, untilMs] (either bound null = open) — the primary "real memory" recall path. */
     fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit>
@@ -124,6 +132,10 @@ interface MomentStore : AutoCloseable {
     /** k-nearest among `type=region` points only, same time-window semantics as [searchFrames] —
      *  the small-object recall path (Task 2.3 fuses this with [searchFrames] by parent [MomentHit.momentId]). */
     fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit>
+
+    /** k-nearest among `type=ocr` points only (Stage 3) — [qvec] MUST be a BGE 384-dim query
+     *  embedding, same time-window semantics as [searchFrames]. */
+    fun searchText(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit>
 
     /** The most-recent [limit] stored `type=frame` moments, oldest-first (payload only, no
      *  vectors) — rebuilds the HUD timeline rail on connect, mirroring [VectorStore.all]. NOT

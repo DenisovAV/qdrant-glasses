@@ -14,6 +14,7 @@ import tech.qdrant.glasses.embedding.EncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
+import tech.qdrant.glasses.ocr.OcrEngine
 import tech.qdrant.glasses.pipeline.MomentCapture
 import tech.qdrant.glasses.search.MomentRetriever
 import tech.qdrant.glasses.search.SherpaVadAsr
@@ -49,6 +50,10 @@ class GlassesComponents(
     // mode/opt-out, never by timing", same rule [retriever] above already follows.
     val momentStore: MomentStore?,
     val momentCapture: MomentCapture?,
+    // Stage 3 "OCR read channel" — null whenever momentCapture is (never active without the moment
+    // pipeline; see [load]'s MOMENT_MEMORY gate), OR when `ocr/` assets are missing/fail to load
+    // (guarded independently — a missing OCR model must not fail the whole app boot).
+    val ocrEngine: OcrEngine?,
 ) : AutoCloseable {
 
     companion object {
@@ -111,6 +116,7 @@ class GlassesComponents(
             var retriever: MomentRetriever? = null
             var momentStore: MomentStore? = null
             var momentCapture: MomentCapture? = null
+            var ocrEngine: OcrEngine? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 tracker = ObjectTracker(confirmSightings = 3)
@@ -146,6 +152,18 @@ class GlassesComponents(
                         dim = cropEncoder.dim,
                         persistFile = File(app.filesDir, "label_vectors_${CropEncoderFactory.namespace}.tsv"),
                     )
+                    // Stage 3 "OCR read channel": constructed once, alongside momentCapture, so it is
+                    // reused (not per-frame) exactly like cropEncoder/labelCache above. Guarded on
+                    // its OWN try/catch — a device missing `assets/ocr/` (or any other load failure)
+                    // must not fail the whole app boot the way a missing crop-encoder asset would;
+                    // it just means Stage 3 stays off (MomentCapture treats a null ocrEngine as
+                    // "OCR disabled", same nullable-optional-feature contract as labelCache).
+                    ocrEngine = try {
+                        OcrEngine(app).also { Log.d(TAG, "load: ocr engine OK") }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "load: ocr engine unavailable, Stage 3 disabled: ${e.message}")
+                        null
+                    }
                     momentCapture = MomentCapture(
                         scope = scope,
                         embedLane = embedLane,
@@ -154,6 +172,8 @@ class GlassesComponents(
                         momentThumbsDir = thumbsDir,
                         isRecording = isRecording,
                         labelCache = labelCache,
+                        ocrEngine = ocrEngine,
+                        bgeEncoder = bgeEncoder,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
                         // thumb for /thumb/<key> BEFORE pushing the event. On the WIRED path
@@ -209,6 +229,7 @@ class GlassesComponents(
                 retriever = retriever,
                 momentStore = momentStore,
                 momentCapture = momentCapture,
+                ocrEngine = ocrEngine,
             )
         }
     }
@@ -226,5 +247,6 @@ class GlassesComponents(
         detector?.close()
         cropEncoder?.close()
         momentStore?.close()
+        ocrEngine?.close()
     }
 }
