@@ -54,6 +54,9 @@ class GlassesComponents(
     // pipeline; see [load]'s MOMENT_MEMORY gate), OR when `ocr/` assets are missing/fail to load
     // (guarded independently — a missing OCR model must not fail the whole app boot).
     val ocrEngine: OcrEngine?,
+    // Stage 3 live text-region highlighting: DBNet on the NPU, run per detect-frame by
+    // PerceptionPipeline (guarded independently — a missing EPContext model must not fail boot).
+    val dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector?,
 ) : AutoCloseable {
 
     companion object {
@@ -117,8 +120,16 @@ class GlassesComponents(
             var momentStore: MomentStore? = null
             var momentCapture: MomentCapture? = null
             var ocrEngine: OcrEngine? = null
+            var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
+                // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
+                // `assets/ocr/dbnet-det-epctx.onnx` just leaves text-highlighting off, no boot failure.
+                dbnetDetector = try {
+                    tech.qdrant.glasses.ocr.QnnDbnetDetector(app).also { Log.d(TAG, "load: DBNet-QNN OK") }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "load: DBNet-QNN unavailable, text-highlight off: ${e.message}"); null
+                }
                 tracker = ObjectTracker(confirmSightings = 3)
                 cropEncoder = CropEncoderFactory.create(app)
                 // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
@@ -230,6 +241,7 @@ class GlassesComponents(
                 momentStore = momentStore,
                 momentCapture = momentCapture,
                 ocrEngine = ocrEngine,
+                dbnetDetector = dbnetDetector,
             )
         }
     }
@@ -245,6 +257,7 @@ class GlassesComponents(
         bgeEncoder.close()
         store.close()
         detector?.close()
+        dbnetDetector?.close()
         cropEncoder?.close()
         momentStore?.close()
         ocrEngine?.close()

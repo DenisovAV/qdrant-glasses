@@ -126,6 +126,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                         viewModelScope, inferLane, c.detector!!, c.tracker!!, hud,
                         isRecording = { session.isRecording },
                         momentCapture = c.momentCapture,
+                        dbnetDetector = c.dbnetDetector,
                     )
                     // Task 2.2: wire MomentCapture's region source to PerceptionPipeline's confirmed-
                     // tracks snapshot ONLY NOW — not inside GlassesComponents.load(), where
