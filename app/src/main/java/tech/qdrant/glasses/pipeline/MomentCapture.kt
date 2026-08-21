@@ -231,6 +231,13 @@ class MomentCapture(
     // SigLIP whole-frames barely separate scenes → 0.90 (vs CLIP 0.85) or genuinely-new views get deduped.
     private val sceneDedupCosine: Float = CropEncoderFactory.sceneDedupCosine
 
+    // DEDICATED lane for background OCR (Stage 3). OCR is ~4s/keyframe on the CPU (DBNet@1536 +
+    // per-line CRNN); running it on [embedLane] would block the NEXT keyframe's embed for those ~4s
+    // and throttle capture. Its OWN single-thread dispatcher runs it IN PARALLEL with embedLane (the
+    // OcrEngine's ORT sessions are still serialized to one thread, since limitedParallelism(1)).
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val ocrLane = kotlinx.coroutines.Dispatchers.Default.limitedParallelism(1)
+
     // Session-generation counter: bumped SYNCHRONOUSLY (on the CALLING thread, not embedLane) at
     // the very top of every startSession(), before its reset is even posted. onFrame() captures
     // the generation at dispatch time and threads it through to process(), which discards
@@ -547,8 +554,9 @@ class MomentCapture(
             // ever logged, never allowed to look like a frame-store failure. Takes its OWN bitmap
             // copy (not the region layer's `crop`s) because `bitmap` is unconditionally recycled by
             // the outer `finally` the instant this whole method returns, and OCR runs as a
-            // SEPARATELY launched coroutine on [embedLane] (queued behind whatever's already pending,
-            // not run inline) so it never extends the critical path that just stored the frame. id/ts/
+            // SEPARATELY launched coroutine on the dedicated [ocrLane] (NOT embedLane — a ~4s OCR must
+            // not block the next keyframe's embed) so it never extends the critical path that just
+            // stored the frame, and runs in parallel with capture. id/ts/
             // episodeId are captured into locals before the launch — not read again once the
             // coroutine actually runs — so a startSession() reset racing in behind this launch can't
             // attribute the OCR points to the wrong session.
@@ -567,7 +575,7 @@ class MomentCapture(
                 if (ocrBitmap != null) {
                     val w = bitmap.width.toFloat()
                     val h = bitmap.height.toFloat()
-                    scope.launch(embedLane) {
+                    scope.launch(ocrLane) {
                         try {
                             val lines = ocr.recognize(ocrBitmap)
                             var stored = 0
