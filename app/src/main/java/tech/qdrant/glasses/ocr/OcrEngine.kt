@@ -13,33 +13,45 @@ import java.nio.FloatBuffer
 data class OcrLine(val text: String, val box: RectF, val conf: Float)
 
 /**
- * On-device OCR "read" channel (Stage 3) — PP-OCRv3-mobile via ONNX Runtime, fully local (no relay,
- * no Play Services). Two stages, mirroring the proven [tech.qdrant.glasses.embedding] encoders:
- *  - DET (DBNet, `ocr/ch_PP-OCRv3_det_infer.onnx`): whole frame → per-pixel text-probability map.
- *    Horizontal-projection line segmentation turns that into line boxes. This stage is the "is there
- *    text?" gate — zero boxes ⇒ no recognition runs. (Feasible on the Hexagon HTP at ~10.6ms — see
- *    the DBNet-on-NPU spike — but this class runs it on the CPU; the NPU path is a later optimization.)
- *  - REC (CRNN, `ocr/ch_PP-OCRv3_rec_infer.onnx`): each line crop → per-timestep char logits →
- *    CTC-decoded against `ocr/ppocr_keys.txt` (6625 entries, index→char, 0=blank, last=space).
+ * On-device OCR "read" channel (Stage 3) — fully local (no relay, no Play Services). Detect text lines,
+ * recognize each. Two interchangeable backends behind one [recognize]:
+ *  - **NPU** (when [dbnet] + [vitstr] are supplied): [QnnDbnetDetector] (DBNet int8, ~10ms) locates
+ *    text-line boxes on the Hexagon HTP, [QnnVitstrRecognizer] (ViTSTR W8A16, ~24ms/line) reads each —
+ *    the WHOLE OCR on the NPU. This is the default when the EPContext assets are present.
+ *  - **CPU fallback** (no NPU args): PP-OCRv3-mobile via ORT — DET (DBNet `ocr/ch_PP-OCRv3_det_infer.onnx`)
+ *    → horizontal-projection line boxes, REC (CRNN `ocr/ch_PP-OCRv3_rec_infer.onnx`) → CTC against
+ *    `ocr/ppocr_keys.txt`. Accurate on tiny/far text (det@1536) but ~4s/frame. The CRNN's LSTM can't run
+ *    on the AR1 HTP, which is why the NPU rec is ViTSTR, not this CRNN — see the ocr-ondevice-spike memory.
  *
- * Must be called OFF the main thread (ORT inference). Intended to run in the BACKGROUND on a stored
- * keyframe, not in the live capture hot loop. Reuses the calibrated preprocessing from OcrSpikeTest.
+ * Must be called OFF the main thread. Intended to run in the BACKGROUND on a stored keyframe, not in the
+ * live capture hot loop.
  */
-class OcrEngine(context: Context) : AutoCloseable {
+class OcrEngine(
+    context: Context,
+    private val vitstr: QnnVitstrRecognizer? = null,
+) : AutoCloseable {
     private val env = OrtEnvironment.getEnvironment()
-    private val det: OrtSession
-    private val rec: OrtSession
+    private val det: OrtSession                 // CPU DBNet@DET_MAX_SIDE — ALWAYS (full-frame coverage,
+                                                // incl. small/far text the 640² NPU DBNet misses).
+    private val rec: OrtSession?                // CPU CRNN — only when there's no NPU recognizer.
     private val chars: List<String>
 
     init {
         val a = context.assets
         det = a.open("ocr/ch_PP-OCRv3_det_infer.onnx").use { env.createSession(it.readBytes(), OrtSession.SessionOptions()) }
-        rec = a.open("ocr/ch_PP-OCRv3_rec_infer.onnx").use { env.createSession(it.readBytes(), OrtSession.SessionOptions()) }
         chars = a.open("ocr/ppocr_keys.txt").bufferedReader().use { it.readLines() }
-        Log.i(TAG, "OCR engine ready (dict=${chars.size})")
+        rec = if (vitstr != null) null
+              else a.open("ocr/ch_PP-OCRv3_rec_infer.onnx").use { env.createSession(it.readBytes(), OrtSession.SessionOptions()) }
+        Log.i(TAG, if (vitstr != null) "OCR engine ready (CPU DBNet det@$DET_MAX_SIDE + ViTSTR-NPU rec)"
+                   else "OCR engine ready (CPU, dict=${chars.size})")
     }
 
-    /** Detect + recognize all text lines in [bmp]. Empty list if no text (the DET gate found none). */
+    /**
+     * Detect + recognize all text lines in [bmp]. Detection is ALWAYS the CPU DBNet@1536 — it catches
+     * the small/far text (a laptop screen at arm's length) that the fast 640² NPU DBNet drops, so the
+     * read channel keeps the coverage it had before ViTSTR. Recognition is ViTSTR-NPU when present
+     * (~24ms/line vs the CRNN's ~440ms), else the CPU CRNN. Empty list if the detector found no text.
+     */
     fun recognize(bmp: Bitmap): List<OcrLine> {
         val t0 = System.currentTimeMillis()
         val (prob, sx, sy) = runDet(bmp)
@@ -52,10 +64,11 @@ class OcrEngine(context: Context) : AutoCloseable {
             val ox1 = (b[2] / sx).toInt().coerceIn(ox0 + 1, bmp.width)
             val oy1 = (b[3] / sy).toInt().coerceIn(oy0 + 1, bmp.height)
             val crop = Bitmap.createBitmap(bmp, ox0, oy0, ox1 - ox0, oy1 - oy0)
-            val (txt, conf) = runRec(crop)
+            val (txt, conf) = vitstr?.recognize(crop) ?: runRec(crop)
+            crop.recycle()
             if (txt.isNotBlank()) out += OcrLine(txt, RectF(ox0.toFloat(), oy0.toFloat(), ox1.toFloat(), oy1.toFloat()), conf)
         }
-        Log.i(TAG, "OCR ${System.currentTimeMillis() - t0}ms -> ${out.size} lines")
+        Log.i(TAG, "OCR ${System.currentTimeMillis() - t0}ms -> ${out.size} lines (${if (vitstr != null) "ViTSTR-NPU" else "CRNN-CPU"})")
         return out
     }
 
@@ -110,7 +123,7 @@ class OcrEngine(context: Context) : AutoCloseable {
             arr[c * REC_H * w + i] = (v / 255f - 0.5f) / 0.5f
         }
         val t = OnnxTensor.createTensor(env, buf, longArrayOf(1, 3, REC_H.toLong(), w.toLong()))
-        val r = t.use { rec.run(mapOf(rec.inputNames.first() to it)) }
+        val r = t.use { rec!!.run(mapOf(rec.inputNames.first() to it)) }
         @Suppress("UNCHECKED_CAST")
         val logits = (r.get(0).value as Array<Array<FloatArray>>)[0]   // [T][6625]
         r.close()
@@ -124,7 +137,7 @@ class OcrEngine(context: Context) : AutoCloseable {
         return sb.toString() to if (cN > 0) cSum / cN else 0f
     }
 
-    override fun close() { det.close(); rec.close() }
+    override fun close() { det.close(); rec?.close() }
 
     companion object {
         private const val TAG = "OcrEngine"

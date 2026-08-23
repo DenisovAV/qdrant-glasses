@@ -11,6 +11,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import tech.qdrant.glasses.embedding.extractAsset
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
 /**
@@ -72,6 +75,117 @@ class OcrSpikeTest {
         }
         det.close(); rec.close()
         assertTrue("OCR spike produced no text on-device", anyText)
+    }
+
+    /** WHOLE OCR on the NPU: DBNet detector (EPContext) + CRNN recognizer (EPContext), both on the
+     *  Hexagon HTP. Reads text end-to-end on-device and times det+rec. Read: `adb logcat -d -s
+     *  OCR_SPIKE:I CrnnQnn:I DbnetQnn:I`. */
+    @Test fun wholeOcrOnNpu() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val a = InstrumentationRegistry.getInstrumentation().context.assets
+        val dbnet = QnnDbnetDetector(ctx)
+        val crnn = QnnCrnnRecognizer(ctx)
+        var anyText = false
+        for (name in listOf("t_whiteboard.png", "t_label.png")) {
+            val bmp = a.open("ocr/$name").use { BitmapFactory.decodeStream(it) }
+            val td = System.currentTimeMillis()
+            val boxes = dbnet.detect(bmp)
+            val detMs = System.currentTimeMillis() - td
+            Log.i(TAG, "==== NPU-OCR $name: ${boxes.size} boxes, det ${detMs}ms ====")
+            var recMs = 0L
+            for (b in boxes) {
+                val x0 = (b.left * bmp.width).toInt().coerceIn(0, bmp.width - 1)
+                val y0 = (b.top * bmp.height).toInt().coerceIn(0, bmp.height - 1)
+                val x1 = (b.right * bmp.width).toInt().coerceIn(x0 + 1, bmp.width)
+                val y1 = (b.bottom * bmp.height).toInt().coerceIn(y0 + 1, bmp.height)
+                val crop = Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
+                val tr = System.currentTimeMillis()
+                val (txt, conf) = crnn.recognize(crop)
+                recMs += System.currentTimeMillis() - tr
+                if (txt.isNotBlank()) { anyText = true; Log.i(TAG, "  %.2f  %s".format(conf, txt)) }
+            }
+            Log.i(TAG, "  NPU-OCR total: det ${detMs}ms + rec ${recMs}ms = ${detMs + recMs}ms")
+        }
+        dbnet.close(); crnn.close()
+        assertTrue("NPU-OCR produced no text", anyText)
+    }
+
+    /** ISOLATION: feed the CRNN-NPU the EXACT fp32 input the host model reads correctly ("MCP..."),
+     *  straight into the EPContext session — NO DBNet, NO Kotlin preprocessing. If the NPU read differs
+     *  from the input-invariant `块煨块8:` garbage, the binary DOES respond to input → the bug was upstream
+     *  (crops/preprocess), not the binary. If it's the same garbage → the quantized binary is the fault. */
+    @Test fun crnnKnownGoodInput() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val a = InstrumentationRegistry.getInstrumentation().context.assets
+        val chars = a.open("ocr/ppocr_keys.txt").bufferedReader().readLines()
+        val bytes = a.open("ocr/c0_fp32.raw").use { it.readBytes() }
+        val arr = FloatArray(3 * 32 * 320)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(arr)
+        var mn = arr[0]; var mx = arr[0]; for (v in arr) { if (v < mn) mn = v; if (v > mx) mx = v }
+        Log.i(TAG, "c0 loaded: ${arr.size} floats  min=$mn max=$mx")
+
+        val opts = OrtSession.SessionOptions().apply {
+            addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst"))
+        }
+        val sess = env.createSession(extractAsset(ctx, "ocr/crnn-rec-epctx.onnx").absolutePath, opts)
+        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(arr), longArrayOf(1, 3, 32, 320))
+        val res = tensor.use { sess.run(mapOf("image" to it)) }
+        @Suppress("UNCHECKED_CAST")
+        val logits = (res.get("logits").get().value as Array<Array<FloatArray>>)[0]
+        res.close(); sess.close()
+
+        val sb = StringBuilder(); var prev = -1; var cSum = 0f; var cN = 0
+        for (t in logits.indices) {
+            var best = 0; var bv = logits[t][0]
+            for (k in 1 until logits[t].size) if (logits[t][k] > bv) { bv = logits[t][k]; best = k }
+            if (best != 0 && best != prev) { sb.append(chars.getOrElse(best) { "" }); cSum += bv; cN++ }
+            prev = best
+        }
+        Log.i(TAG, "NPU read of KNOWN-GOOD c0 (T=${logits.size}): \"$sb\"  conf=${if (cN>0) cSum/cN else 0f}")
+    }
+
+    /** ViTSTR (ViT + CTC-ish head) recognizer on the NPU — the NON-recurrent replacement for the CRNN
+     *  whose LSTM can't run on the AR1 HTP. Feeds pre-preprocessed [1,1,224,224] text-line rasters
+     *  (fp32, already resized+normalized to [-1,1], from the host) through the EPContext QNN session and
+     *  greedy-decodes [1,25,96] (pos0=[GO], stop at [s]=1, index>=2 -> vocab char). Read: logcat VitstrQnn. */
+    @Test fun vitstrOnNpu() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val a = InstrumentationRegistry.getInstrumentation().context.assets
+        val vocab = a.open("ocr/vitstr_vocab.txt").bufferedReader().use { it.readLines() }
+        val opts = OrtSession.SessionOptions().apply {
+            addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst"))
+        }
+        val t0 = System.currentTimeMillis()
+        val sess = env.createSession(extractAsset(ctx, "ocr/vitstr-epctx.onnx").absolutePath, opts)
+        Log.i("VitstrQnn", "ViTSTR-QNN EPContext session created in ${System.currentTimeMillis() - t0}ms (vocab=${vocab.size})")
+
+        val cases = listOf("vt_mobile.raw" to "Mobile", "vt_hello.raw" to "Hello",
+                           "vt_mcp.raw" to "MCP", "vt_2026.raw" to "2026")
+        var ok = 0
+        for ((file, expect) in cases) {
+            val bytes = a.open("ocr/$file").use { it.readBytes() }
+            val arr = FloatArray(1 * 1 * 224 * 224)
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(arr)
+            val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(arr), longArrayOf(1, 1, 224, 224))
+            val tr = System.currentTimeMillis()
+            val res = tensor.use { sess.run(mapOf("pixel" to it)) }
+            val ms = System.currentTimeMillis() - tr
+            @Suppress("UNCHECKED_CAST")
+            val logits = (res.get("out").get().value as Array<Array<FloatArray>>)[0]   // [25][96]
+            res.close()
+            val sb = StringBuilder()
+            for (pos in 1 until logits.size) {                   // skip pos0 = [GO]
+                var best = 0; var bv = logits[pos][0]
+                for (k in 1 until logits[pos].size) if (logits[pos][k] > bv) { bv = logits[pos][k]; best = k }
+                if (best == 1) break                             // [s] end
+                if (best >= 2) sb.append(vocab.getOrElse(best) { "" })
+            }
+            val hit = sb.toString() == expect
+            if (hit) ok++
+            Log.i("VitstrQnn", "NPU ${ms}ms  read=\"$sb\"  expect=\"$expect\"  ${if (hit) "OK" else "x"}")
+        }
+        sess.close()
+        Log.i("VitstrQnn", "ViTSTR NPU accuracy: $ok/${cases.size} exact")
     }
 
     // ---- detection: preprocess (resize /32, ImageNet-norm NCHW) -> prob map [H][W] ----

@@ -52,6 +52,39 @@ object Config {
     val MOMENT_MEMORY: Boolean = sysprop("qdrant.memory") != "0"
 
     /**
+     * OCR recognizer backend. **OPT-IN NPU — OFF by default (the long-proven CPU CRNN path).**
+     *
+     *   adb shell setprop debug.qdrant.ocr_npu 1     → ViTSTR recognizer on the Hexagon NPU (~24ms/line)
+     *   (unset / anything else)                      → PP-OCR CRNN recognizer on the CPU (~440ms/line)
+     *
+     * This flag swaps ONLY the recognizer — detection is the CPU DBNet@1536 either way, so small/far
+     * text coverage is identical. NPU rec is ViTSTR (non-recurrent ViT; the CRNN's LSTM can't run on
+     * the AR1 HTP). Kept switchable for A/B on real captures; default is the CPU path that already
+     * worked well, so a fresh install "just works" and NPU is a deliberate opt-in.
+     */
+    val OCR_NPU: Boolean = sysprop("qdrant.ocr_npu") == "1"
+
+    /**
+     * Recency re-ranking of moment-search survivors ("gate-then-decay"). The per-backend score gate
+     * ([tech.qdrant.glasses.embedding.CropEncoderFactory.searchGate]) is a PRESENCE detector; ABOVE
+     * it the surviving cosine band is only ~0.025 wide — mostly noise — so raw-score order is a weak
+     * ranker of the survivors. When this is a POSITIVE number of seconds, the normal (non-recall,
+     * non-time-only) search re-ranks its gate survivors by `score × exp(-Δt / τ)`, τ = this many
+     * seconds, so the freshest of several near-equal matches surfaces first. **UNSET / 0 → OFF** (raw
+     * cosine order, the calibrated status quo) — opt-in like [OCR_NPU], so a fresh install is unchanged.
+     *
+     * Recall-intent ("where did I leave X") and pure-time ("what did I see yesterday") queries are
+     * DELIBERATELY unaffected: both already order by recency directly (a stronger preference than a
+     * tie-breaker). τ must match the capture timescale to reorder at all — a demo session spans
+     * minutes-to-hours, so 1800 (30 min) is the suggested starting value; raise it for multi-day memory.
+     *
+     *   adb shell setprop debug.qdrant.recency_tau_s 1800   → recency ranker on, τ = 30 min
+     *   (unset / 0)                                          → off (raw score order)
+     */
+    val RECENCY_TAU_MS: Long =
+        sysprop("qdrant.recency_tau_s").toLongOrNull()?.takeIf { it > 0 }?.times(1000L) ?: 0L
+
+    /**
      * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).
      * persist.* matters because a glasses reboot silently reverted the app to compiled-in defaults
      * mid-rehearsal — twice. Read once at startup; an app restart applies a change.

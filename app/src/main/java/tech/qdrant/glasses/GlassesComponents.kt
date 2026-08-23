@@ -57,6 +57,9 @@ class GlassesComponents(
     // Stage 3 live text-region highlighting: DBNet on the NPU, run per detect-frame by
     // PerceptionPipeline (guarded independently — a missing EPContext model must not fail boot).
     val dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector?,
+    // Stage 3 NPU recognizer: ViTSTR (W8A16), used by [ocrEngine]'s NPU path. Owned here (not by
+    // OcrEngine) and closed in [close]; null → OcrEngine reads on the CPU. Guarded independently.
+    val vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer?,
 ) : AutoCloseable {
 
     companion object {
@@ -121,6 +124,7 @@ class GlassesComponents(
             var momentCapture: MomentCapture? = null
             var ocrEngine: OcrEngine? = null
             var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
+            var vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
@@ -169,8 +173,26 @@ class GlassesComponents(
                     // must not fail the whole app boot the way a missing crop-encoder asset would;
                     // it just means Stage 3 stays off (MomentCapture treats a null ocrEngine as
                     // "OCR disabled", same nullable-optional-feature contract as labelCache).
+                    // Stage 3 recognizer on the NPU: ViTSTR (non-recurrent ViT, W8A16) — the CRNN's LSTM
+                    // can't run on the AR1 HTP (unrolled-quant collapses, native-quant hits the requant
+                    // limit, FP16 unsupported — see ocr-ondevice-spike). Guarded like dbnetDetector: a
+                    // missing `assets/ocr/vitstr-epctx.onnx` just makes OcrEngine fall back to its CPU
+                    // PP-OCR path. Paired with dbnetDetector (NPU det) it puts the WHOLE read channel on
+                    // the HTP (~10ms det + ~24ms/line rec vs the CPU path's ~4s). dbnetDetector is shared
+                    // with PerceptionPipeline's live highlighter — ORT run() is thread-safe.
+                    vitstrRec = if (!Config.OCR_NPU) {
+                        Log.i(TAG, "OCR recognizer = CPU CRNN (proven path; set debug.qdrant.ocr_npu=1 for ViTSTR-NPU)")
+                        null
+                    } else try {
+                        tech.qdrant.glasses.ocr.QnnVitstrRecognizer(app).also { Log.d(TAG, "load: ViTSTR-QNN OK → NPU OCR rec") }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "load: ViTSTR-QNN unavailable, OCR rec stays on CPU: ${e.message}"); null
+                    }
                     ocrEngine = try {
-                        OcrEngine(app).also { Log.d(TAG, "load: ocr engine OK") }
+                        // Read-channel OCR: CPU DBNet det@1536 (full coverage — catches small/far text the
+                        // 640² NPU DBNet drops) + ViTSTR-NPU rec (~24ms/line). dbnetDetector stays for
+                        // PerceptionPipeline's live highlighter only.
+                        OcrEngine(app, vitstr = vitstrRec).also { Log.d(TAG, "load: ocr engine OK") }
                     } catch (e: Throwable) {
                         Log.w(TAG, "load: ocr engine unavailable, Stage 3 disabled: ${e.message}")
                         null
@@ -242,6 +264,7 @@ class GlassesComponents(
                 momentCapture = momentCapture,
                 ocrEngine = ocrEngine,
                 dbnetDetector = dbnetDetector,
+                vitstrRec = vitstrRec,
             )
         }
     }
@@ -260,6 +283,7 @@ class GlassesComponents(
         dbnetDetector?.close()
         cropEncoder?.close()
         momentStore?.close()
-        ocrEngine?.close()
+        ocrEngine?.close()          // NPU-mode OcrEngine doesn't own dbnet/vitstr (shared) — close them after
+        vitstrRec?.close()
     }
 }

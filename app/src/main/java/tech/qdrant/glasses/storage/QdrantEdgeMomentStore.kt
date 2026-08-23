@@ -2,29 +2,34 @@ package tech.qdrant.glasses.storage
 
 import android.content.Context
 import android.util.Log
-import tech.qdrant.edge.CountRequest
-import tech.qdrant.edge.Distance
-import tech.qdrant.edge.EdgeConfig
-import tech.qdrant.edge.EdgeShard
-import tech.qdrant.edge.Point
-import tech.qdrant.edge.UpdateOperation
-import tech.qdrant.edge.VectorDataConfig
-import tech.qdrant.edge.ffi.Condition
-import tech.qdrant.edge.ffi.FieldCondition
-import tech.qdrant.edge.ffi.Filter
-import tech.qdrant.edge.ffi.Match
-import tech.qdrant.edge.ffi.NamedVector
-import tech.qdrant.edge.ffi.PointId
-import tech.qdrant.edge.ffi.Query
-import tech.qdrant.edge.ffi.QueryRequest
-import tech.qdrant.edge.ffi.RangeFloat
-import tech.qdrant.edge.ffi.ScoredPoint
-import tech.qdrant.edge.ffi.ScoringQuery
-import tech.qdrant.edge.ffi.ScrollRequest
-import tech.qdrant.edge.ffi.ValueVariants
-import tech.qdrant.edge.ffi.Vector
-import tech.qdrant.edge.ffi.WithPayload
-import tech.qdrant.edge.ffi.WithVector
+import io.qdrant.edge.CountRequest
+import io.qdrant.edge.Distance
+import io.qdrant.edge.EdgeConfig
+import io.qdrant.edge.EdgeShard
+import io.qdrant.edge.Point
+import io.qdrant.edge.UpdateOperation
+import io.qdrant.edge.VectorDataConfig
+import io.qdrant.edge.Condition
+import io.qdrant.edge.FieldCondition
+import io.qdrant.edge.Filter
+import io.qdrant.edge.Match
+import io.qdrant.edge.Direction
+import io.qdrant.edge.IntegerIndexParams
+import io.qdrant.edge.NamedVector
+import io.qdrant.edge.OrderBy
+import io.qdrant.edge.PayloadIndexParams
+import io.qdrant.edge.PayloadSchemaType
+import io.qdrant.edge.PointId
+import io.qdrant.edge.Query
+import io.qdrant.edge.QueryRequest
+import io.qdrant.edge.RangeFloat
+import io.qdrant.edge.ScoredPoint
+import io.qdrant.edge.ScoringQuery
+import io.qdrant.edge.ScrollRequest
+import io.qdrant.edge.ValueVariants
+import io.qdrant.edge.Vector
+import io.qdrant.edge.WithPayload
+import io.qdrant.edge.WithVector
 import java.io.File
 import java.util.UUID
 
@@ -107,7 +112,31 @@ class QdrantEdgeMomentStore(
 
     init {
         shard = EdgeShard.load(dir, config)
-        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))}")
+        ensurePayloadIndexes()
+        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))} (payload indexes: timestamp_ms, type)")
+    }
+
+    /**
+     * (Re)create the 0.8 payload indexes on the CURRENT [shard] (0.7's Edge FFI had NO index-creation
+     * API at all — see timeline()'s KDoc). MUST run on every fresh shard handle — both [init] and
+     * [deleteAll]'s reload — because `EdgeShard.load` does NOT carry indexes forward: they live in the
+     * shard, and deleteAll wipes the shard dir, so an index created only in [init] vanishes the moment
+     * deleteAll reloads (which is what made framesInWindow's orderBy throw "No range index" right after
+     * the test/demo-wipe deleteAll).
+     *
+     * `timestamp_ms` needs a RANGE index for SERVER-SIDE orderBy(DESC): the DEFAULT integer index
+     * (`createFieldIndex(..., INTEGER)`) is LOOKUP-ONLY and orderBy still throws — it must be
+     * `IntegerIndexParams(range = true)`. `type` (KEYWORD lookup) accelerates the channel-equality
+     * filter every search AND's in. runCatching: creating an index that already exists throws — swallow.
+     */
+    private fun ensurePayloadIndexes() {
+        runCatching {
+            shard.update(UpdateOperation.createFieldIndexWithParams(
+                "timestamp_ms", PayloadIndexParams.Integer(IntegerIndexParams(range = true))))
+        }.onFailure { Log.d(TAG, "payload index 'timestamp_ms' not (re)created: ${it.message}") }
+        runCatching { shard.update(UpdateOperation.createFieldIndex("type", PayloadSchemaType.KEYWORD)) }
+            .onFailure { Log.d(TAG, "payload index 'type' not (re)created: ${it.message}") }
+        shard.flush()
     }
 
     override fun storeMoment(clipVec: FloatArray, payload: MomentPayload): String = synchronized(lock) {
@@ -182,7 +211,7 @@ class QdrantEdgeMomentStore(
         require(qvec.size == dim) { "dim ${qvec.size} != $dim" }
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = qvec.toList(), using = field)),
+            query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(qvec.toList()), using = field)),
             prefetches = emptyList(),
             withVector = null, withPayload = WithPayload.Bool(true),
             filter = typeAndTimeFilter(typeValue, sinceMs, untilMs),
@@ -213,41 +242,25 @@ class QdrantEdgeMomentStore(
     }
 
     /**
-     * The most-recent [limit] stored `type=frame` moments (payload only, no vectors), oldest-first
-     * — rebuilds the HUD timeline rail on connect as a chronological strip ending at "now".
+     * The most-recent [limit] stored `type=frame` moments (payload only, no vectors), OLDEST-first —
+     * rebuilds the HUD timeline rail on connect as a chronological strip ending at "now".
      *
-     * **Server-side `orderBy` was tried and rejected on-device**: `ScrollRequest.orderBy` exists in
-     * this AAR's FFI, but a live scroll with `OrderBy("timestamp_ms", Direction.DESC)` throws
-     * `EdgeException.OperationException("No range index for \`order_by\` key: \`timestamp_ms\`...")`
-     * — and `EdgeConfig` (see its fields) exposes no API to create one. So there is no way to get
-     * the shard to order by timestamp itself; this pages the ENTIRE `type=frame` channel via
-     * [ScrollRequest.offset]/[tech.qdrant.edge.ffi.ScrollResponse.nextOffset] (Qdrant's default
-     * point-ID order says nothing about recency, so a single `limit`-sized page could silently
-     * drop the newest frames once the channel exceeds `limit`), sorts every point by
-     * [MomentHit.timestampMs] client-side, and keeps only the most recent [limit]. Fine at demo
-     * scale (low hundreds of frames); a payload index on `timestamp_ms` — if this Edge FFI ever
-     * grows one — would let `orderBy` do this server-side instead and drop the full scan.
+     * 0.8: the `timestamp_ms` RANGE index (see [ensurePayloadIndexes]) lets the shard order server-side,
+     * so this asks for the `limit` NEWEST frames via orderBy(DESC) and reverses to oldest-first — no more
+     * paging the ENTIRE frame channel and sorting every point client-side. (0.7's Edge FFI had NO
+     * index-creation API, so orderBy threw "No range index" and the full scan was the only option — that
+     * was this method's old body, preserved in git history.)
      */
     override fun timeline(limit: Int): List<MomentHit> = synchronized(lock) {
-        val frameFilter = Filter(must = listOf(Condition.Field(FieldCondition(
-            key = "type", match = Match.Value(ValueVariants.String(MomentType.FRAME)),
-            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
-        ))), should = null, mustNot = null)
-        val all = mutableListOf<MomentHit>()
-        var offset: PointId? = null
-        do {
-            val resp = shard.scroll(ScrollRequest(
-                offset = offset, limit = SCROLL_PAGE_SIZE,
-                filter = frameFilter,
-                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
-                orderBy = null,
-            ))
-            resp.records.mapTo(all) { rec -> toHit(rec.id, rec.payload ?: "{}") }
-            offset = resp.nextOffset
-        } while (offset != null)
-        all.sortedBy { it.timestampMs }
-            .takeLast(limit)
-            .also { Log.i(TAG, "timeline(): scanned ${all.size} stored frames, returning ${it.size} most recent") }
+        val resp = shard.scroll(ScrollRequest(
+            offset = null, limit = limit.toULong(),
+            filter = typeAndTimeFilter(MomentType.FRAME, null, null),
+            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+            orderBy = OrderBy(key = "timestamp_ms", direction = Direction.DESC, startFrom = null),
+        ))
+        // orderBy DESC gives newest-first; reverse to the oldest-first order the rail plays back in.
+        resp.records.map { rec -> toHit(rec.id, rec.payload ?: "{}") }.reversed()
+            .also { Log.i(TAG, "timeline(): orderBy DESC returning ${it.size} most-recent frames (oldest-first)") }
     }
 
     /**
@@ -261,22 +274,17 @@ class QdrantEdgeMomentStore(
      * not oldest-first playback of the rail.
      */
     override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> = synchronized(lock) {
-        val filter = typeAndTimeFilter(MomentType.FRAME, sinceMs, untilMs)
-        val all = mutableListOf<MomentHit>()
-        var offset: PointId? = null
-        do {
-            val resp = shard.scroll(ScrollRequest(
-                offset = offset, limit = SCROLL_PAGE_SIZE,
-                filter = filter,
-                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
-                orderBy = null,
-            ))
-            resp.records.mapTo(all) { rec -> toHit(rec.id, rec.payload ?: "{}") }
-            offset = resp.nextOffset
-        } while (offset != null)
-        all.sortedByDescending { it.timestampMs }
-            .take(limit)
-            .also { Log.i(TAG, "framesInWindow(): since=$sinceMs until=$untilMs matched=${all.size} returning=${it.size}") }
+        // 0.8: the INTEGER index on `timestamp_ms` (created in init) lets the shard order server-side, so
+        // this asks for the `limit` most-recent matches directly — no more scrolling the WHOLE matching
+        // set and sorting client-side (0.7's forced pattern; see timeline()'s KDoc for why 0.7 couldn't).
+        val resp = shard.scroll(ScrollRequest(
+            offset = null, limit = limit.toULong(),
+            filter = typeAndTimeFilter(MomentType.FRAME, sinceMs, untilMs),
+            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(false),
+            orderBy = OrderBy(key = "timestamp_ms", direction = Direction.DESC, startFrom = null),
+        ))
+        resp.records.map { rec -> toHit(rec.id, rec.payload ?: "{}") }
+            .also { Log.i(TAG, "framesInWindow(): since=$sinceMs until=$untilMs orderBy=DESC returning=${it.size}") }
     }
 
     override fun count(): Long = synchronized(lock) { shard.count(CountRequest(filter = null, exact = true)).toLong() }
@@ -305,6 +313,7 @@ class QdrantEdgeMomentStore(
         }
         File(dir).mkdirs()
         shard = EdgeShard.load(dir, config)
+        ensurePayloadIndexes()   // the reload dropped the indexes with the old shard — recreate them
         closed = false
         Log.i(TAG, "deleteAll: dropped $before points, shard recreated empty at $dir")
     }

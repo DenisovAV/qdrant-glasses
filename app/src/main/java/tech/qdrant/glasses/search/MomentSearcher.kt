@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.search
 
 import android.util.Log
+import tech.qdrant.glasses.Config
 import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
@@ -73,11 +74,28 @@ class MomentSearcher(
          * ONLY. A weak/broad present object that still misses the gate is recovered by an exact
          * VERIFIED-tag match (the tag-accept filter in [search] / [tagAcceptedMomentIds]).
          */
+
+        /**
+         * Gate-then-decay re-rank of gate SURVIVORS (see [Config.RECENCY_TAU_MS]). Re-orders — never
+         * re-gates, never drops — [hits] by `score × exp(-Δt / τ)`, so the freshest of several
+         * near-equal cosine matches wins. Δt = [nowMs] − hit timestamp, clamped ≥ 0 so a write-time
+         * clock skew that stamps a moment slightly in the future can't AMPLIFY it (exp of a positive
+         * exponent). [tauMs] is assumed > 0 (the caller gates on that; 0 is the OFF sentinel and would
+         * divide into NaN, never passed here). sortedByDescending is STABLE, so hits with equal decayed
+         * scores keep their incoming (raw-score-sorted) order — decay only breaks near-ties, it doesn't
+         * reshuffle. Pure + static so it unit-tests without the search() deps.
+         */
+        internal fun recencyRank(hits: List<MomentHit>, nowMs: Long, tauMs: Long): List<MomentHit> =
+            hits.sortedByDescending { h ->
+                val dt = (nowMs - h.timestampMs).coerceAtLeast(0L).toDouble()
+                h.score * kotlin.math.exp(-dt / tauMs)
+            }
     }
 
     /** Runs on: inferLane. */
     fun search(query: String): ObjectSearcher.Outcome {
-        val pq = parseQuery(query, System.currentTimeMillis())
+        val nowMs = System.currentTimeMillis()
+        val pq = parseQuery(query, nowMs)
         if (pq.embedText != query.lowercase())
             Log.i(TAG, "query normalized(moments): \"$query\" → \"${pq.embedText}\" window=${pq.window}")
 
@@ -183,13 +201,17 @@ class MomentSearcher(
             "ocrAccepted=${ocrAcceptedIds.size} top=${allHits.firstOrNull()?.score}")
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
-        // Both branches keep the established top-5 contract: recall re-sorts by recency then trims;
-        // the non-recall branch is already score-sorted (inherited from allHits above) so trimming
-        // here is just the top-5 cap — a two-channel fetchK=5+5 can otherwise surface ~10 distinct
-        // moments after fuseAndCollapse.
-        val ordered =
-            if (pq.recallIntent) hits.sortedByDescending { it.timestampMs }.take(5)
-            else hits.take(5)
+        // All branches keep the established top-5 contract:
+        //   • recall-intent → re-sort by recency (strong preference), trim;
+        //   • recency ranker ON ([Config.RECENCY_TAU_MS] > 0) → gate-then-decay re-rank, trim — a
+        //     tie-breaker within the noisy above-gate band (see recencyRank / Config KDocs);
+        //   • otherwise → the raw score order (inherited from allHits above), trimmed to the top-5 cap
+        //     (a two-channel fetchK=5+5 can otherwise surface ~10 distinct moments after fuseAndCollapse).
+        val ordered = when {
+            pq.recallIntent -> hits.sortedByDescending { it.timestampMs }.take(5)
+            Config.RECENCY_TAU_MS > 0L -> recencyRank(hits, nowMs, Config.RECENCY_TAU_MS).take(5)
+            else -> hits.take(5)
+        }
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)
