@@ -39,6 +39,9 @@ data class MomentHit(
     // Stage 3 (OCR read channel): the recognized line's text, non-empty only on a `type=ocr` hit.
     // Defaults to "" so every pre-Stage-3 named-arg MomentHit construction site keeps compiling.
     val text: String = "",
+    // Provenance of a search hit: "local" (this device's own memory) or "fleet" (pulled shared corpus).
+    // Defaults to "local" so every existing construction site is unchanged (fleet-sync PoC).
+    val source: String = "local",
 )
 
 /**
