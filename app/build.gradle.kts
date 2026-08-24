@@ -101,6 +101,13 @@ android {
         noCompress += "bin"   // qai-hub QNN context binary — extracted to disk for ORT QNN EP
         noCompress += "data"  // ONNX external weights (yolov8_det.data) — read from disk by ORT
         noCompress += "txt"   // sherpa tokens.txt is mmap'd natively, must stay uncompressed
+        // siglip-tokenizer.json (SiglipTextEncoder) is extracted to disk via extractAsset(), which
+        // sizes it with assets.openFd() BEFORE copying — openFd() needs a raw fd into the APK's
+        // zip, which only exists for a STORED (uncompressed) entry; a compressed one throws
+        // "probably compressed" (confirmed on-device). clip-tokenizer.json is unaffected either
+        // way (RankedBpeTokenizer streams it with assets.open(), no fd needed) — this just also
+        // leaves it uncompressed, which is harmless at its 2MB size.
+        noCompress += "json"
         // Keep models the OBJECTS + QNN_B32 demo never loads OUT of the APK (they stay on disk,
         // gitignored, so re-including is just editing this line). Pattern segments are
         // colon-separated globs matched against asset path components.
@@ -130,6 +137,14 @@ android {
             // Scope pickFirst to x86 ONLY so a future REAL arm64 ORT clash still fails loudly.
             pickFirsts += "lib/x86/libonnxruntime.so"
         }
+        // src/main/jniLibs/arm64-v8a/libc++_shared.so is a manually-added copy (NDK
+        // toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so, any
+        // reasonably recent NDK) — NOT auto-generated. ai.djl.android:tokenizer-native's
+        // libdjl_tokenizer.so `NEEDED`s libc++_shared.so (confirmed via `objdump -p`) but does not
+        // bundle it, and it is the ONLY native lib in this app that dynamically links libc++ (every
+        // other AAR here — ORT, QNN, sherpa, vosk, mediapipe, litert, JNA — statically links it) —
+        // so nothing else in the tree supplies it. Without this file: `UnsatisfiedLinkError: dlopen
+        // failed: library "libc++_shared.so" not found`, confirmed on-device before adding it.
     }
 }
 
@@ -150,6 +165,22 @@ dependencies {
     implementation(libs.qnn.runtime)
     implementation(libs.qnn.litert.delegate)
     implementation(libs.coroutines.android)
+    // SiglipTextEncoder's tokenizer — see gradle/libs.versions.toml's `djl` version comment for
+    // why these two are pinned together at 0.33.0 (that's the last version with a matching
+    // Android-native artifact). ai.djl:api (tokenizers' only transitive dep) drags in a PLAIN
+    // (non-Android) net.java.dev.jna:jna jar for its own unrelated CUDA-detection utility
+    // (ai.djl.util.cuda.CudaUtils — never touched by HuggingFaceTokenizer, which talks to its
+    // native lib via real JNI `native` methods, not JNA) — verified real conflict, not a
+    // hypothetical: `net.java.dev.jna:jna:5.17.0@aar` (our own, satisfying vosk-android, whose
+    // own POM also pins the `aar` type) and this plain jar both resolve to the version-conflict
+    // winner 5.18.1, landing BOTH the `.aar`'s classes.jar and the plain `.jar` on the runtime
+    // classpath — `checkDemoDebugDuplicateClasses` fails on every `com.sun.jna.*` class, confirmed
+    // by first attempting this without the exclude. Excluding it here removes the plain-jar edge;
+    // the AAR one (used for its arm64 native dispatch lib) is untouched.
+    implementation(libs.djl.tokenizers) {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation(libs.djl.android.tokenizer.native)
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
@@ -185,4 +216,6 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.7.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
+    // FleetQdrantClient's REST calls verified against a local server (Sovereign Fleet Memory PoC).
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

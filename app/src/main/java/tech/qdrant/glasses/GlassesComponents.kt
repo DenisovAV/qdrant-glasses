@@ -14,6 +14,7 @@ import tech.qdrant.glasses.embedding.EncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
 import tech.qdrant.glasses.embedding.TextEncoder
 import tech.qdrant.glasses.embedding.VisionEncoder
+import tech.qdrant.glasses.ocr.OcrEngine
 import tech.qdrant.glasses.pipeline.MomentCapture
 import tech.qdrant.glasses.search.MomentRetriever
 import tech.qdrant.glasses.search.SherpaVadAsr
@@ -49,6 +50,23 @@ class GlassesComponents(
     // mode/opt-out, never by timing", same rule [retriever] above already follows.
     val momentStore: MomentStore?,
     val momentCapture: MomentCapture?,
+    // Stage 3 "OCR read channel" — null whenever momentCapture is (never active without the moment
+    // pipeline; see [load]'s MOMENT_MEMORY gate), OR when `ocr/` assets are missing/fail to load
+    // (guarded independently — a missing OCR model must not fail the whole app boot).
+    val ocrEngine: OcrEngine?,
+    // Stage 3 live text-region highlighting: DBNet on the NPU, run per detect-frame by
+    // PerceptionPipeline (guarded independently — a missing EPContext model must not fail boot).
+    val dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector?,
+    // Stage 3 NPU recognizer: ViTSTR (W8A16), used by [ocrEngine]'s NPU path. Owned here (not by
+    // OcrEngine) and closed in [close]; null → OcrEngine reads on the CPU. Guarded independently.
+    val vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer?,
+    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): the pulled fleet corpus, or null when Config.FLEET_URL
+    // is blank OR the pull failed (FleetSync.pull already logs+swallows every Throwable) — same
+    // nullable-optional-feature contract as momentStore/momentCapture above. GlassesViewModel passes
+    // this straight through as MomentSearcher's `fleet` argument; a null here just means "no fleet
+    // tier this session", byte-for-byte today's local-only search (Global Constraint). Owned here so
+    // [close] can release its native EdgeShard alongside [momentStore]'s.
+    val fleetStore: tech.qdrant.glasses.fleet.FleetShardStore?,
 ) : AutoCloseable {
 
     companion object {
@@ -70,7 +88,7 @@ class GlassesComponents(
          * `PerceptionPipeline`/`MomentSearcher` directly (see the "moment-timeline backfill" comment
          * below for why `hud` itself isn't owned here).
          */
-        fun load(
+        suspend fun load(
             app: Application,
             mode: AppMode,
             scope: CoroutineScope,
@@ -111,8 +129,19 @@ class GlassesComponents(
             var retriever: MomentRetriever? = null
             var momentStore: MomentStore? = null
             var momentCapture: MomentCapture? = null
+            var ocrEngine: OcrEngine? = null
+            var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
+            var vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer? = null
+            var fleetStore: tech.qdrant.glasses.fleet.FleetShardStore? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
+                // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
+                // `assets/ocr/dbnet-det-epctx.onnx` just leaves text-highlighting off, no boot failure.
+                dbnetDetector = try {
+                    tech.qdrant.glasses.ocr.QnnDbnetDetector(app).also { Log.d(TAG, "load: DBNet-QNN OK") }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "load: DBNet-QNN unavailable, text-highlight off: ${e.message}"); null
+                }
                 tracker = ObjectTracker(confirmSightings = 3)
                 cropEncoder = CropEncoderFactory.create(app)
                 // Build the retriever with THIS encoder's calibrated vision gate (SigLIP2 and
@@ -146,6 +175,36 @@ class GlassesComponents(
                         dim = cropEncoder.dim,
                         persistFile = File(app.filesDir, "label_vectors_${CropEncoderFactory.namespace}.tsv"),
                     )
+                    // Stage 3 "OCR read channel": constructed once, alongside momentCapture, so it is
+                    // reused (not per-frame) exactly like cropEncoder/labelCache above. Guarded on
+                    // its OWN try/catch — a device missing `assets/ocr/` (or any other load failure)
+                    // must not fail the whole app boot the way a missing crop-encoder asset would;
+                    // it just means Stage 3 stays off (MomentCapture treats a null ocrEngine as
+                    // "OCR disabled", same nullable-optional-feature contract as labelCache).
+                    // Stage 3 recognizer on the NPU: ViTSTR (non-recurrent ViT, W8A16) — the CRNN's LSTM
+                    // can't run on the AR1 HTP (unrolled-quant collapses, native-quant hits the requant
+                    // limit, FP16 unsupported — see ocr-ondevice-spike). Guarded like dbnetDetector: a
+                    // missing `assets/ocr/vitstr-epctx.onnx` just makes OcrEngine fall back to its CPU
+                    // PP-OCR path. Paired with dbnetDetector (NPU det) it puts the WHOLE read channel on
+                    // the HTP (~10ms det + ~24ms/line rec vs the CPU path's ~4s). dbnetDetector is shared
+                    // with PerceptionPipeline's live highlighter — ORT run() is thread-safe.
+                    vitstrRec = if (!Config.OCR_NPU) {
+                        Log.i(TAG, "OCR recognizer = CPU CRNN (proven path; set debug.qdrant.ocr_npu=1 for ViTSTR-NPU)")
+                        null
+                    } else try {
+                        tech.qdrant.glasses.ocr.QnnVitstrRecognizer(app).also { Log.d(TAG, "load: ViTSTR-QNN OK → NPU OCR rec") }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "load: ViTSTR-QNN unavailable, OCR rec stays on CPU: ${e.message}"); null
+                    }
+                    ocrEngine = try {
+                        // Read-channel OCR: CPU DBNet det@1536 (full coverage — catches small/far text the
+                        // 640² NPU DBNet drops) + ViTSTR-NPU rec (~24ms/line). dbnetDetector stays for
+                        // PerceptionPipeline's live highlighter only.
+                        OcrEngine(app, vitstr = vitstrRec).also { Log.d(TAG, "load: ocr engine OK") }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "load: ocr engine unavailable, Stage 3 disabled: ${e.message}")
+                        null
+                    }
                     momentCapture = MomentCapture(
                         scope = scope,
                         embedLane = embedLane,
@@ -154,6 +213,8 @@ class GlassesComponents(
                         momentThumbsDir = thumbsDir,
                         isRecording = isRecording,
                         labelCache = labelCache,
+                        ocrEngine = ocrEngine,
+                        bgeEncoder = bgeEncoder,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
                         // thumb for /thumb/<key> BEFORE pushing the event. On the WIRED path
@@ -178,6 +239,22 @@ class GlassesComponents(
                         }
                     }
                     Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")
+                    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): OPTIONAL cloud tier, gated purely on
+                    // Config.FLEET_URL (Global Constraint — blank URL means byte-for-byte today's
+                    // offline behavior, so this whole block is skipped, not just no-op'd). Runs on
+                    // THIS coroutine (load() is suspend precisely so this pull() can happen here,
+                    // off-main like every other blocking call in this function — see GlassesViewModel's
+                    // `viewModelScope.launch(Dispatchers.IO) { GlassesComponents.load(...) }`).
+                    // FleetSync.pull() itself never throws (wraps create-snapshot/download/unpack/load
+                    // in one try/catch, Spec §7) — a null result here just means no fleet this session.
+                    if (Config.FLEET_URL.isNotBlank()) {
+                        val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
+                            tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
+                            app.filesDir, cropEncoder.dim,
+                        )
+                        fleetStore = fleetSync.pull()
+                        Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
+                    }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
                 // compiles into both flavors, so the actual sysprop-check + launch is indirected
@@ -209,6 +286,10 @@ class GlassesComponents(
                 retriever = retriever,
                 momentStore = momentStore,
                 momentCapture = momentCapture,
+                ocrEngine = ocrEngine,
+                dbnetDetector = dbnetDetector,
+                vitstrRec = vitstrRec,
+                fleetStore = fleetStore,
             )
         }
     }
@@ -224,7 +305,11 @@ class GlassesComponents(
         bgeEncoder.close()
         store.close()
         detector?.close()
+        dbnetDetector?.close()
         cropEncoder?.close()
         momentStore?.close()
+        fleetStore?.close()
+        ocrEngine?.close()          // NPU-mode OcrEngine doesn't own dbnet/vitstr (shared) — close them after
+        vitstrRec?.close()
     }
 }

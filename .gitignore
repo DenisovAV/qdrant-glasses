@@ -4,6 +4,9 @@
 *.ap_
 *.aab
 
+# Code-review tool scratch/cache (downloaded deps + a private gradle wrapper) — machine-local, never commit
+.gradle-review/
+
 # Files for the ART/Dalvik VM
 *.dex
 

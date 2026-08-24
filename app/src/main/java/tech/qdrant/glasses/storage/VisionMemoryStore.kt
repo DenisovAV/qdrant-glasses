@@ -2,28 +2,28 @@ package tech.qdrant.glasses.storage
 
 import android.content.Context
 import android.util.Log
-import tech.qdrant.edge.CountRequest
-import tech.qdrant.edge.Distance
-import tech.qdrant.edge.EdgeConfig
-import tech.qdrant.edge.EdgeShard
-import tech.qdrant.edge.Point
-import tech.qdrant.edge.UpdateOperation
-import tech.qdrant.edge.VectorDataConfig
-import tech.qdrant.edge.ffi.NamedVector
-import tech.qdrant.edge.ffi.PointId
-import tech.qdrant.edge.ffi.Query
-import tech.qdrant.edge.ffi.ScoredPoint
-import tech.qdrant.edge.ffi.Vector
-import tech.qdrant.edge.ffi.WithPayload
-import tech.qdrant.edge.ffi.QueryRequest
-import tech.qdrant.edge.ffi.ScoringQuery
-import tech.qdrant.edge.ffi.Filter
-import tech.qdrant.edge.ffi.Condition
-import tech.qdrant.edge.ffi.FieldCondition
-import tech.qdrant.edge.ffi.Match
-import tech.qdrant.edge.ffi.ValueVariants
-import tech.qdrant.edge.ffi.ScrollRequest
-import tech.qdrant.edge.ffi.WithVector
+import io.qdrant.edge.CountRequest
+import io.qdrant.edge.Distance
+import io.qdrant.edge.EdgeConfig
+import io.qdrant.edge.EdgeShard
+import io.qdrant.edge.Point
+import io.qdrant.edge.UpdateOperation
+import io.qdrant.edge.VectorDataConfig
+import io.qdrant.edge.NamedVector
+import io.qdrant.edge.PointId
+import io.qdrant.edge.Query
+import io.qdrant.edge.ScoredPoint
+import io.qdrant.edge.Vector
+import io.qdrant.edge.WithPayload
+import io.qdrant.edge.QueryRequest
+import io.qdrant.edge.ScoringQuery
+import io.qdrant.edge.Filter
+import io.qdrant.edge.Condition
+import io.qdrant.edge.FieldCondition
+import io.qdrant.edge.Match
+import io.qdrant.edge.ValueVariants
+import io.qdrant.edge.ScrollRequest
+import io.qdrant.edge.WithVector
 import java.io.File
 import java.util.UUID
 
@@ -122,7 +122,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
         val results = shard.query(
             QueryRequest(
                 limit = topK.toULong(), offset = null,
-                query = ScoringQuery.Vector(Query.Nearest(vector = q, using = using)),
+                query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(q), using = using)),
                 prefetches = emptyList(),
                 withVector = null, withPayload = WithPayload.Bool(true),
                 filter = Filter(
@@ -171,7 +171,7 @@ class VisionMemoryStore(context: Context) : AutoCloseable {
     private fun toFrame(payload: String, scored: ScoredPoint?): MemoryFrame =
         toFrame(payload, scored?.id, scored?.score ?: 0f)
 
-    private fun toFrame(payload: String, pointId: tech.qdrant.edge.ffi.PointId?, score: Float): MemoryFrame {
+    private fun toFrame(payload: String, pointId: io.qdrant.edge.PointId?, score: Float): MemoryFrame {
         val ts = extractLong(payload, "timestamp_ms")
         // t_end_ms exists only on transcript points; image points are instants (tEnd=ts).
         val tEnd = extractLong(payload, "t_end_ms").let { if (it > 0) it else ts }

@@ -1,5 +1,25 @@
 # qdrant_glasses — project rules
 
+## The demo app is `tech.qdrant.glasses` — NOTHING ELSE (IMPORTANT)
+
+The one and only demo/app on the glasses is the package **`tech.qdrant.glasses`**
+(applicationId in `app/build.gradle.kts`; `installDemoDebug` installs exactly this).
+Its launch activity is `tech.qdrant.glasses/.MainActivity`. To launch:
+
+    adb shell monkey -p tech.qdrant.glasses -c android.intent.category.LAUNCHER 1
+
+Do NOT launch, screenshot, uninstall, or grant permissions to any other
+`tech.qdrant.*` package. In particular `tech.qdrant.edge.example` is a **different,
+empty SDK-example app** ("QdrantEdgeExample" title, blank body) that is NOT ours —
+chasing it once cost a whole session of false "white screen" debugging. `tech.qdrant.hello`
+is an old throwaway. If you see a stale package name in memory/notes, distrust it and
+re-check `pm list packages | grep qdrant` against the build.gradle applicationId.
+
+Also: **`adb screencap` cannot capture the CameraX preview** (hardware surface) — a
+working demo still screenshots as a ~3.5 KB solid color. Never conclude "white/blank
+screen" from a screencap alone; trust the user's eyes, or check the CameraX use-case
+logs (`UseCaseAttachState`) instead.
+
 ## Demo memory wipe (IMPORTANT)
 
 The demo's object memory can live in TWO places: the glasses (Qdrant Edge shards +

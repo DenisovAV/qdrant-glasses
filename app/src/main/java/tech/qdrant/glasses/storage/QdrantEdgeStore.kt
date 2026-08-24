@@ -2,28 +2,28 @@ package tech.qdrant.glasses.storage
 
 import android.content.Context
 import android.util.Log
-import tech.qdrant.edge.CountRequest
-import tech.qdrant.edge.Distance
-import tech.qdrant.edge.EdgeConfig
-import tech.qdrant.edge.EdgeShard
-import tech.qdrant.edge.Point
-import tech.qdrant.edge.UpdateOperation
-import tech.qdrant.edge.VectorDataConfig
-import tech.qdrant.edge.ffi.Condition
-import tech.qdrant.edge.ffi.FieldCondition
-import tech.qdrant.edge.ffi.Filter
-import tech.qdrant.edge.ffi.HnswIndexConfig
-import tech.qdrant.edge.ffi.NamedVector
-import tech.qdrant.edge.ffi.PointId
-import tech.qdrant.edge.ffi.Query
-import tech.qdrant.edge.ffi.QueryRequest
-import tech.qdrant.edge.ffi.RangeFloat
-import tech.qdrant.edge.ffi.ScoredPoint
-import tech.qdrant.edge.ffi.ScoringQuery
-import tech.qdrant.edge.ffi.ScrollRequest
-import tech.qdrant.edge.ffi.Vector
-import tech.qdrant.edge.ffi.WithPayload
-import tech.qdrant.edge.ffi.WithVector
+import io.qdrant.edge.CountRequest
+import io.qdrant.edge.Distance
+import io.qdrant.edge.EdgeConfig
+import io.qdrant.edge.EdgeShard
+import io.qdrant.edge.Point
+import io.qdrant.edge.UpdateOperation
+import io.qdrant.edge.VectorDataConfig
+import io.qdrant.edge.Condition
+import io.qdrant.edge.FieldCondition
+import io.qdrant.edge.Filter
+import io.qdrant.edge.HnswIndexConfig
+import io.qdrant.edge.NamedVector
+import io.qdrant.edge.PointId
+import io.qdrant.edge.Query
+import io.qdrant.edge.QueryRequest
+import io.qdrant.edge.RangeFloat
+import io.qdrant.edge.ScoredPoint
+import io.qdrant.edge.ScoringQuery
+import io.qdrant.edge.ScrollRequest
+import io.qdrant.edge.Vector
+import io.qdrant.edge.WithPayload
+import io.qdrant.edge.WithVector
 import java.io.File
 import java.util.UUID
 
@@ -76,7 +76,9 @@ class QdrantEdgeStore(
                     // bench example), which serialized the graph build on ONE of the AR1's 4 cores and
                     // ~3–4×'d the build time — the real cause of the low HNSW ingest, not Qdrant itself.
                     m = 16uL, efConstruct = 100uL, fullScanThreshold = 10000uL,
-                    maxIndexingThreads = 0uL, onDisk = false, payloadM = null,
+                    // 0.8: HnswIndexConfig dropped the boolean `onDisk` for a richer `memory: Memory?`
+                    // (default null = the old in-memory behavior `onDisk = false` gave us).
+                    maxIndexingThreads = 0uL, payloadM = null,
                 ) else null,
             )
         ),
@@ -136,7 +138,7 @@ class QdrantEdgeStore(
     override fun search(vector: FloatArray, topK: Int): List<ObjectHit> = synchronized(lock) {
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = vector.toList(), using = FIELD)),
+            query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(vector.toList()), using = FIELD)),
             prefetches = emptyList(),
             withVector = null, withPayload = WithPayload.Bool(true),
             filter = null, scoreThreshold = null, params = null
@@ -171,7 +173,7 @@ class QdrantEdgeStore(
         )
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = vector.toList(), using = FIELD)),
+            query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(vector.toList()), using = FIELD)),
             prefetches = emptyList(),
             withVector = null, withPayload = WithPayload.Bool(true),
             filter = filter, scoreThreshold = null, params = null

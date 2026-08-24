@@ -53,6 +53,9 @@ class PerceptionPipeline(
     // only when the sysprop explicitly disables it, making onFrame's call to it a no-op; this
     // class carries NO memory-write path of its own anymore (Task 2.4 retired the crop store).
     private val momentCapture: MomentCapture?,
+    // Stage 3 live text-region highlighting: DBNet on the NPU (~10.6ms), run per detect-frame
+    // alongside YOLO, its boxes drawn CYAN on the stream. Null = off (models absent / disabled).
+    private val dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null,
 ) {
     companion object {
         private const val TAG = "GlassesVM"
@@ -71,6 +74,9 @@ class PerceptionPipeline(
     // boxes. Immutable List + @Volatile ref = lock-free. Boxes lag the video by ~1 detect cycle
     // (~110ms); the tracker smooths positions so the lag is imperceptible.
     @Volatile private var latestDetections: List<tech.qdrant.glasses.detect.Detection> = emptyList()
+    // DBNet text-region boxes (normalized [0,1]), published by inferLane, read by streamLane to
+    // overlay in CYAN — same lock-free @Volatile handoff as latestDetections above.
+    @Volatile private var latestTextBoxes: List<android.graphics.RectF> = emptyList()
     // Region-candidate snapshot for MomentCapture's region layer (Task 2.2) — same lock-free
     // publish pattern as [latestDetections] just above, read from a DIFFERENT lane (embedLane, via
     // MomentCapture's regionsProvider) instead of streamLane. Read-only: MomentCapture never mutates
@@ -120,6 +126,7 @@ class PerceptionPipeline(
         // CAS the gate only AFTER both copies exist, so the early-return above can never strand it.
         if (streamCopy != null && streamBusy.compareAndSet(false, true)) {
             val dets = latestDetections   // volatile read — at most ~1 detect cycle stale
+            val txtBoxes = latestTextBoxes // DBNet text-region boxes (normalized), same stale window
             scope.launch(streamLane) {
                 try {
                     val aspect = streamCopy.height.toFloat() / streamCopy.width
@@ -135,6 +142,9 @@ class PerceptionPipeline(
                                 it.bbox.left * sx, it.bbox.top * sy, it.bbox.right * sx, it.bbox.bottom * sy))
                         }
                         tech.qdrant.glasses.stream.drawBoxesInPlace(scaled, scaledDets)
+                        // Text boxes are NORMALIZED [0,1] → scaled to `scaled`'s pixels inside the
+                        // draw call (NOT via the sx/sy pixel factors used for the object boxes).
+                        tech.qdrant.glasses.stream.drawTextBoxesInPlace(scaled, txtBoxes)
                         val baos = java.io.ByteArrayOutputStream()
                         scaled.compress(Bitmap.CompressFormat.JPEG, STREAM_QUALITY, baos)
                         hud.offerFrame(baos.toByteArray())
@@ -175,6 +185,11 @@ class PerceptionPipeline(
                     Log.e(TAG, "detect failed", e); return@launch
                 }
                 val detMs = System.currentTimeMillis() - t0
+                // Stage 3 live text-region highlighting: DBNet on the NPU over the SAME frame (recycled
+                // in this lane's finally). Additive + failure-swallowing — a text-detect error must
+                // never drop the object frame or the tracker update.
+                latestTextBoxes = try { dbnetDetector?.detect(frame) ?: emptyList() }
+                    catch (e: Throwable) { Log.w(TAG, "text detect failed: ${e.message}"); emptyList() }
                 val tracks = tracker.update(detections)
                 latestDetections = detections   // publish for the stream lane (volatile write)
                 // Publish for MomentCapture's region layer (Task 2.2) — confirmed() reads tracker

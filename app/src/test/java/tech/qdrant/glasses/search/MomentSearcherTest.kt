@@ -7,6 +7,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
@@ -42,8 +43,14 @@ class MomentSearcherTest {
         var lastWindowUntil: Long? = null; private set
         override fun storeMoment(clipVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun storeRegion(clipVec: FloatArray, payload: MomentPayload) = error("not used")
+        override fun storeOcr(textVec: FloatArray, payload: MomentPayload) = error("not used")
         override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = frameHits
         override fun searchRegions(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = regionHits
+        // Stage 3 OCR channel — MomentSearcherTest never wires a bgeEncoder into MomentSearcher, so
+        // this branch is never reached; kept as `error()` like the other unused write-path methods
+        // above so a future test that DOES wire OCR search finds out immediately if it forgets to
+        // stub this.
+        override fun searchText(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?) = error("not used")
         override fun timeline(limit: Int): List<MomentHit> = emptyList()
         override fun framesInWindow(sinceMs: Long?, untilMs: Long?, limit: Int): List<MomentHit> {
             lastWindowSince = sinceMs; lastWindowUntil = untilMs
@@ -69,16 +76,22 @@ class MomentSearcherTest {
     private fun noopHud() = HudPublisher(railItems = { emptyList() }, momentItems = { emptyList() })
 
     @Test fun searchAcceptsGatePassAndTagAccept_rejectsBelowGateNoTag() {
-        // (a) ABOVE MomentSearcher's 0.25 gate, no region — accepted on score alone.
-        val aboveGate = frameHit("a", score = 0.30f)
+        // The gate is PER-BACKEND ([CropEncoderFactory.searchGate]), so fixtures are expressed
+        // RELATIVE to it — a pinned "0.15 = below gate" silently became ABOVE-gate when the default
+        // backend moved CLIP→SigLIP2 (gate 0.25→0.085). softBoost's max lift is
+        // TAG_BOOST_LAMBDA·yoloConf·verifyCos = 0.05·0.9·0.8 ≈ 0.036, so (c)'s region (0.3·gate) sits
+        // far enough below that even boosted it stays under the gate, proving (c) is admitted by the
+        // tag-accept OR-clause, not the vector score.
+        val gate = CropEncoderFactory.searchGate
+        // (a) ABOVE gate, no region — accepted on score alone.
+        val aboveGate = frameHit("a", score = gate + 0.05f)
         // (b) BELOW gate, no matching region at all — must be rejected.
-        val belowGateNoTag = frameHit("b", score = 0.15f)
-        // (c) BELOW gate on BOTH the frame hit and its region (fused score also stays below gate,
-        // and the bounded softBoost — max 0.05 — can't close the gap either: 0.20 + 0.05*0.9*0.8 =
-        // 0.236, still < 0.25), but the region's label ("cup") verifies (verifyCos > 0) and matches
-        // the query — accepted via the tag-accept OR-clause, not the vector gate.
-        val belowGateFrame = frameHit("c", score = 0.10f)
-        val belowGateVerifiedRegion = regionHit("c", score = 0.20f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
+        val belowGateNoTag = frameHit("b", score = gate * 0.5f)
+        // (c) BELOW gate on BOTH the frame hit and its region (fused max stays below gate, and the
+        // bounded softBoost can't close the gap), but the region's label ("cup") verifies
+        // (verifyCos > 0) and matches the query — accepted via the tag-accept OR-clause.
+        val belowGateFrame = frameHit("c", score = gate * 0.2f)
+        val belowGateVerifiedRegion = regionHit("c", score = gate * 0.3f, label = "cup", yoloConf = 0.9f, verifyCos = 0.8f)
 
         val searcher = MomentSearcher(
             cropEncoder = FakeCropEncoder(),
@@ -123,5 +136,33 @@ class MomentSearcherTest {
         val since = store.lastWindowSince!!
         val until = store.lastWindowUntil!!
         assertTrue("since must precede until", since < until)
+    }
+
+    // --- gate-then-decay recency ranker (Config.RECENCY_TAU_MS) — pure companion fn, no search() deps ---
+
+    @Test fun recencyRankFavorsFresherAmongNearEqualScores() {
+        val now = 1_000_000_000L
+        val min = 60_000L
+        // "old" is marginally STRONGER (0.30 vs 0.28) but 30 min stale; "fresh" is 1 min old. With
+        // τ = 10 min: old → 0.30·exp(-3)=0.015, fresh → 0.28·exp(-0.1)=0.253. Recency flips the order.
+        val old   = frameHit("old", score = 0.30f).copy(timestampMs = now - 30 * min)
+        val fresh = frameHit("fresh", score = 0.28f).copy(timestampMs = now - 1 * min)
+        val ranked = MomentSearcher.recencyRank(listOf(old, fresh), now, tauMs = 10 * min)
+        assertEquals(listOf("fresh", "old"), ranked.map { it.id })
+    }
+
+    @Test fun recencyRankKeepsScoreOrderAtEqualAgeAndClampsFutureStamps() {
+        val now = 1_000_000_000L
+        // Equal timestamps → identical decay factor → the STABLE sort keeps raw-score order.
+        val strong = frameHit("strong", score = 0.30f).copy(timestampMs = now - 60_000L)
+        val weak   = frameHit("weak", score = 0.20f).copy(timestampMs = now - 60_000L)
+        assertEquals(listOf("strong", "weak"),
+            MomentSearcher.recencyRank(listOf(weak, strong), now, tauMs = 600_000L).map { it.id })
+        // A hit stamped in the FUTURE (write-time clock skew) must NOT be amplified: Δt clamps to 0
+        // (decay = 1), so it ranks on its (lower) score alone. Without the clamp exp(+1)=2.72 would
+        // rocket future (0.22) above strong (0.30·exp(-0.1)=0.271) — this asserts strong still wins.
+        val future = frameHit("future", score = 0.22f).copy(timestampMs = now + 600_000L)
+        val ranked = MomentSearcher.recencyRank(listOf(future, strong), now, tauMs = 600_000L)
+        assertEquals("strong", ranked.first().id)
     }
 }

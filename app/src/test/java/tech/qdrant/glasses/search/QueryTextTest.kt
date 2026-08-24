@@ -294,4 +294,177 @@ class QueryTextTest {
         assertEquals(dayWindow(2025, 8, 5, utc), p.window)   // Sept 5, NOT yesterday
         assertEquals("keys", p.embedText); assertFalse(p.timeOnly)
     }
+
+    // --- Relative temporal grammar: weekday / week / month / N-ago / day-before-yesterday.
+    // now2 = 2026-08-17 12:00 UTC, a MONDAY. Windows in UTC to match dayWindow.
+    private fun monthStart(mo0: Int) =
+        Calendar.getInstance(utc).apply { clear(); set(2026, mo0, 1, 0, 0, 0) }.timeInMillis
+
+    @Test fun lastWeekdayResolvesToPastOccurrence() {
+        // Aug 11 is the Tuesday before Monday Aug 17.
+        assertEquals(dayWindow(2026, 7, 11, utc), extractTimeWindow("what did I see last Tuesday", now2, utc))
+        assertEquals(dayWindow(2026, 7, 11, utc), extractTimeWindow("the report on Tuesday", now2, utc))
+    }
+    @Test fun lastWeekIsPreviousMondayToSunday() {
+        val w = extractTimeWindow("desk last week", now2, utc)!!
+        val monAug10 = Calendar.getInstance(utc).apply { clear(); set(2026, Calendar.AUGUST, 10, 0, 0, 0) }.timeInMillis
+        assertEquals(monAug10, w.sinceMs)                 // Mon Aug 10 00:00
+        assertEquals(monAug10 + 7 * DAY - 1, w.untilMs)   // .. Sun Aug 16 23:59:59.999
+    }
+    @Test fun thisWeekIsMondayUntilNow() {
+        val w = extractTimeWindow("what did I see this week", now2, utc)!!
+        assertEquals(dayWindow(2026, 7, 17, utc).sinceMs, w.sinceMs)   // Mon Aug 17 00:00
+        assertEquals(now2, w.untilMs)
+    }
+    @Test fun lastMonthIsWholePreviousMonth() {
+        val w = extractTimeWindow("what did I see last month", now2, utc)!!
+        assertEquals(monthStart(Calendar.JULY), w.sinceMs)
+        assertEquals(monthStart(Calendar.AUGUST) - 1, w.untilMs)
+    }
+    @Test fun inMonthIsWholeNamedMonth() {
+        val w = extractTimeWindow("the MCP talk in April", now2, utc)!!
+        assertEquals(monthStart(Calendar.APRIL), w.sinceMs)
+        assertEquals(monthStart(Calendar.MAY) - 1, w.untilMs)
+    }
+    @Test fun nDaysAgoIsThatDay() {
+        assertEquals(dayWindow(2026, 7, 14, utc), extractTimeWindow("3 days ago", now2, utc))   // 17 - 3
+    }
+    @Test fun dayBeforeYesterdayIsTwoDaysBack() {
+        assertEquals(dayWindow(2026, 7, 15, utc), extractTimeWindow("the day before yesterday", now2, utc))
+    }
+
+    // parseQuery integration for the user's three example shapes.
+    @Test fun parseObjectPlusRelativeWeek() {
+        val p = parseQuery("desk last week", now2, utc)
+        assertEquals("desk", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+    }
+    @Test fun parsePureTimeWeekdayIsTimeOnly() {
+        val p = parseQuery("what did I see last Tuesday", now2, utc)
+        assertEquals("", p.embedText); assertNotNull(p.window); assertTrue(p.timeOnly)
+    }
+    @Test fun parseTopicPlusInMonth() {
+        val p = parseQuery("the MCP talk in April", now2, utc)
+        assertEquals("mcp talk", p.embedText); assertNotNull(p.window); assertFalse(p.timeOnly)
+    }
+    // Guard: relative-date additions must not eat a plain object/location query.
+    @Test fun plainQueriesUnaffectedByRelativeGrammar() {
+        assertNull(extractTimeWindow("where is my laptop", now2, utc))
+        assertEquals("in my backpack", parseQuery("in my backpack", now2, utc).embedText)
+    }
+
+    // Coverage stress test: 100 realistic queries → dump each parse to a file for human review.
+    // Not an assertion suite (always "passes"); the point is to eyeball which phrasings the grammar
+    // MISSES (no window where one is meant, boilerplate left in embedText, wrong intent).
+    @Test fun dumpHundredQueryParsesForReview() {
+        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm").apply { timeZone = utc }
+        fun d(ms: Long?) = ms?.let { fmt.format(java.util.Date(it)) } ?: "?"
+        val queries = listOf(
+            // object recall (no time)
+            "where's my laptop", "find my keys", "where did I put my wallet", "my phone",
+            "show me my glasses", "where are my headphones", "find the charger", "where's the remote",
+            "my backpack", "find my umbrella", "where's my water bottle", "my notebook",
+            "show me the scissors", "where did I last see my passport", "the red mug",
+            // object + relative time
+            "laptop yesterday", "cup this morning", "keys last week", "phone last Tuesday",
+            "wallet an hour ago", "bag today", "mug last month", "charger 3 days ago",
+            "glasses this week", "bottle last night", "notebook this afternoon", "badge earlier today",
+            "book two weeks ago", "remote a few minutes ago", "umbrella the day before yesterday",
+            "headphones on Monday", "scissors last Friday", "watch last weekend", "folder this evening",
+            "the desk last week",
+            // object + absolute date
+            "wallet on September 5", "laptop on August 1", "keys on July 4", "phone on March 8",
+            "cup on 5 september",
+            // pure time
+            "what did I see yesterday", "what did I see last week", "what did I see last Tuesday",
+            "what did I see this morning", "what did I see in April", "what did I see on September 5",
+            "what did I see last month", "what did I see today", "what did I see 3 days ago",
+            "what did I see this week", "what did I see last night", "what did I see over the weekend",
+            "what did I see a week ago", "what did I see this month", "what did I see on Monday",
+            // topic / OCR text
+            "the MCP talk in April", "slides about kubernetes", "the whiteboard with the diagram",
+            "notes on the roadmap", "the presentation about AI", "the poster in the hallway",
+            "the menu at the restaurant", "the sign that said exit", "the receipt from lunch",
+            "the code on the screen", "the meeting notes last week", "the error message",
+            "the phone number on the card", "the address on the envelope", "the title of the book",
+            // recall intent
+            "where did I leave my laptop", "where did I put my keys", "where did I last see my wallet",
+            "where did I drop my phone", "where did I leave my badge yesterday", "where did I put the charger",
+            "where did I last see the remote", "where did I leave my glasses this morning",
+            "where did I put my umbrella", "where did I drop my keys last Tuesday",
+            // count / aggregation
+            "how many cups did I see", "how many times did I see my laptop", "how many people did I see today",
+            "how many bottles last week", "how many times did I see the whiteboard",
+            // tricky / edge phrasings
+            "a couple days ago", "two months ago", "earlier this week", "a while ago", "recently",
+            "just now", "over the weekend", "last night", "this evening", "tonight", "a few hours ago",
+            "yesterday morning", "sometime last week", "around noon", "at lunch",
+        )
+        val sb = StringBuilder("n=${queries.size}  now2 = Mon 2026-08-17 12:00 UTC\n\n")
+        queries.forEachIndexed { i, q ->
+            val p = parseQuery(q, now2, utc)
+            val win = p.window?.let { "${d(it.sinceMs)}..${d(it.untilMs)}" } ?: "—"
+            sb.appendLine("%3d | %-38s | embed='%s' | win=%s | timeOnly=%s recall=%s"
+                .format(i + 1, q, p.embedText, win, p.timeOnly, p.recallIntent))
+        }
+        java.io.File("/private/tmp/claude-501/-Users-sashadenisov-Work-qdrant-glasses/f9efee29-f096-4cd5-8759-1877d8e07302/scratchpad/query_parses.txt")
+            .writeText(sb.toString())
+    }
+
+    // Second, adversarial batch (fable-generated): future time, "a fortnight/back", seasons, event-
+    // relative, holidays, ISO dates, and false-trigger words ("may"/"march"/"May issue"). Same dump-for-
+    // review format; the point is to see false-positives + uncovered phrasings, not to assert.
+    @Test fun dumpAgentQueryParsesForReview() {
+        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm").apply { timeZone = utc }
+        fun d(ms: Long?) = ms?.let { fmt.format(java.util.Date(it)) } ?: "?"
+        val queries = listOf(
+            "Where did I leave my keys?", "Where's my wallet?", "Where'd I put my phone charger?", "Wheres my badge",
+            "What did I see yesterday?", "What did I see last Thursday?",
+            "What am I supposed to see this coming Friday on my calendar?", "What did I see the day before yesterday?",
+            "Show me what I saw a fortnight ago", "What did I look at 10 days ago?", "What was I looking at half an hour ago?",
+            "What did I see a couple weeks back?", "What did I see earlier this afternoon?", "What was on my desk last week?",
+            "What did I see in March?", "Show me the whiteboard from early April", "What was I reading at the start of the month?",
+            "What did I photograph mid-July?", "Where did I put my gloves last winter?", "What did I see at the beach this summer?",
+            "I saw a poster a while back, find it", "That restaurant menu from the other day", "The bike I saw ages ago",
+            "What did I see recently?", "What was I just looking at?", "What did I see just now?",
+            "Where was my laptop before lunch?", "What was on the screen after the meeting?", "The slides from during the conference",
+            "What did I pass on my way home?", "What did I see on my birthday?", "The decorations I saw around Christmas",
+            "What did I see on 2026-03-15?", "What was I doing at 3pm yesterday?", "The talk about MCP",
+            "The diagram on the whiteboard", "What was the error code on the screen?", "What's the wifi password I saw at the cafe?",
+            "What was my gate number?", "The price tag on that jacket", "The slide about vector databases",
+            "What did the street sign say near the station?", "The phone number on the flyer",
+            "The license plate of the car that hit the pole", "What was written on the meeting room door?",
+            "The QR code at the conference booth", "The red notebook on my desk last Tuesday", "The blue mug in the kitchen this morning",
+            "The black backpack I had at the airport last month", "The green sticky note on my monitor on Monday",
+            "The white cable on the conference table yesterday afternoon", "How many times did I see my keys today?",
+            "How often was the laptop open this week?", "How many cups of coffee did I have yesterday?",
+            "How many people were in the meeting room?", "How many slides were in that deck?", "What did I not see today?",
+            "The last time I saw my wallet", "When did I last see my passport?", "The first slide of the deck",
+            "The first time I saw that dog this month", "Which room have I not been in today?", "I may have left my keys at the gym",
+            "Did I march to the office or take the bus?", "The May issue of the magazine on the shelf",
+            "A date on the calendar I circled", "What's on my second monitor?", "The march schedule for the parade",
+            "Was there a sale sign in the window?", "Keys?", "Wallet", "Yesterday", "Glasses case", "Umbrella?",
+            "Where did I park the car this morning?", "Where's the remote?", "Where'd I leave my headphones last night?",
+            "Did I lock the front door before I left?", "What book was I reading on the train last Wednesday?",
+            "Show me the receipt from the pharmacy two days ago", "What did I eat for dinner on Sunday?",
+            "The plant I saw at the garden center a month ago", "What was on the kitchen counter an hour ago?",
+            "The address on the package that arrived this week", "What did the doctor's prescription say?",
+            "The chart from the standup this morning", "Where were my sunglasses the weekend before last?",
+            "What did I see between 9 and 10 this morning?", "What was I looking at around noon?",
+            "The graffiti I walked past sometime in June", "Did I see my neighbor's cat this evening?",
+            "What was the room number of my hotel?", "Show me everything from last Friday evening",
+            "The blue folder — did I have it at the office or at home?", "What jacket was I wearing on New Year's Eve?",
+            "The screwdriver I used the weekend I fixed the shelf", "What did the parking meter display say?",
+            "Anything with a dog in it from this month", "The total on the grocery bill from Tuesday",
+            "What was the last thing I saw before my glasses died last night?",
+        )
+        val sb = StringBuilder("n=${queries.size}  now2 = Mon 2026-08-17 12:00 UTC\n\n")
+        queries.forEachIndexed { i, q ->
+            val p = parseQuery(q, now2, utc)
+            val win = p.window?.let { "${d(it.sinceMs)}..${d(it.untilMs)}" } ?: "—"
+            sb.appendLine("%3d | %-52s | embed='%s' | win=%s | tOnly=%s rc=%s"
+                .format(i + 1, q.take(52), p.embedText, win, p.timeOnly, p.recallIntent))
+        }
+        java.io.File("/private/tmp/claude-501/-Users-sashadenisov-Work-qdrant-glasses/f9efee29-f096-4cd5-8759-1877d8e07302/scratchpad/query_parses_agent.txt")
+            .writeText(sb.toString())
+    }
 }

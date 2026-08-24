@@ -1,7 +1,11 @@
 package tech.qdrant.glasses.search
 
 import android.util.Log
+import tech.qdrant.glasses.Config
+import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.CropEncoderFactory
+import tech.qdrant.glasses.fleet.FleetSource
 import tech.qdrant.glasses.storage.MemoryFrame
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentStore
@@ -37,6 +41,20 @@ class MomentSearcher(
     private val cropEncoder: CropEncoder,
     private val store: MomentStore,
     private val hud: HudPublisher,
+    // Stage 3 "OCR read channel": null disables the text-search fan-out entirely (mirrors
+    // MomentCapture's ocrEngine/bgeEncoder nullable-optional-feature contract) — GlassesViewModel
+    // only passes a non-null encoder when GlassesComponents.load() built one. Note this is the SAME
+    // BgeTextEncoder instance MomentCapture uses to write the `ocr` channel — searching with a
+    // different encoder instance would still work (it's a fixed pretrained model, not fine-tuned
+    // per-session) but there is exactly one instance in the app either way (GlassesComponents.bgeEncoder).
+    private val bgeEncoder: BgeTextEncoder? = null,
+    // Fleet-sync Task 5 (Spec §3/§5): the pulled fleet corpus, behind the FleetSource seam so this
+    // class stays testable in a plain JVM/Robolectric test (no native EdgeShard) — see FleetSource's
+    // KDoc. Null (the default, same nullable-optional-feature contract as bgeEncoder above) means
+    // "no fleet configured" and the merge step below is a no-op, byte-for-byte today's local-only
+    // search — GlassesComponents only passes non-null when Config.FLEET_URL is set AND a pull
+    // succeeded (Task 6).
+    private val fleet: FleetSource? = null,
 ) {
     companion object {
         private const val TAG = "GlassesVM"
@@ -45,24 +63,47 @@ class MomentSearcher(
          *  query's true most-recent sighting may not be a top-5 cosine hit. */
         private const val RECALL_FETCH_K = 25
 
+        // BGE cosine gate for the OCR "read channel" (Stage 3) — a DIFFERENT scale than
+        // CropEncoderFactory.searchGate (BGE sentence embeddings, not CLIP/SigLIP image-text), so
+        // this is its own constant, not reused from there. A real text match (query text actually
+        // appears in a recognized OCR line) should score high on BGE's own scale; 0.5 is an
+        // UNCALIBRATED starting value — TODO: calibrate on-device against real OCR'd text once
+        // Stage 3 has been exercised on the glasses (same "starting value pending calibration"
+        // status as CONFIRM_COSINE/VERIFY_COS/searchGate/TAG_BOOST_LAMBDA elsewhere in this plan).
+        private const val OCR_GATE = 0.5f
+
         /**
-         * Per-channel score gate for whole-frame moment search. CALIBRATED from an on-device
-         * rehearsal (Spec §7/§8 unknown #7): the CLIP modality gap is real at this scale — whole-
-         * frame top cosines for a query naming a PRESENT object ran 0.26–0.29 (laptop 0.29, phone
-         * 0.28, cup/keyboard/chair 0.26), but an ABSENT object's query landed at 0.236–0.246
-         * (elephant 0.236, banana 0.241, pizza/umbrella 0.246) — indistinguishable from a WEAK
-         * present-object hit (person/book 0.239). The old 0.20 gate passed EVERY absent-object
-         * query as a "hit". 0.25 is precision-first: it clears the observed junk floor (~0.246)
-         * while every strong present object still survives; a weak/broad present object that now
-         * misses this gate is recovered by an exact VERIFIED-tag match instead (see the
-         * tag-accept filter in [search] / [tagAcceptedMomentIds]), not by loosening the vector gate.
+         * The whole-frame moment-search score gate is PER-BACKEND — [CropEncoderFactory.searchGate]
+         * — because the text→image cosine scale differs by encoder (modality gap). CLIP (QNN_B32):
+         * 0.25, calibrated from an on-device rehearsal — present-object queries ran 0.26–0.29, the
+         * absent junk floor ~0.246, so 0.25 is precision-first. SigLIP2 (SIGLIP_NPU): 0.085 — its
+         * scale is ~3× more compressed (measured on-device: present ~0.11, absent ~0.069), so the
+         * CLIP 0.25 left EVERY SigLIP moment below the gate and search worked by verified-tag match
+         * ONLY. A weak/broad present object that still misses the gate is recovered by an exact
+         * VERIFIED-tag match (the tag-accept filter in [search] / [tagAcceptedMomentIds]).
          */
-        private const val MOMENT_SEARCH_GATE = 0.25f
+
+        /**
+         * Gate-then-decay re-rank of gate SURVIVORS (see [Config.RECENCY_TAU_MS]). Re-orders — never
+         * re-gates, never drops — [hits] by `score × exp(-Δt / τ)`, so the freshest of several
+         * near-equal cosine matches wins. Δt = [nowMs] − hit timestamp, clamped ≥ 0 so a write-time
+         * clock skew that stamps a moment slightly in the future can't AMPLIFY it (exp of a positive
+         * exponent). [tauMs] is assumed > 0 (the caller gates on that; 0 is the OFF sentinel and would
+         * divide into NaN, never passed here). sortedByDescending is STABLE, so hits with equal decayed
+         * scores keep their incoming (raw-score-sorted) order — decay only breaks near-ties, it doesn't
+         * reshuffle. Pure + static so it unit-tests without the search() deps.
+         */
+        internal fun recencyRank(hits: List<MomentHit>, nowMs: Long, tauMs: Long): List<MomentHit> =
+            hits.sortedByDescending { h ->
+                val dt = (nowMs - h.timestampMs).coerceAtLeast(0L).toDouble()
+                h.score * kotlin.math.exp(-dt / tauMs)
+            }
     }
 
     /** Runs on: inferLane. */
     fun search(query: String): ObjectSearcher.Outcome {
-        val pq = parseQuery(query, System.currentTimeMillis())
+        val nowMs = System.currentTimeMillis()
+        val pq = parseQuery(query, nowMs)
         if (pq.embedText != query.lowercase())
             Log.i(TAG, "query normalized(moments): \"$query\" → \"${pq.embedText}\" window=${pq.window}")
 
@@ -126,7 +167,30 @@ class MomentSearcher(
             Log.e(TAG, "moment store search failed", e)
             return ObjectSearcher.Outcome.Unavailable
         }
-        // MOMENT_SEARCH_GATE's raised 0.25 is precision-first against the whole-frame junk floor,
+        // Stage 3 "OCR read channel": a SEPARATE search — OCR hits live in the BGE 384-dim `text`
+        // space, not the crop encoder's `clip` space [allHits] above is scored in, so they can NOT
+        // be folded into fuseAndCollapse's client-side max (different scale entirely). Treated like
+        // [tagAcceptedIds] instead: collect the momentIds of OCR hits whose score clears [OCR_GATE]
+        // and OR-accept those into the final gate below. Additive + optional (mirrors
+        // MomentCapture's ocrEngine/bgeEncoder nullable contract on the write side) — a null
+        // [bgeEncoder] or an embed/store failure here must never fail the whole voice query, so this
+        // gets its OWN try/catch that falls back to an empty set rather than Unavailable.
+        val ocrAcceptedIds = try {
+            val bge = bgeEncoder
+            if (bge != null) {
+                val bgeVec = bge.encode(pq.embedText)
+                val ocrHits = store.searchText(
+                    bgeVec, topK = fetchK, sinceMs = pq.window?.sinceMs, untilMs = pq.window?.untilMs,
+                )
+                ocrHits.filter { it.score >= OCR_GATE }.mapTo(mutableSetOf()) { it.momentId }
+            } else {
+                emptySet()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "moment ocr search failed (non-fatal): ${e.message}")
+            emptySet()
+        }
+        // The per-backend search gate is precision-first against the whole-frame junk floor,
         // but it can also drop a moment whose region label we ALREADY verified at capture time,
         // just because that moment's fused vector score happens to miss the gate (broad categories
         // like "person" verify at 0.21–0.23, per VERIFY_COS's KDoc — nowhere near guaranteed to
@@ -135,20 +199,59 @@ class MomentSearcher(
         // above) — mirrors the retired ObjectSearcher's gate-OR-labelMatch, but sourced from
         // CLIP-verified region labels, not YOLO's raw output, so it can't be polluted by a raw
         // mislabel the way ObjectSearcher's version could.
-        val hits = allHits.filter { it.score >= MOMENT_SEARCH_GATE || it.momentId in tagAcceptedIds }
+        val gate = CropEncoderFactory.searchGate
+        val hits = allHits.filter {
+            it.score >= gate || it.momentId in tagAcceptedIds || it.momentId in ocrAcceptedIds
+        }
         val searchMs = System.currentTimeMillis() - searchT0
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +
-            "hits=${hits.size}/${allHits.size} gate=$MOMENT_SEARCH_GATE tagAccepted=${tagAcceptedIds.size} " +
-            "top=${allHits.firstOrNull()?.score}")
+            "hits=${hits.size}/${allHits.size} gate=$gate tagAccepted=${tagAcceptedIds.size} " +
+            "ocrAccepted=${ocrAcceptedIds.size} top=${allHits.firstOrNull()?.score}")
+        // Fleet-sync Task 5 (Spec §3/§5): query the SAME qvec/window against the pulled fleet corpus
+        // (already tagged source="fleet" by FleetShardStore), gate it with the SAME per-backend gate
+        // local hits just cleared, then dedup by id keeping the LOCAL copy on a collision ("local
+        // wins", Spec §5's two-shard merge) — see `merged` below for how that content-precedence is
+        // kept separate from ranking. Double-gated on BOTH `Config.FLEET_URL.isNotBlank()` AND
+        // `fleet != null` per the plan's documented offline/config gate (Spec §7): GlassesComponents
+        // (Task 6) only ever constructs/passes a non-null `fleet` when the URL is set and a pull
+        // succeeded, so in production the two conditions move together — but re-checking the sysprop
+        // here is still the belt to `fleet != null`'s suspenders (defense in depth against a future
+        // caller wiring `fleet` while the sysprop is unset/cleared at runtime), and it costs nothing:
+        // a test that injects `fleet` directly (MomentSearcherFleetTest) just also has to flip the
+        // sysprop, same as any other Config-gated behavior. Wrapped like every other fleet op (Spec
+        // §7): a runtime failure (unreachable server, native shard error) falls back to local-only,
+        // never fails the voice query.
+        val fleetHits = if (Config.FLEET_URL.isNotBlank() && fleet != null)
+            try { fleet.searchFrames(qvec, fetchK, pq.window?.sinceMs, pq.window?.untilMs).filter { it.score >= gate } }
+            catch (e: Throwable) { Log.w(TAG, "fleet search failed (non-fatal): ${e.message}"); emptyList() }
+        else emptyList()
+        // Dedup by id keeping the FIRST occurrence — hits is concatenated before fleetHits, so a
+        // local hit always wins its own id over a fleet duplicate (content AND score: the surviving
+        // entry is the local one, not whichever scored higher) — but that precedence must NOT also
+        // decide ranking position for non-duplicate ids, or a handful of low-scoring local hits can
+        // crowd a genuinely higher-scoring fleet hit out of the top-5 truncation below purely because
+        // "local" was listed first. So re-sort the deduped union by score before any truncation —
+        // this is a no-op for the recall-intent/recency branches below (both re-sort `merged` again
+        // by their own criteria) and is what actually matters for the plain `else` branch, which
+        // trims `merged` AS-IS with no further sort.
+        val merged = (hits + fleetHits).distinctBy { it.id }.sortedByDescending { it.score }
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
-        // Both branches keep the established top-5 contract: recall re-sorts by recency then trims;
-        // the non-recall branch is already score-sorted (inherited from allHits above) so trimming
-        // here is just the top-5 cap — a two-channel fetchK=5+5 can otherwise surface ~10 distinct
-        // moments after fuseAndCollapse.
-        val ordered =
-            if (pq.recallIntent) hits.sortedByDescending { it.timestampMs }.take(5)
-            else hits.take(5)
+        // All branches keep the established top-5 contract:
+        //   • recall-intent → re-sort by recency (strong preference), trim;
+        //   • recency ranker ON ([Config.RECENCY_TAU_MS] > 0) → gate-then-decay re-rank, trim — a
+        //     tie-breaker within the noisy above-gate band (see recencyRank / Config KDocs);
+        //   • otherwise → the raw score order (inherited from allHits above), trimmed to the top-5 cap
+        //     (a two-channel fetchK=5+5 can otherwise surface ~10 distinct moments after fuseAndCollapse).
+        val ordered = when {
+            pq.recallIntent -> merged.sortedByDescending { it.timestampMs }.take(5)
+            Config.RECENCY_TAU_MS > 0L -> recencyRank(merged, nowMs, Config.RECENCY_TAU_MS).take(5)
+            else -> merged.take(5)
+        }
+        // Fleet-sync (Spec §5): result provenance — each shown card's source (local|fleet), score, label.
+        // The on-device signal that a pulled fleet corpus actually surfaced in the merged top-5.
+        Log.i(TAG, "results(${ordered.size}): " +
+            ordered.joinToString { "${it.source}[${"%.3f".format(it.score)}]${it.label}" })
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)

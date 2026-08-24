@@ -6,8 +6,11 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
+import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
+import tech.qdrant.glasses.ocr.OcrEngine
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
@@ -51,12 +54,21 @@ enum class Decision { SKIP, CAPTURE, HEARTBEAT }
 // Pixel pre-gate (Spec §4 step 2): a candidate whose 32x32 luma grid is at least this similar to
 // the LAST STORED keyframe's grid is "no visible change" -> no capture, unless a heartbeat is due.
 // Same value FrameCaptureManager used for its (now-superseded) whole-pipeline gate.
-private const val PREGATE_SIMILARITY = 0.85f
+// 0.98 (was 0.85): `sim < this -> CAPTURE`, so RAISING it lets MORE frames through, not fewer. The
+// pixel luma-grid vs the last STORED keyframe barely moves in a visually-uniform room — a whole-room
+// pan measured pregateSim 0.91–0.97, all >0.85, so every view was SKIPped before the embedding ran
+// (~1 keyframe stored). 0.98 passes anything with any real pixel change to the semantic CONFIRM
+// (sceneDedupCosine 0.90) stage — the actual scene discriminator; only a near-static frame (~0.99)
+// is pre-skipped (the 45s heartbeat still covers it). Trades a per-3s embedding for real coverage.
+private const val PREGATE_SIMILARITY = 0.98f
 
 // Minimum time between two STORES, regardless of scene change (Spec §4 step 5) — a hard flood cap
 // under heavy motion. Deliberately shorter than HEARTBEAT_MS so a heartbeat is never itself
 // throttled by the cooldown it just satisfied (see [decide]'s ordering).
-private const val CAPTURE_COOLDOWN_MS = 8000L
+// 3000 (was 8000): the cooldown is a HARD cap checked before every other gate, so at 8s an active
+// look-around the room stored only ~1 moment / 8s (a whole-room pan → ~3 keyframes). 3s gives a
+// richer memory during deliberate recording while still throttling the NPU/store on a static scene.
+private const val CAPTURE_COOLDOWN_MS = 3000L
 
 // Force a store even when the scene never visibly changes, so "what did I see N minutes ago"
 // stays answerable for a wearer standing still (Spec §4 step 5).
@@ -126,6 +138,12 @@ class MomentCapture(
     // regions matter; the nullability exists so a bare MomentCapture (unit tests, a hypothetical
     // frame-only deployment) needs no cache just to store keyframes.
     private val labelCache: LabelVectorCache? = null,
+    // Stage 3 "OCR read channel" (additive, like [labelCache]/the region layer): both null disables
+    // OCR entirely — no assets, no BGE model load required. GlassesComponents only builds a non-null
+    // pair when `ocr/` assets provisioned cleanly, so a device missing them still runs frame+region
+    // capture exactly as before Stage 3 (same nullable-optional-feature contract as [labelCache]).
+    private val ocrEngine: OcrEngine? = null,
+    private val bgeEncoder: BgeTextEncoder? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -170,11 +188,11 @@ class MomentCapture(
         // ...at most this often, so a 30fps camera doesn't turn "sample the window" into "score
         // every single frame" (~4 samples over the 800ms window, matching the spec).
         private const val SELECT_SAMPLE_MS = 200L
-        // Semantic confirm (Spec §4 step 4): the chosen frame's CLIP cosine vs the last STORED
-        // keyframe vector must fall below this to count as a genuinely new scene. Bypassed for a
-        // HEARTBEAT decision (see confirmAndStore) — that path exists specifically to store an
-        // UNCHANGED scene, so re-gating it on cosine would defeat the heartbeat entirely.
-        private const val CONFIRM_COSINE = 0.85f
+        // Semantic confirm (Spec §4 step 4): the chosen frame's whole-frame cosine vs the last STORED
+        // keyframe must fall below the gate to count as a genuinely new scene. The gate is PER-BACKEND
+        // — see CropEncoderFactory.sceneDedupCosine — because the whole-frame image↔image cosine scale
+        // differs by encoder (SigLIP's is compressed: different scenes 0.77–0.92, so it needs 0.90 vs
+        // CLIP's 0.85). Bypassed for a HEARTBEAT decision (that path exists to store an UNCHANGED scene).
         // Grid side for BOTH the pixel pre-gate and the sharpness score — same value
         // FrameCaptureManager used for its ssimSize, and SceneDiff.downscaleLuma's default `out`.
         private const val GRID_SIDE = 32
@@ -194,21 +212,31 @@ class MomentCapture(
         // MomentSearcher.kt's/MomentFusion.kt's "(Spec §7/§8 unknown #7)" constants, which ARE on
         // that list.)
         const val REGIONS_MAX_PER_MOMENT = 6
-        // CLIP-verify-the-label threshold (Spec §2/§7): a region embedding's cosine against its
-        // YOLO label's CLIP text vector must clear this to keep the label as a display tag.
-        // CALIBRATED from an on-device rehearsal (was 0.22, seeded from QnnB32CropEncoder's
-        // unrelated visionMinScore floor): distinctive objects verify well clear of either
-        // threshold (laptop 0.26–0.28, cell phone 0.28, cup 0.25), but a broad category like
-        // "person" verified at only 0.21–0.23 on real crops — straddling the old 0.22, so a real
-        // person's label flickered kept/dropped frame to frame. 0.20 keeps a real person's label
-        // stable while still well clear of a genuine non-match. Below this, the region vector is
-        // still stored (it's still a valid recall signal) — only the label is dropped. Affects
-        // FUTURE captures only — points already stored keep whatever verify_cos decision was made
-        // at their own capture time.
-        const val VERIFY_COS = 0.20f
+        // Region label-verify threshold (Spec §2/§7): a region embedding's cosine against its YOLO
+        // label's TEXT vector must clear the gate to keep the label as a display tag. This gate is
+        // now PER-BACKEND — see CropEncoderFactory.verifyGate — because it lives on the same
+        // text→image modality-gap scale as searchGate: a fixed CLIP-scale 0.20 silently dropped
+        // EVERY SigLIP region's label (SigLIP present-cosines ~0.11, not ~0.26). Below the gate the
+        // region vector is still stored (a valid recall signal); only the label is dropped, for
+        // FUTURE captures only — points already stored keep their own capture-time verify_cos.
     }
 
     private val busy = AtomicBoolean(false)
+
+    // Per-backend label-verify gate for the active crop encoder (read once; see the companion note
+    // and CropEncoderFactory.verifyGate). SigLIP's compressed scale needs ~0.10, CLIP ~0.20.
+    private val verifyGate: Float = CropEncoderFactory.verifyGate
+
+    // Per-backend whole-frame scene-dedup cosine (read once; see CropEncoderFactory.sceneDedupCosine).
+    // SigLIP whole-frames barely separate scenes → 0.90 (vs CLIP 0.85) or genuinely-new views get deduped.
+    private val sceneDedupCosine: Float = CropEncoderFactory.sceneDedupCosine
+
+    // DEDICATED lane for background OCR (Stage 3). OCR is ~4s/keyframe on the CPU (DBNet@1536 +
+    // per-line CRNN); running it on [embedLane] would block the NEXT keyframe's embed for those ~4s
+    // and throttle capture. Its OWN single-thread dispatcher runs it IN PARALLEL with embedLane (the
+    // OcrEngine's ORT sessions are still serialized to one thread, since limitedParallelism(1)).
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val ocrLane = kotlinx.coroutines.Dispatchers.Default.limitedParallelism(1)
 
     // Session-generation counter: bumped SYNCHRONOUSLY (on the CALLING thread, not embedLane) at
     // the very top of every startSession(), before its reset is even posted. onFrame() captures
@@ -379,7 +407,8 @@ class MomentCapture(
         lastCheckMs = now
         val grid = gridOf(frame)
         val decision = decide(lastStoredGrid, grid, lastStoreMs, now)
-        Log.d(TAG, "moment gate: decision=$decision")
+        val pregateSim = lastStoredGrid?.let { similarity(it, grid) } ?: -1f
+        Log.d(TAG, "moment gate: decision=$decision pregateSim=%.3f".format(pregateSim))
         when (decision) {
             Decision.SKIP -> frame.recycle()
             Decision.CAPTURE, Decision.HEARTBEAT -> {
@@ -426,9 +455,9 @@ class MomentCapture(
             // A HEARTBEAT decision exists specifically to force a store on an UNCHANGED scene
             // (Spec §4 step 5) — re-gating it on cosine here would reject it right back out and
             // defeat the entire point, so only CAPTURE goes through the confirm check.
-            if (decision == Decision.CAPTURE && prevVec != null && cos >= CONFIRM_COSINE) {
+            if (decision == Decision.CAPTURE && prevVec != null && cos >= sceneDedupCosine) {
                 Log.i(TAG, "moment confirm: not a new scene (cos=%.3f >= %.2f) — skip store"
-                    .format(cos, CONFIRM_COSINE))
+                    .format(cos, sceneDedupCosine))
                 return
             }
 
@@ -517,6 +546,75 @@ class MomentCapture(
                 Log.w(TAG, "moment stored (id=$id) but onMoment callback failed: ${e.message}")
             }
 
+            // OCR "read channel" (Stage 3, additive): recognize any text lines in the SAME keyframe
+            // pixels just stored above, embed each line's text with BGE into the 384-dim `text`
+            // named-vector space, and store as `type=ocr` points sharing this moment's id. The frame
+            // moment is ALREADY durable at this point (id/thumbPath persisted, baseline advanced
+            // above), so — same contract as the region layer right below — a failure here is only
+            // ever logged, never allowed to look like a frame-store failure. Takes its OWN bitmap
+            // copy (not the region layer's `crop`s) because `bitmap` is unconditionally recycled by
+            // the outer `finally` the instant this whole method returns, and OCR runs as a
+            // SEPARATELY launched coroutine on the dedicated [ocrLane] (NOT embedLane — a ~4s OCR must
+            // not block the next keyframe's embed) so it never extends the critical path that just
+            // stored the frame, and runs in parallel with capture. id/ts/
+            // episodeId are captured into locals before the launch — not read again once the
+            // coroutine actually runs — so a startSession() reset racing in behind this launch can't
+            // attribute the OCR points to the wrong session.
+            val ocr = ocrEngine
+            val bge = bgeEncoder
+            if (ocr != null && bge != null) {
+                val ocrMomentId = id
+                val ocrTs = ts
+                val ocrEpisodeId = episodeId
+                val ocrBitmap = try {
+                    bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "moment $id: ocr bitmap copy failed: ${e.message}")
+                    null
+                }
+                if (ocrBitmap != null) {
+                    val w = bitmap.width.toFloat()
+                    val h = bitmap.height.toFloat()
+                    scope.launch(ocrLane) {
+                        try {
+                            val lines = ocr.recognize(ocrBitmap)
+                            var stored = 0
+                            for (line in lines) {
+                                if (line.text.isBlank()) continue
+                                val vec = bge.encode(line.text)
+                                store.storeOcr(vec, MomentPayload(
+                                    type = MomentType.OCR,
+                                    momentId = ocrMomentId,
+                                    episodeId = ocrEpisodeId,
+                                    timestampMs = ocrTs,
+                                    tEndMs = ocrTs,
+                                    // No thumb of its own — an OCR hit is folded into an existing
+                                    // frame/region hit by momentId at search time (MomentSearcher),
+                                    // never displayed as its own HUD card, so it needs no thumbPath.
+                                    thumbPath = "",
+                                    // Same normalized-fraction convention as the region layer's bbox
+                                    // just below (OcrLine.box is in ORIGINAL-image pixel coords).
+                                    bbox = "%.3f,%.3f,%.3f,%.3f".format(
+                                        line.box.left / w, line.box.top / h,
+                                        line.box.right / w, line.box.bottom / h,
+                                    ),
+                                    label = "",
+                                    yoloConf = 0f,
+                                    verifyCos = 0f,
+                                    text = line.text,
+                                ))
+                                stored++
+                            }
+                            Log.i(TAG, "ocr: momentId=$ocrMomentId lines=${lines.size} stored=$stored")
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "moment $ocrMomentId: ocr failed: ${e.message}")
+                        } finally {
+                            ocrBitmap.recycle()
+                        }
+                    }
+                }
+            }
+
             // Region layer (Task 2.2, Spec §2 "CLIP-verify-the-label"): CLIP-verified YOLO
             // regions sharing THIS moment's id, layered ADDITIVELY on top of the frame keyframe
             // just stored above. Still on embedLane, still holding `bitmap` (the chosen keyframe,
@@ -542,9 +640,9 @@ class MomentCapture(
                         try {
                             val regionVec = cropEncoder.encode(crop)
                             val verifyCos = cache.verify(regionVec, region.label)
-                            val verified = verifyCos >= VERIFY_COS
+                            val verified = verifyCos >= verifyGate
                             // dedup-check-style diagnostic line (PerceptionPipeline's convention) so
-                            // VERIFY_COS can be calibrated on real data at the Stage 2 gate.
+                            // the per-backend verifyGate can be calibrated on real data at Stage 2.
                             Log.i(TAG, "region: label=${region.label} verifyCos=%.3f yoloConf=%.3f -> %s"
                                 .format(verifyCos, region.conf, if (verified) "stored" else "label-dropped"))
                             store.storeRegion(regionVec, MomentPayload(
