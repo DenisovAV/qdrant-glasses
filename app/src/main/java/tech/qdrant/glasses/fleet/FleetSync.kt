@@ -23,17 +23,31 @@ class FleetSync(
     private val filesDir: File,
     private val clipDim: Int,
 ) {
-    /** Pulls [collection] down as a snapshot and opens it read-only. Never throws. */
-    suspend fun pull(collection: String = "fleet_curated"): FleetShardStore? = try {
-        val name = client.createShardSnapshot(collection)
-        val snap = File(filesDir, "fleet_snap.bin").apply { delete() }
-        client.downloadSnapshot(collection, 0, name, snap)
-        val dir = File(filesDir, "fleet_shard").apply { deleteRecursively() }
-        unpackSnapshotAsync(snap.absolutePath, dir.absolutePath)
-        FleetShardStore.load(dir.absolutePath, clipDim).also { Log.i(TAG, "fleet pulled: $collection") }
-    } catch (e: Throwable) {
-        Log.w(TAG, "fleet pull failed (non-fatal): ${e.message}")
-        null
+    /**
+     * Pulls [collection] down as a snapshot and opens it read-only. Never throws.
+     *
+     * `fleet_snap.bin` is only ever an intermediate — [unpackSnapshotAsync] consumes it into `dir`,
+     * so it's deleted in a `finally` regardless of outcome. `fleet_shard` (`dir`) is different: on
+     * success it becomes the returned [FleetShardStore]'s on-disk backing and must survive; on
+     * failure nothing owns it, so the catch path deletes it too, leaving no orphan on disk.
+     */
+    suspend fun pull(collection: String = "fleet_curated"): FleetShardStore? {
+        val snap = File(filesDir, "fleet_snap.bin")
+        val dir = File(filesDir, "fleet_shard")
+        return try {
+            val name = client.createShardSnapshot(collection)
+            snap.delete()
+            client.downloadSnapshot(collection, 0, name, snap)
+            dir.deleteRecursively()
+            unpackSnapshotAsync(snap.absolutePath, dir.absolutePath)
+            FleetShardStore.load(dir.absolutePath, clipDim).also { Log.i(TAG, "fleet pulled: $collection") }
+        } catch (e: Throwable) {
+            Log.w(TAG, "fleet pull failed (non-fatal): ${e.message}")
+            dir.deleteRecursively()
+            null
+        } finally {
+            snap.delete()
+        }
     }
 
     companion object {
