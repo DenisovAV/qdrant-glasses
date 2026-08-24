@@ -42,4 +42,17 @@ class FleetQdrantClient(
             dest.outputStream().use { out -> body.byteStream().copyTo(out) }
         }
     }
+
+    /**
+     * DELETE the server-side shard snapshot [name] — cleanup after [downloadSnapshot] pulls it
+     * locally, so snapshots don't accumulate on the fleet hub across every [FleetSync.pull]. Purely
+     * a cleanup op: callers soft-fail this, so the result is ignored here too (no return value).
+     */
+    fun deleteSnapshot(collection: String, shard: Int, name: String) {
+        val req = Request.Builder()
+            .url("$baseUrl/collections/$collection/shards/$shard/snapshots/$name").delete().build()
+        http.newCall(req).execute().use { resp ->
+            require(resp.isSuccessful) { "snapshot delete ${resp.code}" }
+        }
+    }
 }

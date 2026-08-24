@@ -32,4 +32,15 @@ class FleetQdrantClientTest {
         assertEquals("/collections/fleet_curated/shards/0/snapshots/snap-1.snapshot", srv.takeRequest().path)
         srv.shutdown()
     }
+    @Test fun deleteSnapshotSendsDelete() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setBody("""{"result":true,"status":"ok"}"""))
+        srv.start()
+        val c = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        c.deleteSnapshot("fleet_curated", 0, "snap-1.snapshot")
+        val req = srv.takeRequest()
+        assertEquals("DELETE", req.method)
+        assertEquals("/collections/fleet_curated/shards/0/snapshots/snap-1.snapshot", req.path)
+        srv.shutdown()
+    }
 }

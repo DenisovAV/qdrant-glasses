@@ -42,6 +42,15 @@ import java.util.UUID
  */
 class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : FleetSource {
 
+    // Same concurrency story as QdrantEdgeMomentStore/QdrantEdgeStore: the native EdgeShard's
+    // thread-safety is unverified, and this store is touched from more than one lane —
+    // MomentSearcher's searchFrames runs on inferLane while GlassesComponents.close() (main,
+    // GlassesViewModel.onCleared's 800ms-drain "closing anyway" path) can call close() at the
+    // same time. Serialize every native call through one monitor and guard close() with an
+    // idempotent closed flag, exactly like those two stores.
+    private val lock = Any()
+    @Volatile private var closed = false
+
     companion object {
         private const val TAG = "FleetShardStore"
         private const val CLIP_FIELD = "clip"
@@ -94,7 +103,11 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : 
     }
 
     /** Nearest-neighbor search against the fleet corpus's `"clip"` vector; every hit tagged `source="fleet"`. */
-    override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> {
+    override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> = synchronized(lock) {
+        // GlassesComponents.close() can race in from main (onCleared's "closing anyway" drain) while
+        // a query is still in flight on inferLane — a closed shard means no fleet hits, not a
+        // native use-after-free.
+        if (closed) return@synchronized emptyList()
         // Mirrors QdrantEdgeMomentStore.channelSearch's guard: reject a malformed query vector before
         // it ever reaches NamedVector.Dense / the native API.
         require(qvec.size == clipDim) { "dim ${qvec.size} != $clipDim" }
@@ -108,10 +121,16 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : 
         ))
         val hits = results.map { toHit(it) }
         Log.i(TAG, "fleet search: topK=$topK since=$sinceMs until=$untilMs returned=${hits.size}")
-        return hits
+        hits
     }
 
-    fun close() = shard.close()
+    // Idempotent, same discipline as QdrantEdgeMomentStore/QdrantEdgeStore: a second close() must
+    // NOT touch the already-freed native shard.
+    fun close() = synchronized(lock) {
+        if (closed) return@synchronized
+        closed = true
+        shard.close()
+    }
 
     // No bound at all -> no filter (the fleet corpus is small; an unbounded query is the common case).
     private fun timeFilter(sinceMs: Long?, untilMs: Long?): Filter? {
