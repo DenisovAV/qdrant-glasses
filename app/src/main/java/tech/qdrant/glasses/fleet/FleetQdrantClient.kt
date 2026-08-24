@@ -1,8 +1,10 @@
 package tech.qdrant.glasses.fleet
 
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -53,6 +55,36 @@ class FleetQdrantClient(
             .url("$baseUrl/collections/$collection/shards/$shard/snapshots/$name").delete().build()
         http.newCall(req).execute().use { resp ->
             require(resp.isSuccessful) { "snapshot delete ${resp.code}" }
+        }
+    }
+
+    /**
+     * PUT-upsert a batch of already-queued points into [collection] (the UP half of fleet sync —
+     * Spec §4/§5, plan Task 9; [FleetSync.pushDrain] is the caller, off the fleet lane after
+     * [UploadQueue.drain]). `wait=true` so the call only returns once Qdrant has applied the whole
+     * batch — [FleetSync.pushDrain] only [UploadQueue.ack]s after this returns successfully (Task 11),
+     * so a partial/failed upsert must never look like a success here.
+     *
+     * A [QueuedPoint.payloadJson] is a serialized JSON OBJECT of point payload fields (see
+     * [UploadQueue]'s doc) — it is parsed and used directly as the point's `payload`, not nested
+     * under another key. [points] empty is a no-op (no request sent): nothing to upsert, and an
+     * empty `points` array would just be a wasted round trip.
+     */
+    fun upsertPoints(collection: String, points: List<QueuedPoint>) {
+        if (points.isEmpty()) return
+        val body = JSONObject().put("points", JSONArray(points.map { p ->
+            JSONObject()
+                .put("id", p.id)
+                .put("vector", JSONObject().put("clip", JSONArray(p.clip.map { it.toDouble() })))
+                .put("payload", JSONObject(p.payloadJson))
+        }))
+        val req = Request.Builder()
+            .url("$baseUrl/collections/$collection/points?wait=true")
+            .put(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val respBody = resp.body?.string().orEmpty()
+            require(resp.isSuccessful) { "upsert points ${resp.code}: $respBody" }
         }
     }
 }
