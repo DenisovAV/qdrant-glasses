@@ -209,20 +209,32 @@ class MomentSearcher(
             "ocrAccepted=${ocrAcceptedIds.size} top=${allHits.firstOrNull()?.score}")
         // Fleet-sync Task 5 (Spec §3/§5): query the SAME qvec/window against the pulled fleet corpus
         // (already tagged source="fleet" by FleetShardStore), gate it with the SAME per-backend gate
-        // local hits just cleared, then dedup by id keeping the FIRST occurrence — hits is appended
-        // before fleetHits, so a local hit always wins its own id over a fleet duplicate ("local
-        // wins", Spec §5's two-shard merge). Gated on `fleet != null` ONLY — Config.FLEET_URL is
-        // already the gate one layer up, in GlassesComponents (Task 6): it only ever constructs and
-        // passes a non-null `fleet` when the URL is set and a pull succeeded, so re-checking the
-        // sysprop here would be redundant (and wrong for a test that injects `fleet` directly, e.g.
-        // MomentSearcherFleetTest, without going through Config at all). Wrapped like every other
-        // fleet op (Spec §7): a runtime failure (unreachable server, native shard error) falls back
-        // to local-only, never fails the voice query.
-        val fleetHits = if (fleet != null)
+        // local hits just cleared, then dedup by id keeping the LOCAL copy on a collision ("local
+        // wins", Spec §5's two-shard merge) — see `merged` below for how that content-precedence is
+        // kept separate from ranking. Double-gated on BOTH `Config.FLEET_URL.isNotBlank()` AND
+        // `fleet != null` per the plan's documented offline/config gate (Spec §7): GlassesComponents
+        // (Task 6) only ever constructs/passes a non-null `fleet` when the URL is set and a pull
+        // succeeded, so in production the two conditions move together — but re-checking the sysprop
+        // here is still the belt to `fleet != null`'s suspenders (defense in depth against a future
+        // caller wiring `fleet` while the sysprop is unset/cleared at runtime), and it costs nothing:
+        // a test that injects `fleet` directly (MomentSearcherFleetTest) just also has to flip the
+        // sysprop, same as any other Config-gated behavior. Wrapped like every other fleet op (Spec
+        // §7): a runtime failure (unreachable server, native shard error) falls back to local-only,
+        // never fails the voice query.
+        val fleetHits = if (Config.FLEET_URL.isNotBlank() && fleet != null)
             try { fleet.searchFrames(qvec, fetchK, pq.window?.sinceMs, pq.window?.untilMs).filter { it.score >= gate } }
             catch (e: Throwable) { Log.w(TAG, "fleet search failed (non-fatal): ${e.message}"); emptyList() }
         else emptyList()
-        val merged = (hits + fleetHits).distinctBy { it.id }
+        // Dedup by id keeping the FIRST occurrence — hits is concatenated before fleetHits, so a
+        // local hit always wins its own id over a fleet duplicate (content AND score: the surviving
+        // entry is the local one, not whichever scored higher) — but that precedence must NOT also
+        // decide ranking position for non-duplicate ids, or a handful of low-scoring local hits can
+        // crowd a genuinely higher-scoring fleet hit out of the top-5 truncation below purely because
+        // "local" was listed first. So re-sort the deduped union by score before any truncation —
+        // this is a no-op for the recall-intent/recency branches below (both re-sort `merged` again
+        // by their own criteria) and is what actually matters for the plain `else` branch, which
+        // trims `merged` AS-IS with no further sort.
+        val merged = (hits + fleetHits).distinctBy { it.id }.sortedByDescending { it.score }
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
         // All branches keep the established top-5 contract:
