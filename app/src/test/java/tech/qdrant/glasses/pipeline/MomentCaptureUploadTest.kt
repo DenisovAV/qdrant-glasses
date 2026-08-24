@@ -109,6 +109,12 @@ class MomentCaptureUploadTest {
         assertEquals("frame", uploadPayload.getString("type"))
         assertTrue("sync_ts present", uploadPayload.has("sync_ts"))
         assertTrue("thumb_b64 present", uploadPayload.has("thumb_b64"))
+        // Round-1 regression: the upload payload's moment_id must match the enqueued point's OWN
+        // id (Spec §6 frame invariant) — framePayload is built with a momentId="" placeholder
+        // BEFORE storeMoment stamps its own internal copy, so reusing it unstamped silently
+        // shipped moment_id:"" to fleet_inbox on every upload until this was fixed.
+        assertEquals("upload payload moment_id must equal the point's own id",
+            drained[0].id, uploadPayload.getString("moment_id"))
     }
 
     @Test fun nullUploadQueueSkipsTheUploadSideButStillStoresLocally() {

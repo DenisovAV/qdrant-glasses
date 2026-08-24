@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import tech.qdrant.glasses.detect.DetectorFactory
 import tech.qdrant.glasses.detect.ObjectDetector
 import tech.qdrant.glasses.detect.ObjectTracker
@@ -274,11 +275,20 @@ class GlassesComponents(
                         fleetStore = fleetSync.pull()
                         Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
                         // UP half (Task 11, Spec §4/§5): drain moments queued from a PRIOR session up
-                        // to the hub. Runs on THIS load coroutine (off-main); pushDrain is fail-soft
-                        // (never throws except cancellation). This-session captures are enqueued to the
-                        // persistent JSONL queue and drain on the NEXT launch — the natural PoC trigger,
-                        // no lifecycle-scoped periodic loop needed.
-                        fleetSync.pushDrain()
+                        // to the hub. Fired DETACHED on [scope] (round-1 review fix), NOT awaited on
+                        // this load() coroutine: pushDrain can make up to maxEntries/BATCH = 100
+                        // sequential blocking HTTP round trips (each up to FleetQdrantClient's 30s
+                        // callTimeout) against a possibly slow/flaky-but-reachable hub, and load()
+                        // returning is what gates GlassesViewModel's session.setIdle() — i.e. the
+                        // FIRST moment recording/search become available. Awaiting the ENTIRE upload
+                        // backlog inline would hang app readiness on best-effort background I/O,
+                        // against Spec §7's fail-soft/non-blocking spirit and Task 11's own "schedule
+                        // drain on the fleet lane" language. Safe to detach: this-session captures
+                        // can't enqueue anything until recording starts, which can't happen until
+                        // load() returns anyway, so nothing here can race a fresh capture into a lost
+                        // update — the persistent JSONL queue (not this coroutine) is the source of
+                        // truth, and a drain that doesn't finish this launch just retries next time.
+                        scope.launch(kotlinx.coroutines.Dispatchers.IO) { fleetSync.pushDrain() }
                     }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file

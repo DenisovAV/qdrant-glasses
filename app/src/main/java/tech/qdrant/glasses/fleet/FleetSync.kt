@@ -2,6 +2,8 @@ package tech.qdrant.glasses.fleet
 
 import android.util.Log
 import io.qdrant.edge.unpackSnapshotAsync
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.ensureActive
 import java.io.File
 
 /**
@@ -76,17 +78,42 @@ class FleetSync(
      * leaves those points queued for the next drain — no loss (Decision C: the LOCAL moment is never
      * touched by any of this either way). No-op when no fleet tier is configured or the queue is
      * empty. Fail-soft per Spec §7: any error stops this pass and is retried on the next call; this
-     * runs on a fleet lane, never the capture path, so capture is never affected. Cancellation
-     * propagates (structured concurrency).
+     * runs on a fleet lane, never the capture path, so capture is never affected.
+     *
+     * **No-progress guard (round-1 fix):** [UploadQueue.ack] can itself fail fail-soft (returns
+     * `false` rather than throwing — a full disk, a stuck rename, …). The old code ignored that
+     * return value, so a PERSISTENTLY failing [ack] against a reachable server produced an unbounded
+     * hot loop: [UploadQueue.drain] keeps returning the SAME un-acked batch, [FleetQdrantClient.upsertPoints]
+     * keeps succeeding, [UploadQueue.ack] keeps failing, repeat — a tight spin of full-batch HTTP PUTs with no
+     * suspension point in between. This now checks [UploadQueue.ack]'s return and BREAKS the loop the
+     * first time it's `false`, leaving that batch queued for the next [pushDrain] call rather than
+     * retrying it inside this one.
+     *
+     * **Cancellation (round-1 fix, partial):** the loop body ([UploadQueue.drain], the blocking
+     * OkHttp [FleetQdrantClient.upsertPoints] call, [UploadQueue.ack]) has no suspending calls of its
+     * own, so a coroutine cancellation can't interrupt an in-flight HTTP request — that limitation is
+     * NOT fixed here (would need `runInterruptible`/a cancellable OkHttp call wrapper, out of scope
+     * for this pass). What IS fixed: `coroutineContext.ensureActive()` at the top of every iteration
+     * means a cancellation IS observed BETWEEN batches, not only after the whole backlog drains or an
+     * unrelated network error happens to throw — previously true only in the sense that a thrown
+     * [kotlinx.coroutines.CancellationException] gets rethrown, which nothing in the loop body could
+     * ever produce on its own.
      */
     suspend fun pushDrain(collection: String = "fleet_inbox") {
         val queue = uploadQueue ?: return
         try {
             while (true) {
+                coroutineContext.ensureActive()
                 val batch = queue.drain(BATCH)
                 if (batch.isEmpty()) break
                 client.upsertPoints(collection, batch)   // throws on HTTP failure → caught below; batch stays queued
-                queue.ack(batch.map { it.id })
+                if (!queue.ack(batch.map { it.id })) {
+                    // ack failed (already logged by UploadQueue) — stop this pass instead of
+                    // re-upserting the same still-queued batch in a tight loop; retried whole on the
+                    // next pushDrain call.
+                    Log.w(TAG, "fleet pushDrain: ack failed, stopping this pass (batch stays queued, will retry)")
+                    break
+                }
             }
         } catch (e: Throwable) {
             if (e is kotlinx.coroutines.CancellationException) throw e

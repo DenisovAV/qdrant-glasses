@@ -535,11 +535,14 @@ class MomentCapture(
             // with the baseline already advanced — a durable card pointing at a missing file, no
             // retry). Rethrows nothing either way: the outer `finally` below still recycles `bitmap`.
             // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the new
-            // point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
-            // documents on storeMoment(). The gate embedding above IS the stored vector: it is never
-            // re-embedded here or anywhere else on this path. Held in a local (not inlined into the
-            // storeMoment call below) so the fleet-upload enqueue further down can reuse the EXACT
-            // same payload via [MomentPayload.toJson] rather than re-deriving it (Task 10).
+            // point's own id on its OWN internal copy (`payload.copy(...)`, Spec §6 invariant), same
+            // convention QdrantEdgeMomentStore documents on storeMoment() — but it only returns the
+            // bare `id` string, never that stamped copy, so THIS local still carries momentId="".
+            // The gate embedding above IS the stored vector: it is never re-embedded here or anywhere
+            // else on this path. Held in a local (not inlined into the storeMoment call below) so the
+            // fleet-upload enqueue further down can reuse this SAME payload (re-stamped with
+            // `.copy(momentId = id)` once `id` is known — round-1 fix, see that call site) via
+            // [MomentPayload.toJson] rather than re-deriving every other field (Task 10).
             val framePayload = MomentPayload(
                 type = MomentType.FRAME,
                 momentId = "",
@@ -592,7 +595,16 @@ class MomentCapture(
                         val thumbB64 = if (thumbOk) {
                             Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
                         } else ""
-                        queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.toJson(), ts, thumbB64))
+                        // Round-1 fix: `framePayload` (the pre-store local) still carries the
+                        // placeholder momentId="" — store.storeMoment stamped ITS OWN copy
+                        // (`payload.copy(momentId = id)`) internally and only returned the bare
+                        // `id`, never handing the stamped payload back (see QdrantEdgeMomentStore.
+                        // storeMoment). Reusing framePayload.toJson() as-is here silently uploaded
+                        // every point to fleet_inbox with moment_id:"" instead of moment_id:<its own
+                        // id> — violating the documented frame invariant ("momentId == the point's
+                        // own id") the onMoment callback below already gets right. .copy(momentId =
+                        // id) re-stamps this local copy the same way storeMoment stamped its own.
+                        queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.copy(momentId = id).toJson(), ts, thumbB64))
                     } catch (e: Throwable) {
                         Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
                     }

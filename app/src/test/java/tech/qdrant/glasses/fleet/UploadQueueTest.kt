@@ -183,6 +183,35 @@ class UploadQueueTest {
         assertEquals(listOf("b", "c"), q.drain(max = 10).map { it.id })
     }
 
+    @Test fun ackReturnsTrueOnSuccessfulRewrite() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file)
+        q.enqueue("a", floatArrayOf(0.1f), "{}")
+        q.enqueue("b", floatArrayOf(0.2f), "{}")
+
+        assertTrue("ack() must report success so callers (FleetSync.pushDrain) can trust it",
+            q.ack(listOf("a")))
+        assertEquals(listOf("b"), q.drain(max = 10).map { it.id })
+    }
+
+    @Test fun ackReturnsFalseInsteadOfSilentlySucceedingWhenTheRewriteFails() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file)
+        q.enqueue("a", floatArrayOf(0.1f), "{}")
+        q.enqueue("b", floatArrayOf(0.2f), "{}")
+
+        // Force the durable rewrite in ack() to fail: replace the live queue file with a DIRECTORY
+        // at the same path, so writeAtomic's tmp-file write/rename can't complete. Round-1 fix:
+        // ack() must now REPORT this failure (false) rather than the old Unit-returning version,
+        // which let a failed rewrite look identical to a successful one to FleetSync.pushDrain (see
+        // its "no-progress guard" fix) — and must not throw back up to the caller either.
+        file.delete()
+        file.mkdir()
+
+        assertFalse("a failed rewrite must be reported, not silently treated as success",
+            q.ack(listOf("a")))
+    }
+
     @Test fun capIsRespectedAcrossReopen() {
         val file = tempQueueFile()
         val q1 = UploadQueue(file, maxEntries = 2)

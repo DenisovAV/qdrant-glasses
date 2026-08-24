@@ -4,6 +4,7 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 
 /**
  * One point queued for upload to the private Qdrant fleet hub (Spec §4 UP flow / §5 dual-write,
@@ -34,12 +35,13 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * lane (Spec §7: fleet ops run off the inference lane) — but Spec §7 ALSO requires that fleet sync
  * "never crash or block capture", and the original design shared ONE lock across all three methods,
  * so a slow [ack] (read + JSON-parse + rewrite of the WHOLE file) could stall a concurrent capture-
- * side [enqueue] for that entire operation. [ack] now does its slow part — reading, parsing, and
- * filtering the file — OUTSIDE [lock] entirely; [lock] only wraps the small fixed-cost tail: folding
- * in anything [enqueue] appended in the meantime (see below) and swapping the rewritten file in.
+ * side [enqueue] for that entire operation. [ack] now does its slow part — PARSING and FILTERING the
+ * file — OUTSIDE [lock] entirely; [lock] only wraps the two small fixed-cost pieces: the plain file
+ * reads themselves (both the initial snapshot and the later "fresh" re-read — round-1 fix, see below,
+ * this is what keeps them from ever observing a torn write) and the final fold-in-extras+atomic-swap.
  * [enqueue]'s own critical section is symmetrically small (a cap check, one append, a counter bump).
- * So the longest either side can ever block the other for is that short tail, never "read+parse+
- * rewrite the whole queue" — that's what actually satisfies the "must not block capture" requirement
+ * So the longest either side can ever block the other for is a plain file read/append/rename, never
+ * "parse+filter the whole queue" — that's what actually satisfies the "must not block capture" requirement
  * (an async fire-and-forget [enqueue] would satisfy it too, but at the cost of durability — see
  * above — which is the worse trade for a queue whose entire point is surviving a crash/reboot).
  *
@@ -49,6 +51,20 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * right before it swaps the rewritten file in, it re-reads whatever now sits past the point it
  * originally snapshotted and folds those lines back in — so a point [enqueue] appends during an
  * in-flight [ack] is never lost, only possibly (harmlessly) re-ordered relative to it in the file.
+ *
+ * **Round-1 fix — [ack]'s OWN snapshot read must not be torn.** The fold above assumes [ack]'s
+ * first read either fully sees a concurrently-appended line or doesn't see it at all. That assumption
+ * broke because the read used to run via a plain unlocked `file.readLines()` while [enqueue]'s
+ * `file.appendText` (a multi-KB write for a real clip vector, spanning more than one filesystem
+ * page) was in flight: a read landing mid-write could observe a HALF-written last line, which
+ * [parseLine] then drops as unparseable — but the fold's "extra = lines past `snapshot.size`" logic
+ * still counted that half-written line towards `snapshot.size`, so once the write completed the now-
+ * valid line sat at an index BELOW the fold's cutoff and was never re-included — permanently and
+ * silently dropped. Since [enqueue]'s write itself runs entirely inside [lock], the fix is for
+ * [ack]'s snapshot read to take [lock] too (a plain `file.readLines()`, not the JSON parse) — the two
+ * can then never interleave, so the read is always either fully-before or fully-after any given
+ * `appendText`, never mid-write. Only the read moved under [lock]; the actually slow part (per-line
+ * JSON parse + filter) still runs OUTSIDE it, exactly as before.
  *
  * **Fail-soft (review fix):** every file/JSON operation runs inside a try/catch that logs and
  * swallows — a malformed [payloadJson], a full disk, or any other I/O failure is dropped with a
@@ -61,7 +77,21 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * would silently discard every unacknowledged (not-yet-uploaded) entry, with no retry path. [ack] now
  * writes the new content to a sibling `.tmp` file first and only swaps it in via [File.renameTo] (an
  * atomic same-filesystem rename), so a crash at any point before the rename leaves the ORIGINAL file
- * — every entry, acked or not — fully intact.
+ * — every entry, acked or not — fully intact. **Round-1 fix:** a failed [File.renameTo] used to fall
+ * back to `tmp.copyTo(file, overwrite = true)` — a non-atomic truncate-then-copy of the LIVE file
+ * that defeated the entire point of the tmp-swap (a crash mid-copy could still destroy unacked
+ * entries). That fallback is gone: a rename failure now throws, [ack] returns `false` (see below)
+ * with the original file untouched, and the whole rewrite is retried from scratch on the next [ack]
+ * call — "leave it queued and retry" instead of "maybe corrupt it now," matching every other
+ * fail-soft path in this class.
+ *
+ * **[ack]'s return value (round-1 fix):** [ack] used to swallow every failure silently (`Unit`
+ * return), so [FleetSync.pushDrain] could not tell a successful rewrite from a failed one — it
+ * treated a failed [ack] as done and immediately re-[drain]ed + re-upserted the SAME still-queued
+ * batch, an unbounded tight retry loop against the server on a persistent local I/O failure (e.g. a
+ * full disk). [ack] now returns `true` only when the queue file was durably updated to reflect the
+ * acked ids (or there was nothing to do), `false` on any failure (still logged, still non-throwing to
+ * the caller) — [pushDrain] uses this to stop its pass instead of spinning.
  *
  * **Bounded growth (review fix):** an unreachable fleet hub means [enqueue] runs forever with no
  * [ack] ever removing anything. [maxEntries] caps how many points this queue will hold; once full,
@@ -80,9 +110,10 @@ class UploadQueue(private val file: File, private val maxEntries: Int = DEFAULT_
     }
 
     // Guards ONLY the short, fixed-cost sections described in the class doc's "Concurrency" section:
-    // enqueue()'s cap-check+append+counter-bump, and ack()'s final tail-fold+atomic-swap. Deliberately
-    // does NOT cover drain()'s read (read-only, benign under a torn concurrent append — parseLine
-    // just skips it) or the bulk of ack()'s work (reading + JSON-parsing + filtering the whole file).
+    // enqueue()'s cap-check+append+counter-bump, ack()'s two plain file.readLines() calls (round-1
+    // fix — never the JSON parse/filter that follows each one), and ack()'s final tail-fold+atomic-
+    // swap. Deliberately does NOT cover drain()'s read (read-only, benign under a torn concurrent
+    // append — parseLine just skips it) or ack()'s JSON-parsing/filtering of the whole file.
     private val lock = Any()
 
     // In-memory queue depth, mutated only under [lock] (by enqueue's append and ack's swap), so no
@@ -141,35 +172,49 @@ class UploadQueue(private val file: File, private val maxEntries: Int = DEFAULT_
     /**
      * Durably removes the given [ids] from the queue (rewrites the file without them, atomically —
      * see class doc) — call after a batch [drain] has been confirmed upserted server-side. A missing
-     * file or an empty [ids] is a no-op, not an error (mirrors [drain]'s soft-fail-safe shape — an
-     * ack after a queue already emptied by a prior run must never throw). Fail-soft like [enqueue]/
-     * [drain]: any failure is logged and swallowed, leaving the entries queued so they retry later.
+     * file or an empty [ids] is a no-op (returns `true`), not an error (mirrors [drain]'s soft-fail-
+     * safe shape — an ack after a queue already emptied by a prior run must never throw). Fail-soft
+     * like [enqueue]/[drain]: any failure is logged and swallowed (never thrown to the caller), the
+     * entries stay queued to retry later, and this returns `false` so the caller (see [FleetSync.
+     * pushDrain]) can tell the difference instead of assuming every ack landed (round-1 fix — see
+     * class doc "[ack]'s return value").
      */
-    fun ack(ids: Collection<String>) {
-        if (ids.isEmpty()) return
-        try {
-            if (!file.exists()) return
+    fun ack(ids: Collection<String>): Boolean {
+        if (ids.isEmpty()) return true
+        return try {
+            if (!file.exists()) return true
             val acked = ids.toSet()
-            // The slow part — full read + per-line JSON parse + filter — runs OFF [lock] (see class
-            // doc "Concurrency"), so a concurrent enqueue() is never stuck behind it.
-            val snapshot = file.readLines()
+            // The READ itself runs under [lock] (round-1 fix — see class doc "ack's OWN snapshot
+            // read must not be torn"): enqueue()'s file.appendText also runs entirely under [lock],
+            // so this can never observe a half-written line. Only the read is locked here — the
+            // actually slow part (per-line JSON parse + filter) still runs OFF [lock], same as before.
+            val snapshot = synchronized(lock) { if (file.exists()) file.readLines() else emptyList() }
             val remaining = snapshot.filter { it.isNotBlank() }.mapNotNull(::parseLine).filter { it.id !in acked }
             synchronized(lock) {
                 // Fold in anything enqueue() appended AFTER `snapshot` was taken (appends only ever
                 // grow the file, so any lines beyond `snapshot.size` are new arrivals) — without this,
-                // the swap below would silently overwrite a point that landed mid-ack.
+                // the swap below would silently overwrite a point that landed mid-ack. This second
+                // read is ALSO under [lock] (mutual exclusion with enqueue()'s append), so it's whole
+                // and complete too.
                 val fresh = file.readLines()
                 val extra = fresh.drop(snapshot.size).filter { it.isNotBlank() }.mapNotNull(::parseLine)
                 val finalRemaining = remaining + extra
-                writeAtomic(finalRemaining)
+                writeAtomic(finalRemaining)   // throws (round-1 fix) rather than falling back unsafe
                 count = finalRemaining.size
             }
+            true
         } catch (e: Throwable) {
             Log.w(TAG, "upload queue ack failed (non-fatal, entries stay queued and will retry): ${e.message}")
+            false
         }
     }
 
-    /** Write-temp-then-rename so a crash never leaves the live file partially truncated. */
+    /**
+     * Write-temp-then-rename so a crash never leaves the live file partially truncated. Throws if
+     * the atomic rename fails (round-1 fix) — callers must NOT fall back to a non-atomic copy-then-
+     * overwrite of the live file (see class doc "Durability of ack"); [ack]'s own try/catch turns
+     * this into a logged, fail-soft `false` return with the ORIGINAL file left untouched.
+     */
     private fun writeAtomic(remaining: List<QueuedPoint>) {
         if (remaining.isEmpty()) {
             file.delete()
@@ -179,11 +224,9 @@ class UploadQueue(private val file: File, private val maxEntries: Int = DEFAULT_
         val tmp = File(file.absoluteFile.parentFile, file.name + ".tmp")
         tmp.writeText(body)
         if (!tmp.renameTo(file)) {
-            // Same-filesystem rename should always succeed for an app-private filesDir path; this
-            // is a last-resort fallback so the queue never gets stuck behind an orphaned .tmp file.
-            Log.w(TAG, "upload queue: atomic rename failed, falling back to a direct write")
-            tmp.copyTo(file, overwrite = true)
-            tmp.delete()
+            // Same-filesystem rename should always succeed for an app-private filesDir path; if it
+            // somehow doesn't, throw rather than silently truncating the live file — see class doc.
+            throw IOException("upload queue: atomic rename of ${tmp.name} -> ${file.name} failed")
         }
     }
 
