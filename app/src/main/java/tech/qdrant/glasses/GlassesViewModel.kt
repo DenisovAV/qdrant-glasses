@@ -170,6 +170,7 @@ class GlassesViewModel(app: Application) : AndroidViewModel(app) {
                     if (Config.MOMENT_MEMORY) {
                         momentSearcher = tech.qdrant.glasses.search.MomentSearcher(
                             c.cropEncoder!!, c.momentStore!!, hud, bgeEncoder = c.bgeEncoder,
+                            fleet = c.fleetStore,
                         )
                     }
                     // momentStore is async-loaded (~10s); a HUD that connected before now got an

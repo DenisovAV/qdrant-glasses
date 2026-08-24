@@ -60,6 +60,13 @@ class GlassesComponents(
     // Stage 3 NPU recognizer: ViTSTR (W8A16), used by [ocrEngine]'s NPU path. Owned here (not by
     // OcrEngine) and closed in [close]; null → OcrEngine reads on the CPU. Guarded independently.
     val vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer?,
+    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): the pulled fleet corpus, or null when Config.FLEET_URL
+    // is blank OR the pull failed (FleetSync.pull already logs+swallows every Throwable) — same
+    // nullable-optional-feature contract as momentStore/momentCapture above. GlassesViewModel passes
+    // this straight through as MomentSearcher's `fleet` argument; a null here just means "no fleet
+    // tier this session", byte-for-byte today's local-only search (Global Constraint). Owned here so
+    // [close] can release its native EdgeShard alongside [momentStore]'s.
+    val fleetStore: tech.qdrant.glasses.fleet.FleetShardStore?,
 ) : AutoCloseable {
 
     companion object {
@@ -81,7 +88,7 @@ class GlassesComponents(
          * `PerceptionPipeline`/`MomentSearcher` directly (see the "moment-timeline backfill" comment
          * below for why `hud` itself isn't owned here).
          */
-        fun load(
+        suspend fun load(
             app: Application,
             mode: AppMode,
             scope: CoroutineScope,
@@ -125,6 +132,7 @@ class GlassesComponents(
             var ocrEngine: OcrEngine? = null
             var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
             var vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer? = null
+            var fleetStore: tech.qdrant.glasses.fleet.FleetShardStore? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
@@ -231,6 +239,22 @@ class GlassesComponents(
                         }
                     }
                     Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")
+                    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): OPTIONAL cloud tier, gated purely on
+                    // Config.FLEET_URL (Global Constraint — blank URL means byte-for-byte today's
+                    // offline behavior, so this whole block is skipped, not just no-op'd). Runs on
+                    // THIS coroutine (load() is suspend precisely so this pull() can happen here,
+                    // off-main like every other blocking call in this function — see GlassesViewModel's
+                    // `viewModelScope.launch(Dispatchers.IO) { GlassesComponents.load(...) }`).
+                    // FleetSync.pull() itself never throws (wraps create-snapshot/download/unpack/load
+                    // in one try/catch, Spec §7) — a null result here just means no fleet this session.
+                    if (Config.FLEET_URL.isNotBlank()) {
+                        val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
+                            tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
+                            app.filesDir, cropEncoder.dim,
+                        )
+                        fleetStore = fleetSync.pull()
+                        Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
+                    }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
                 // compiles into both flavors, so the actual sysprop-check + launch is indirected
@@ -265,6 +289,7 @@ class GlassesComponents(
                 ocrEngine = ocrEngine,
                 dbnetDetector = dbnetDetector,
                 vitstrRec = vitstrRec,
+                fleetStore = fleetStore,
             )
         }
     }
@@ -283,6 +308,7 @@ class GlassesComponents(
         dbnetDetector?.close()
         cropEncoder?.close()
         momentStore?.close()
+        fleetStore?.close()
         ocrEngine?.close()          // NPU-mode OcrEngine doesn't own dbnet/vitstr (shared) — close them after
         vitstrRec?.close()
     }
