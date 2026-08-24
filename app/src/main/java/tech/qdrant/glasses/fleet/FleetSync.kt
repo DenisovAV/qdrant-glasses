@@ -22,6 +22,10 @@ class FleetSync(
     private val client: FleetQdrantClient,
     private val filesDir: File,
     private val clipDim: Int,
+    // UP half (plan Task 11, Spec §4/§5 dual-write): the persistent queue [MomentCapture] appends a
+    // copy of each stored moment to. Null when no fleet tier is configured — [pushDrain] is then a
+    // no-op. Only [pushDrain] touches it here; [MomentCapture] owns the enqueue side.
+    private val uploadQueue: UploadQueue? = null,
 ) {
     /**
      * Pulls [collection] down as a snapshot and opens it read-only. Never throws.
@@ -65,7 +69,34 @@ class FleetSync(
         }
     }
 
+    /**
+     * UP half (plan Task 11, Spec §4/§5 dual-write): drain the [uploadQueue] to the private Qdrant
+     * in batches — [FleetQdrantClient.upsertPoints] the batch, then [UploadQueue.ack] it ONLY after
+     * the upsert is confirmed (drain is a non-destructive peek), so a failed or interrupted upsert
+     * leaves those points queued for the next drain — no loss (Decision C: the LOCAL moment is never
+     * touched by any of this either way). No-op when no fleet tier is configured or the queue is
+     * empty. Fail-soft per Spec §7: any error stops this pass and is retried on the next call; this
+     * runs on a fleet lane, never the capture path, so capture is never affected. Cancellation
+     * propagates (structured concurrency).
+     */
+    suspend fun pushDrain(collection: String = "fleet_inbox") {
+        val queue = uploadQueue ?: return
+        try {
+            while (true) {
+                val batch = queue.drain(BATCH)
+                if (batch.isEmpty()) break
+                client.upsertPoints(collection, batch)   // throws on HTTP failure → caught below; batch stays queued
+                queue.ack(batch.map { it.id })
+            }
+        } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "fleet pushDrain failed (non-fatal, will retry): ${e.message}")
+        }
+    }
+
     companion object {
         private const val TAG = "FleetSync"
+        /** Upsert batch size for [pushDrain] — matches the plan's Task 11 (BATCH_SIZE). */
+        private const val BATCH = 20
     }
 }

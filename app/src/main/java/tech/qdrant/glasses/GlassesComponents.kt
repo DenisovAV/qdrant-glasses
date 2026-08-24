@@ -269,10 +269,16 @@ class GlassesComponents(
                     if (Config.FLEET_URL.isNotBlank()) {
                         val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
                             tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
-                            app.filesDir, cropEncoder.dim,
+                            app.filesDir, cropEncoder.dim, uploadQueue,
                         )
                         fleetStore = fleetSync.pull()
                         Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
+                        // UP half (Task 11, Spec §4/§5): drain moments queued from a PRIOR session up
+                        // to the hub. Runs on THIS load coroutine (off-main); pushDrain is fail-soft
+                        // (never throws except cancellation). This-session captures are enqueued to the
+                        // persistent JSONL queue and drain on the NEXT launch — the natural PoC trigger,
+                        // no lifecycle-scoped periodic loop needed.
+                        fleetSync.pushDrain()
                     }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
