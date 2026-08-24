@@ -248,6 +248,10 @@ class MomentSearcher(
             Config.RECENCY_TAU_MS > 0L -> recencyRank(merged, nowMs, Config.RECENCY_TAU_MS).take(5)
             else -> merged.take(5)
         }
+        // Fleet-sync (Spec §5): result provenance — each shown card's source (local|fleet), score, label.
+        // The on-device signal that a pulled fleet corpus actually surfaced in the merged top-5.
+        Log.i(TAG, "results(${ordered.size}): " +
+            ordered.joinToString { "${it.source}[${"%.3f".format(it.score)}]${it.label}" })
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)
