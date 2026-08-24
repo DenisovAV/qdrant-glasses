@@ -78,6 +78,7 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : 
          * than passed straight through.
          */
         fun seedForTest(dir: String, clipDim: Int, id: String, vec: FloatArray, label: String, ts: Long) {
+            java.io.File(dir).mkdirs()   // EdgeShard.create does NOT create parents — the dir must exist first (os error 2 otherwise)
             val seedShard = EdgeShard.create(dir, config(clipDim))
             val payload = MomentPayload(
                 type = MomentType.FRAME, momentId = id, episodeId = 0L, timestampMs = ts, tEndMs = ts,

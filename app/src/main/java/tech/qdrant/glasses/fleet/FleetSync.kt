@@ -38,7 +38,7 @@ class FleetSync(
             val name = client.createShardSnapshot(collection)
             snap.delete()
             client.downloadSnapshot(collection, 0, name, snap)
-            dir.deleteRecursively()
+            dir.deleteRecursively(); dir.mkdirs()   // EdgeShard/unpack needs the target dir to EXIST (empty) — it does NOT create parents (os error 2 otherwise)
             unpackSnapshotAsync(snap.absolutePath, dir.absolutePath)
             FleetShardStore.load(dir.absolutePath, clipDim).also { Log.i(TAG, "fleet pulled: $collection") }
         } catch (e: Throwable) {
