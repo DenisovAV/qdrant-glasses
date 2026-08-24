@@ -187,6 +187,23 @@ class MomentCapture(
     // either way) — a best-effort side-channel loss, not a Spec §7 violation (Spec §7 requires
     // fail-soft, not zero-loss-across-a-crash for the optional upload path).
     private val fleetLane: CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1),
+    // Fleet-sync P2 round-2 review fix (Finding 1): the UP half must be an ONGOING loop (Spec §4:
+    // "new local moment -> queue -> (online) batch upsert"), not a single once-per-process flush.
+    // Before this fix, [tech.qdrant.glasses.fleet.FleetSync.pushDrain] was called exactly once, at
+    // GlassesComponents.load() time — a moment captured during the CURRENT live session sat
+    // durably queued (no loss, the JSONL file is the source of truth) but never actually reached
+    // `fleet_inbox` until the app was killed and relaunched. Invoked on [fleetLane], right after a
+    // successful [UploadQueue.enqueue] call, whenever [uploadQueue] is non-null — fire-and-forget:
+    // this class never awaits it or learns whether the drain it triggers actually ran or succeeded
+    // (same "already durable, only log on failure" spirit as the enqueue call itself). Null (no-op)
+    // whenever [uploadQueue] is null, same nullable-optional-feature contract as [uploadQueue].
+    // GlassesComponents wires this to `{ scope.launch(Dispatchers.IO) { fleetSync.pushDrain() } }`
+    // — the SAME shape as its one-off startup call, just fired again on every new moment.
+    // FleetSync.pushDrain() is now single-flight (a Mutex, this round's OTHER fix, Finding 2), so
+    // firing it after every capture can never race a concurrent ack() against another in-flight
+    // pushDrain: a call that lands mid-drain just waits for it, then finds the queue already
+    // drained and returns immediately.
+    private val onFleetEnqueued: (() -> Unit)? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -605,6 +622,10 @@ class MomentCapture(
                         // own id") the onMoment callback below already gets right. .copy(momentId =
                         // id) re-stamps this local copy the same way storeMoment stamped its own.
                         queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.copy(momentId = id).toJson(), ts, thumbB64))
+                        // Round-2 review fix (Finding 1): trigger a push pass for THIS moment (and
+                        // anything else currently queued) instead of only ever draining at process
+                        // start — see [onFleetEnqueued]'s own doc.
+                        onFleetEnqueued?.invoke()
                     } catch (e: Throwable) {
                         Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
                     }

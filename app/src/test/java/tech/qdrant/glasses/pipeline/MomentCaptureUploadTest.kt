@@ -117,6 +117,64 @@ class MomentCaptureUploadTest {
             drained[0].id, uploadPayload.getString("moment_id"))
     }
 
+    @Test fun onFleetEnqueuedFiresAfterAStoreWithAQueue() {
+        // Round-2 review regression test (Finding 1): the UP half must be an ONGOING loop (Spec
+        // §4), not just a once-per-process flush — MomentCapture now fires onFleetEnqueued right
+        // after every successful UploadQueue.enqueue, and GlassesComponents wires that to trigger
+        // FleetSync.pushDrain. This test only covers MomentCapture's half of that fix (the hook
+        // actually firing); FleetSync.pushDrain itself and its single-flight guard (Finding 2) are
+        // covered by FleetSyncPushDrainTest.
+        val store = FakeMomentStore()
+        val thumbsDir = freshDir("moment-thumbs-3").also { it.mkdirs() }
+        val queue = UploadQueue(File(freshDir("fleet-queue-3"), "fleet_queue.jsonl"))
+        val clockRef = longArrayOf(10_000L)
+        var fired = 0
+
+        val capture = MomentCapture(
+            scope = CoroutineScope(Dispatchers.Unconfined),
+            embedLane = Dispatchers.Unconfined,
+            cropEncoder = FakeCropEncoder(),
+            store = store,
+            momentThumbsDir = thumbsDir,
+            isRecording = { true },
+            uploadQueue = queue,
+            fleetLane = Dispatchers.Unconfined,   // Unconfined → the enqueue+trigger run synchronously, observable below
+            onFleetEnqueued = { fired++ },
+            nowMs = { clockRef[0] },
+        )
+
+        captureOneMoment(capture, clockRef)
+
+        assertEquals(
+            "storing a moment with a fleet queue present must trigger exactly one push attempt " +
+                "(the moment just enqueued)",
+            1, fired,
+        )
+    }
+
+    @Test fun onFleetEnqueuedIsNeverCalledWithoutAQueue() {
+        val store = FakeMomentStore()
+        val thumbsDir = freshDir("moment-thumbs-4").also { it.mkdirs() }
+        val clockRef = longArrayOf(10_000L)
+        var fired = 0
+
+        val capture = MomentCapture(
+            scope = CoroutineScope(Dispatchers.Unconfined),
+            embedLane = Dispatchers.Unconfined,
+            cropEncoder = FakeCropEncoder(),
+            store = store,
+            momentThumbsDir = thumbsDir,
+            isRecording = { true },
+            uploadQueue = null,   // Config.FLEET_URL unset — no fleet tier, no trigger either
+            onFleetEnqueued = { fired++ },
+            nowMs = { clockRef[0] },
+        )
+
+        captureOneMoment(capture, clockRef)
+
+        assertEquals("no upload queue means no fleet trigger, same nullable-optional-feature contract", 0, fired)
+    }
+
     @Test fun nullUploadQueueSkipsTheUploadSideButStillStoresLocally() {
         val store = FakeMomentStore()
         val thumbsDir = freshDir("moment-thumbs-2").also { it.mkdirs() }

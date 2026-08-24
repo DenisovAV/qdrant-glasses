@@ -52,6 +52,17 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * originally snapshotted and folds those lines back in — so a point [enqueue] appends during an
  * in-flight [ack] is never lost, only possibly (harmlessly) re-ordered relative to it in the file.
  *
+ * **This fold is NOT, by itself, safe against two CONCURRENT [ack] calls** (round-2 review finding):
+ * each [ack] computes its snapshot/remaining/fresh triple independently, so two overlapping [ack]s
+ * can race their `writeAtomic` swaps — the second can resurrect ids the first already removed
+ * (harmless, Qdrant upsert-by-id is idempotent) or, worse, undercount past `snapshot.size` and
+ * silently drop an entry the OTHER [ack] hadn't folded in yet. [UploadQueue] itself does not
+ * single-flight [ack] — that's a caller responsibility, kept out of this class because only the
+ * caller knows whether it ever calls [ack] from more than one place at once. The one caller in this
+ * codebase, [tech.qdrant.glasses.fleet.FleetSync.pushDrain], enforces single-flight itself (a
+ * `Mutex` around its whole drain/upsert/ack body) — see that class's `pushMutex` doc. A future
+ * second caller of [ack] MUST provide the same guarantee, or serialize through the same [FleetSync].
+ *
  * **Round-1 fix — [ack]'s OWN snapshot read must not be torn.** The fold above assumes [ack]'s
  * first read either fully sees a concurrently-appended line or doesn't see it at all. That assumption
  * broke because the read used to run via a plain unlocked `file.readLines()` while [enqueue]'s

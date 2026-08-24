@@ -224,6 +224,20 @@ class GlassesComponents(
                         Log.w(TAG, "load: ocr engine unavailable, Stage 3 disabled: ${e.message}")
                         null
                     }
+                    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): built HERE, before momentCapture, purely
+                    // so momentCapture's onFleetEnqueued (round-2 review fix, Finding 1) can close
+                    // over THIS instance — construction itself is cheap/non-blocking (no network),
+                    // so moving it earlier changes nothing about when the actual pull()/pushDrain()
+                    // network work happens (still below, unchanged). Null whenever Config.FLEET_URL
+                    // is unset (Global Constraint) — same nullable-optional-feature contract as
+                    // fleetStore/uploadQueue.
+                    val fleetSync: tech.qdrant.glasses.fleet.FleetSync? =
+                        if (Config.FLEET_URL.isNotBlank()) {
+                            tech.qdrant.glasses.fleet.FleetSync(
+                                tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
+                                app.filesDir, cropEncoder.dim, uploadQueue,
+                            )
+                        } else null
                     momentCapture = MomentCapture(
                         scope = scope,
                         embedLane = embedLane,
@@ -235,6 +249,14 @@ class GlassesComponents(
                         ocrEngine = ocrEngine,
                         bgeEncoder = bgeEncoder,
                         uploadQueue = uploadQueue,
+                        // Round-2 review fix (Finding 1): fire a push pass after every enqueue, not
+                        // just once at process start (see MomentCapture's onFleetEnqueued doc).
+                        // Detached on [scope]/IO — same "fire and forget, JSONL queue is the source
+                        // of truth" shape as the startup pushDrain call below, and safe against
+                        // racing it: FleetSync.pushDrain is single-flight (Finding 2's Mutex fix).
+                        onFleetEnqueued = fleetSync?.let { fs ->
+                            { scope.launch(kotlinx.coroutines.Dispatchers.IO) { fs.pushDrain() } }
+                        },
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
                         // thumb for /thumb/<key> BEFORE pushing the event. On the WIRED path
@@ -267,11 +289,9 @@ class GlassesComponents(
                     // `viewModelScope.launch(Dispatchers.IO) { GlassesComponents.load(...) }`).
                     // FleetSync.pull() itself never throws (wraps create-snapshot/download/unpack/load
                     // in one try/catch, Spec §7) — a null result here just means no fleet this session.
-                    if (Config.FLEET_URL.isNotBlank()) {
-                        val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
-                            tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
-                            app.filesDir, cropEncoder.dim, uploadQueue,
-                        )
+                    // `fleetSync` itself was already built above (alongside momentCapture) so its
+                    // onFleetEnqueued hook could close over it; reused here, not rebuilt.
+                    if (fleetSync != null) {
                         fleetStore = fleetSync.pull()
                         Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
                         // UP half (Task 11, Spec §4/§5): drain moments queued from a PRIOR session up

@@ -4,6 +4,8 @@ import android.util.Log
 import io.qdrant.edge.unpackSnapshotAsync
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
@@ -98,28 +100,54 @@ class FleetSync(
      * unrelated network error happens to throw — previously true only in the sense that a thrown
      * [kotlinx.coroutines.CancellationException] gets rethrown, which nothing in the loop body could
      * ever produce on its own.
+     *
+     * **Single-flight (round-2 review fix, Finding 2):** the whole body runs under [pushMutex], so
+     * at most one drain/upsert/ack cycle is ever in flight across every caller of this method —
+     * required now that this is no longer called exactly once per process (see Finding 1's fix:
+     * [tech.qdrant.glasses.pipeline.MomentCapture] fires this after every enqueue too). See
+     * [pushMutex]'s own doc for why concurrent [ack]s specifically are unsafe without it.
      */
     suspend fun pushDrain(collection: String = "fleet_inbox") {
         val queue = uploadQueue ?: return
-        try {
-            while (true) {
-                coroutineContext.ensureActive()
-                val batch = queue.drain(BATCH)
-                if (batch.isEmpty()) break
-                client.upsertPoints(collection, batch)   // throws on HTTP failure → caught below; batch stays queued
-                if (!queue.ack(batch.map { it.id })) {
-                    // ack failed (already logged by UploadQueue) — stop this pass instead of
-                    // re-upserting the same still-queued batch in a tight loop; retried whole on the
-                    // next pushDrain call.
-                    Log.w(TAG, "fleet pushDrain: ack failed, stopping this pass (batch stays queued, will retry)")
-                    break
+        pushMutex.withLock {
+            try {
+                while (true) {
+                    coroutineContext.ensureActive()
+                    val batch = queue.drain(BATCH)
+                    if (batch.isEmpty()) break
+                    client.upsertPoints(collection, batch)   // throws on HTTP failure → caught below; batch stays queued
+                    if (!queue.ack(batch.map { it.id })) {
+                        // ack failed (already logged by UploadQueue) — stop this pass instead of
+                        // re-upserting the same still-queued batch in a tight loop; retried whole on the
+                        // next pushDrain call.
+                        Log.w(TAG, "fleet pushDrain: ack failed, stopping this pass (batch stays queued, will retry)")
+                        break
+                    }
                 }
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.w(TAG, "fleet pushDrain failed (non-fatal, will retry): ${e.message}")
             }
-        } catch (e: Throwable) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            Log.w(TAG, "fleet pushDrain failed (non-fatal, will retry): ${e.message}")
         }
     }
+
+    // Single-flight guard (round-2 review fix, Finding 2): UploadQueue.ack's "fold in appends that
+    // landed mid-ack" logic is correct against ONE concurrent enqueue() but NOT against TWO
+    // concurrent ack() calls — two independently-snapshotted, independently-filtered ack()s can
+    // race their own writeAtomic() swaps and either resurrect already-acked ids (harmless, upsert-
+    // by-id is idempotent) or, worse, undercount and silently drop entries enqueued between the two
+    // snapshots (see UploadQueue's class doc for the full mechanism). That race was unreachable
+    // while pushDrain had exactly one caller per process (the startup flush in
+    // GlassesComponents.load); it becomes reachable now that MomentCapture ALSO fires a pushDrain
+    // after every enqueue (this round's other fix, Finding 1 — the UP half must be an ongoing loop,
+    // Spec §4, not a restart-gated one). Wrapping the WHOLE pushDrain body in this Mutex is the
+    // simplest correct fix: it guarantees at most one drain()/upsertPoints()/ack() triple ever runs
+    // at a time, which is what the UploadQueue class doc already claims as its invariant. A call
+    // that lands while another is in flight loses nothing — it just suspends (no busy spin) until
+    // the lock frees, then drains whatever the file holds at THAT point (already reflecting the
+    // prior run's acks and any fresh enqueue()s), so it's either a normal drain of newly-queued work
+    // or an immediate no-op (drain() returns empty right away).
+    private val pushMutex = Mutex()
 
     companion object {
         private const val TAG = "FleetSync"
