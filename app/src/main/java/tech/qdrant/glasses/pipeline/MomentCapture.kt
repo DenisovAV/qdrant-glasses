@@ -160,6 +160,33 @@ class MomentCapture(
     // contract as [labelCache]/[ocrEngine] above; GlassesComponents only builds a non-null queue
     // when the fleet tier is actually configured.
     private val uploadQueue: UploadQueue? = null,
+    // Fleet-sync Task 10 review fix: the upload-side work triggered by [uploadQueue] above — a
+    // thumbnail file read + base64 encode, then [UploadQueue.enqueue]'s own file append (it takes a
+    // lock and does I/O, per its class doc's "Concurrency" section) — used to run INLINE on
+    // [embedLane], the SAME lane that does the NPU crop embed and [MomentStore.storeMoment] for
+    // every future keyframe. That violates the "fleet sync must never block capture" half of Spec
+    // §7: a slow disk (or another enqueue's momentarily-held lock) stalls this call, which stalls
+    // embedLane, which stalls the NEXT frame's [confirmAndStore] — busy's hard backpressure gate
+    // then drops candidates that arrive while embedLane is stuck on someone else's fleet I/O,
+    // exactly the failure mode Spec §7 rules out. [fleetLane] gives that upload-side work its OWN
+    // single-thread dispatcher — same "pull slow/optional work off embedLane onto a dedicated lane"
+    // shape as [ocrLane] just below (OCR's ~4s CPU pass, this class's OTHER off-embedLane escape
+    // hatch), except this one is INJECTED rather than hardcoded so a test can pass
+    // `Dispatchers.Unconfined` and observe the enqueue synchronously (see
+    // `MomentCaptureUploadTest`) the same way [embedLane] itself is injected for that reason.
+    // Defaults to `Dispatchers.IO.limitedParallelism(1)` — an I/O-shaped lane (file read + append,
+    // not CPU inference), mirroring `GlassesViewModel`'s own `embedLane = Dispatchers.IO.
+    // limitedParallelism(1)`. Durability doesn't depend on WHEN this runs relative to
+    // confirmAndStore returning: [UploadQueue.enqueue] itself is synchronous-durable (the point is
+    // on disk by the time the call returns) and survives a process restart via its JSONL file, so
+    // moving the call a few milliseconds later onto a different thread doesn't weaken the "a stored
+    // moment eventually gets queued for upload" obligation — it only means embedLane is no longer
+    // the thread paying for it. The one gap this accepts (same as the OCR side-channel above): a
+    // process death in the narrow window between storeMoment() returning and this coroutine actually
+    // running would skip that one moment's upload — never its local copy (decision C, unaffected
+    // either way) — a best-effort side-channel loss, not a Spec §7 violation (Spec §7 requires
+    // fail-soft, not zero-loss-across-a-crash for the optional upload path).
+    private val fleetLane: CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1),
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -555,13 +582,20 @@ class MomentCapture(
             // only guards [thumbFile.readBytes] / [buildUploadPayloadJson] ahead of it.
             val queue = uploadQueue
             if (queue != null) {
-                try {
-                    val thumbB64 = if (thumbOk) {
-                        Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
-                    } else ""
-                    queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.toJson(), ts, thumbB64))
-                } catch (e: Throwable) {
-                    Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
+                // OFF embedLane onto [fleetLane]: the thumb read + base64 + [UploadQueue.enqueue]'s
+                // file append must never stall embedLane's next keyframe embed/store (Spec §7 — fleet
+                // sync never blocks capture). All captured values are per-call locals that nothing
+                // else mutates (`vec` is this call's fresh gate embedding; `thumbFile` is durable on
+                // disk; `framePayload`/`id`/`ts` are immutable), so deferring the read is safe.
+                scope.launch(fleetLane) {
+                    try {
+                        val thumbB64 = if (thumbOk) {
+                            Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
+                        } else ""
+                        queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.toJson(), ts, thumbB64))
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
+                    }
                 }
             }
 
