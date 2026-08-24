@@ -5,6 +5,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -35,7 +36,10 @@ class FleetQdrantClient(
             .url("$baseUrl/collections/$collection/shards/$shard/snapshots/$name").get().build()
         http.newCall(req).execute().use { resp ->
             require(resp.isSuccessful) { "snapshot download ${resp.code}" }
-            dest.outputStream().use { out -> resp.body!!.byteStream().copyTo(out) }
+            val body = resp.body ?: throw IOException(
+                "snapshot download ${resp.code}: empty response body for $collection/shards/$shard/snapshots/$name"
+            )
+            dest.outputStream().use { out -> body.byteStream().copyTo(out) }
         }
     }
 }
