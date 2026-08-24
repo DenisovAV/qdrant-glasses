@@ -126,12 +126,20 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : 
         )
     }
 
-    // Payload-field extraction copied verbatim from QdrantEdgeMomentStore's hit mapping (Spec §6: same
-    // payload shape on both sides of the sync) — only `source` differs, always "fleet" here.
+    // Payload-field extraction otherwise mirrors QdrantEdgeMomentStore's hit mapping (Spec §6: same
+    // payload shape on both sides of the sync) — `source` always "fleet" here. `id` mapping does NOT
+    // copy QdrantEdgeMomentStore verbatim: that store only ever writes PointId.Uuid, but the fleet
+    // corpus scripts/fleet-dev.sh seeds uses integer ids (models.PointStruct(id=n+1, ...)), which the
+    // Edge 0.8.0 API round-trips as PointId.NumId (review fix — without this branch every NumId hit
+    // mapped to id="", and MomentSearcher's `distinctBy { it.id }` collapsed every fleet hit but one).
     private fun toHit(p: ScoredPoint): MomentHit {
         val payload = MomentPayload.fromJson(p.payload ?: "{}")
+        val id = when (val pid = p.id) {
+            is PointId.Uuid -> pid.value
+            is PointId.NumId -> pid.value.toString()
+        }
         return MomentHit(
-            id = (p.id as? PointId.Uuid)?.value ?: "",
+            id = id,
             score = p.score,
             type = payload.type,
             momentId = payload.momentId,
