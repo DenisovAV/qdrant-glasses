@@ -118,4 +118,82 @@ class UploadQueueTest {
 
         assertFalse(file.exists())
     }
+
+    // --- Review fixes: fail-soft enqueue, non-blocking/concurrency, atomic ack, bounded growth ---
+
+    @Test fun enqueueWithMalformedPayloadIsDroppedNotThrown() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file)
+        q.enqueue("a", floatArrayOf(0.1f), "{}")
+        q.enqueue("bad", floatArrayOf(0.2f), "not-json{{{")   // must not throw, must not corrupt the file
+        q.enqueue("b", floatArrayOf(0.3f), "{}")
+
+        val drained = q.drain(max = 10)
+
+        assertEquals(listOf("a", "b"), drained.map { it.id })
+    }
+
+    @Test fun enqueueDuringAConcurrentAckIsNotLostOrDeadlocked() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file)
+        q.enqueue("a", floatArrayOf(0.1f), "{}")
+
+        val ackThread = Thread { q.ack(listOf("a")) }
+        ackThread.start()
+        // A point enqueued while ack() is mid-rewrite must land in the file, not be silently
+        // dropped by ack()'s swap (review fix — ack() folds in anything appended after its snapshot).
+        q.enqueue("b", floatArrayOf(0.2f), "{}")
+        ackThread.join(5_000)
+        assertFalse("ack() thread should have finished", ackThread.isAlive)
+
+        assertEquals(listOf("b"), q.drain(max = 10).map { it.id })
+    }
+
+    @Test fun ackLeavesNoOrphanedTempFileBehind() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file)
+        q.enqueue("a", floatArrayOf(0.1f), "{}")
+        q.enqueue("b", floatArrayOf(0.2f), "{}")
+
+        q.ack(listOf("a"))
+
+        val tmp = File(file.parentFile, file.name + ".tmp")
+        assertFalse(tmp.exists())
+        assertEquals(listOf("b"), q.drain(max = 10).map { it.id })
+    }
+
+    @Test fun enqueueDropsOnceQueueIsFull() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file, maxEntries = 2)
+        q.enqueue("a", floatArrayOf(0f), "{}")
+        q.enqueue("b", floatArrayOf(0f), "{}")
+        q.enqueue("c", floatArrayOf(0f), "{}")   // over the cap -> dropped, not queued
+
+        assertEquals(listOf("a", "b"), q.drain(max = 10).map { it.id })
+    }
+
+    @Test fun enqueueHasRoomAgainAfterAckFreesSpace() {
+        val file = tempQueueFile()
+        val q = UploadQueue(file, maxEntries = 2)
+        q.enqueue("a", floatArrayOf(0f), "{}")
+        q.enqueue("b", floatArrayOf(0f), "{}")
+        q.ack(listOf("a"))
+        q.enqueue("c", floatArrayOf(0f), "{}")   // room again after ack freed a slot
+
+        assertEquals(listOf("b", "c"), q.drain(max = 10).map { it.id })
+    }
+
+    @Test fun capIsRespectedAcrossReopen() {
+        val file = tempQueueFile()
+        val q1 = UploadQueue(file, maxEntries = 2)
+        q1.enqueue("a", floatArrayOf(0f), "{}")
+        q1.enqueue("b", floatArrayOf(0f), "{}")
+
+        // A fresh instance (simulating a process restart) must seed its in-memory count from the
+        // file it inherits, not start back at zero — otherwise a restart would silently blow the cap.
+        val q2 = UploadQueue(file, maxEntries = 2)
+        q2.enqueue("c", floatArrayOf(0f), "{}")   // still over cap -> dropped
+
+        assertEquals(listOf("a", "b"), q2.drain(max = 10).map { it.id })
+    }
 }
