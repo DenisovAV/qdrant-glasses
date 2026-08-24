@@ -67,6 +67,14 @@ class GlassesComponents(
     // tier this session", byte-for-byte today's local-only search (Global Constraint). Owned here so
     // [close] can release its native EdgeShard alongside [momentStore]'s.
     val fleetStore: tech.qdrant.glasses.fleet.FleetShardStore?,
+    // Fleet-sync Task 10 (Spec §4 UP flow / §5 dual-write, decision C): the persistent queue
+    // MomentCapture enqueues a COPY of every stored moment onto, for FleetSync.pushDrain (Task 11)
+    // to batch-upsert into `fleet_inbox` once online. Same nullable-optional-feature contract as
+    // [fleetStore] just above — null whenever `Config.FLEET_URL` is unset (Global Constraint:
+    // byte-for-byte today's offline behavior, no queue file ever created). Owned here (not just
+    // handed to MomentCapture and forgotten) so Task 11's drain worker can be wired against this
+    // SAME instance/file.
+    val uploadQueue: tech.qdrant.glasses.fleet.UploadQueue?,
 ) : AutoCloseable {
 
     companion object {
@@ -133,6 +141,16 @@ class GlassesComponents(
             var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
             var vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer? = null
             var fleetStore: tech.qdrant.glasses.fleet.FleetShardStore? = null
+            // Fleet-sync Task 10 (Spec §4 UP flow, decision C): gated on the SAME Config.FLEET_URL
+            // Global Constraint as fleetStore/the pull below, so an unset URL means MomentCapture's
+            // uploadQueue stays null and no `fleet_queue.jsonl` is ever created — byte-for-byte
+            // today's offline behavior. Built here (before momentCapture) purely because
+            // MomentCapture needs it at construction time; the actual server upsert
+            // (FleetSync.pushDrain) is Task 11.
+            val uploadQueue: tech.qdrant.glasses.fleet.UploadQueue? =
+                if (Config.FLEET_URL.isNotBlank()) {
+                    tech.qdrant.glasses.fleet.UploadQueue(File(app.filesDir, "fleet_queue.jsonl"))
+                } else null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
@@ -215,6 +233,7 @@ class GlassesComponents(
                         labelCache = labelCache,
                         ocrEngine = ocrEngine,
                         bgeEncoder = bgeEncoder,
+                        uploadQueue = uploadQueue,
                     ).also { mc ->
                         // Task 1.6: forward each stored keyframe to the HUD timeline — register the
                         // thumb for /thumb/<key> BEFORE pushing the event. On the WIRED path
@@ -290,6 +309,7 @@ class GlassesComponents(
                 dbnetDetector = dbnetDetector,
                 vitstrRec = vitstrRec,
                 fleetStore = fleetStore,
+                uploadQueue = uploadQueue,
             )
         }
     }

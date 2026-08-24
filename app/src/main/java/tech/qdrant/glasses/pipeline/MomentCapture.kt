@@ -2,14 +2,17 @@ package tech.qdrant.glasses.pipeline
 
 import android.graphics.Bitmap
 import android.graphics.RectF
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
 import tech.qdrant.glasses.embedding.LabelVectorCache
+import tech.qdrant.glasses.fleet.UploadQueue
 import tech.qdrant.glasses.ocr.OcrEngine
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
@@ -144,6 +147,19 @@ class MomentCapture(
     // capture exactly as before Stage 3 (same nullable-optional-feature contract as [labelCache]).
     private val ocrEngine: OcrEngine? = null,
     private val bgeEncoder: BgeTextEncoder? = null,
+    // Fleet-sync Task 10 (Spec §4 UP flow / §5 dual-write, decision C): when non-null, every
+    // successfully stored frame moment ADDITIONALLY enqueues a COPY of itself (id, clip vector,
+    // payload + sync_ts + thumb_b64 — see [buildUploadPayloadJson]) onto this queue, for
+    // [tech.qdrant.glasses.fleet.FleetSync.pushDrain] (Task 11) to batch-upsert into the private
+    // Qdrant's `fleet_inbox` next time it's online. The LOCAL point [store] just persisted is
+    // NEVER deleted because of this — decision C makes the local mutable moment the user's
+    // PERMANENT memory; a fleet upload is a side-channel copy, not a move, and this class has no
+    // "delete one point" call to make even if it wanted to ([MomentStore] only exposes
+    // [MomentStore.deleteAll], the demo-wipe gesture). Null (the default) whenever
+    // `Config.FLEET_URL` is unset or a build wires no fleet tier — same nullable-optional-feature
+    // contract as [labelCache]/[ocrEngine] above; GlassesComponents only builds a non-null queue
+    // when the fleet tier is actually configured.
+    private val uploadQueue: UploadQueue? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // Spec §6: a frame's `episode_id` = the recording session's start timestamp. Defaults to
     // construction time so a standalone instance still stamps SOMETHING sane; the real value for
@@ -491,24 +507,27 @@ class MomentCapture(
             // AFTER a successful store deleted the thumb the just-persisted payload still points at,
             // with the baseline already advanced — a durable card pointing at a missing file, no
             // retry). Rethrows nothing either way: the outer `finally` below still recycles `bitmap`.
+            // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the new
+            // point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
+            // documents on storeMoment(). The gate embedding above IS the stored vector: it is never
+            // re-embedded here or anywhere else on this path. Held in a local (not inlined into the
+            // storeMoment call below) so the fleet-upload enqueue further down can reuse the EXACT
+            // same payload via [MomentPayload.toJson] rather than re-deriving it (Task 10).
+            val framePayload = MomentPayload(
+                type = MomentType.FRAME,
+                momentId = "",
+                episodeId = episodeId,
+                timestampMs = ts,
+                tEndMs = ts,
+                thumbPath = if (thumbOk) thumbFile.absolutePath else "",
+                bbox = "",
+                label = "",
+                yoloConf = 0f,
+                verifyCos = 0f,
+                text = "",
+            )
             val id = try {
-                // type/momentId are placeholders — storeMoment stamps type="frame" and momentId=the
-                // new point's own id itself (Spec §6 invariant), same convention QdrantEdgeMomentStore
-                // documents on storeMoment(). The gate embedding above IS the stored vector: it is
-                // never re-embedded here or anywhere else on this path.
-                store.storeMoment(vec, MomentPayload(
-                    type = MomentType.FRAME,
-                    momentId = "",
-                    episodeId = episodeId,
-                    timestampMs = ts,
-                    tEndMs = ts,
-                    thumbPath = if (thumbOk) thumbFile.absolutePath else "",
-                    bbox = "",
-                    label = "",
-                    yoloConf = 0f,
-                    verifyCos = 0f,
-                    text = "",
-                ))
+                store.storeMoment(vec, framePayload)
             } catch (e: Throwable) {
                 // Nothing persisted — thumbFile is a genuine orphan. lastStoredGrid/Vec/Ms are
                 // untouched, so the next gate fire retries cleanly against the same last-known-good
@@ -525,6 +544,26 @@ class MomentCapture(
             lastStoredGrid = grid
             lastStoredVec = vec
             lastStoreMs = ts
+
+            // Fleet-sync Task 10 (Spec §4 UP flow / §5 dual-write, decision C): enqueue a COPY of
+            // the just-stored moment for upload. `uploadQueue` is null unless a fleet tier is
+            // actually wired (Config.FLEET_URL set), in which case this whole block is skipped —
+            // byte-for-byte today's local-only behavior (Global Constraint). Same "already durable,
+            // only log on failure" discipline as count()/onMoment right below: storeMoment already
+            // succeeded, so an enqueue failure here must never look like a store failure, and
+            // [UploadQueue.enqueue] itself is already fail-soft (never throws) — the try/catch here
+            // only guards [thumbFile.readBytes] / [buildUploadPayloadJson] ahead of it.
+            val queue = uploadQueue
+            if (queue != null) {
+                try {
+                    val thumbB64 = if (thumbOk) {
+                        Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
+                    } else ""
+                    queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.toJson(), ts, thumbB64))
+                } catch (e: Throwable) {
+                    Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
+                }
+            }
 
             // storeMoment succeeded: id/thumbPath are now durable. A count() or onMoment (Task 1.6's
             // HUD forward) failure past this point is logged and swallowed, never rethrown and never
@@ -706,3 +745,21 @@ private fun cosine(a: FloatArray, b: FloatArray): Float {
     if (na <= 0f || nb <= 0f) return 0f
     return (dot / (sqrt(na.toDouble()) * sqrt(nb.toDouble()))).toFloat()
 }
+
+/**
+ * Builds the fleet-upload payload JSON for one just-stored moment (plan Task 10, Spec §4 UP flow
+ * / §6 schema) from the SAME [MomentPayload] JSON [MomentCapture.confirmAndStore] just persisted
+ * locally, adding the two upload-only fields the fleet hub needs: [syncTs] (Spec §5's
+ * last-writer-wins conflict timestamp) and [thumbB64] (the thumbnail bytes, base64-encoded — the
+ * device's own `thumb_path` is a device-local file path, meaningless off-device, so the pixels
+ * themselves have to travel for another node to render this moment, Spec §6). [framePayloadJson]
+ * is [MomentPayload.toJson]'s output, unmodified; [thumbB64] "" (never null) when the thumbnail
+ * write failed (mirrors [MomentPayload.thumbPath]'s own "" convention on that same failure).
+ *
+ * Pure/no I/O — pulled out of [MomentCapture] (same "extract the pure part" move as this file's
+ * own [decide]) so the payload-shaping half of the enqueue-on-store behavior can be reasoned about
+ * on its own; `MomentCaptureUploadTest` still drives the real [MomentCapture] end to end (fake
+ * [CropEncoder]/[MomentStore], real [UploadQueue]) to cover the wiring this function alone can't.
+ */
+fun buildUploadPayloadJson(framePayloadJson: String, syncTs: Long, thumbB64: String): String =
+    JSONObject(framePayloadJson).put("sync_ts", syncTs).put("thumb_b64", thumbB64).toString()
