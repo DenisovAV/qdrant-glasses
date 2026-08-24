@@ -34,29 +34,34 @@ class FleetSync(
     suspend fun pull(collection: String = "fleet_curated"): FleetShardStore? {
         val snap = File(filesDir, "fleet_snap.bin")
         val dir = File(filesDir, "fleet_shard")
+        var name: String? = null   // hoisted so `finally` can delete the server snapshot on EVERY exit path
         return try {
-            val name = client.createShardSnapshot(collection)
+            name = client.createShardSnapshot(collection)
             snap.delete()
             client.downloadSnapshot(collection, 0, name, snap)
-            // Cleanup, best-effort: every pull creates a NEW server-side snapshot (createShardSnapshot
-            // above) that otherwise never gets deleted and accumulates on the fleet hub. A failed
-            // delete must never fail the pull itself — the local copy already downloaded successfully.
-            runCatching { client.deleteSnapshot(collection, 0, name) }
-                .onFailure { Log.w(TAG, "fleet snapshot delete failed (non-fatal): ${it.message}") }
             dir.deleteRecursively(); dir.mkdirs()   // EdgeShard/unpack needs the target dir to EXIST (empty) — it does NOT create parents (os error 2 otherwise)
             unpackSnapshotAsync(snap.absolutePath, dir.absolutePath)
             FleetShardStore.load(dir.absolutePath, clipDim).also { Log.i(TAG, "fleet pulled: $collection") }
         } catch (e: Throwable) {
-            // Structured concurrency: a CancellationException here means the load coroutine itself
-            // was cancelled (e.g. the app closing) — it must propagate to cancel the coroutine, not
-            // be swallowed as a fleet-pull failure. The fail-soft contract below is for real errors
-            // only. `finally { snap.delete() }` still runs on this path.
+            // Clean the (possibly half-unpacked) shard dir on EVERY non-success exit — do it BEFORE the
+            // cancellation rethrow so a cancelled pull leaves no orphan either. On success this line is
+            // never reached, so the loaded store's on-disk backing survives.
+            dir.deleteRecursively()
+            // Structured concurrency: a CancellationException means the load coroutine itself was
+            // cancelled (app closing) — propagate it, don't swallow it as a fleet-pull failure. The
+            // fail-soft contract below is for real errors only; `finally` still runs on this path.
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "fleet pull failed (non-fatal): ${e.message}")
-            dir.deleteRecursively()
             null
         } finally {
             snap.delete()
+            // The server-side snapshot is only ever an intermediate — delete it on ALL paths (success,
+            // download failure, cancellation), or created-but-undownloaded snapshots accumulate on the
+            // fleet hub. Best-effort: a failed delete never affects the pull's outcome.
+            name?.let { n ->
+                runCatching { client.deleteSnapshot(collection, 0, n) }
+                    .onFailure { Log.w(TAG, "fleet snapshot delete failed (non-fatal): ${it.message}") }
+            }
         }
     }
 
