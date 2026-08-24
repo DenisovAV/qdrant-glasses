@@ -40,7 +40,7 @@ import java.util.UUID
  * condition). `Task 5` wires this behind a `FleetSource` seam so [MomentSearcher] can fake it in a JVM
  * test without the native `.so`.
  */
-class FleetShardStore(private val shard: EdgeShard) {
+class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) {
 
     companion object {
         private const val TAG = "FleetShardStore"
@@ -65,7 +65,8 @@ class FleetShardStore(private val shard: EdgeShard) {
         )
 
         /** Opens an already-unpacked snapshot dir (see [io.qdrant.edge.unpackSnapshotAsync]) read-only. */
-        fun load(dir: String, clipDim: Int): FleetShardStore = FleetShardStore(EdgeShard.load(dir, config(clipDim)))
+        fun load(dir: String, clipDim: Int): FleetShardStore =
+            FleetShardStore(EdgeShard.load(dir, config(clipDim)), clipDim)
 
         /**
          * TEST ONLY (androidTest, [FleetShardStoreTest]): builds a brand-new tiny shard at [dir] and
@@ -93,6 +94,9 @@ class FleetShardStore(private val shard: EdgeShard) {
 
     /** Nearest-neighbor search against the fleet corpus's `"clip"` vector; every hit tagged `source="fleet"`. */
     fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> {
+        // Mirrors QdrantEdgeMomentStore.channelSearch's guard: reject a malformed query vector before
+        // it ever reaches NamedVector.Dense / the native API.
+        require(qvec.size == clipDim) { "dim ${qvec.size} != $clipDim" }
         val results = shard.query(QueryRequest(
             limit = topK.toULong(), offset = null,
             query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(qvec.toList()), using = CLIP_FIELD)),

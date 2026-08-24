@@ -23,10 +23,15 @@ class FleetShardStoreTest {
         FleetShardStore.seedForTest(dir, clipDim = 768, id = "f1",
             vec = FloatArray(768) { 0.01f }, label = "fleet-cup", ts = 111L)
         val store = FleetShardStore.load(dir, clipDim = 768)
-        val hits = store.searchFrames(FloatArray(768) { 0.01f }, topK = 5, sinceMs = null, untilMs = null)
-        assertTrue(hits.isNotEmpty())
-        assertEquals("fleet", hits.first().source)
-        assertEquals("fleet-cup", hits.first().label)
-        store.close()
+        try {
+            val hits = store.searchFrames(FloatArray(768) { 0.01f }, topK = 5, sinceMs = null, untilMs = null)
+            assertTrue(hits.isNotEmpty())
+            assertEquals("fleet", hits.first().source)
+            assertEquals("fleet-cup", hits.first().label)
+        } finally {
+            // Always close the native shard handle, even on assertion failure — otherwise it leaks
+            // open and can affect later instrumented-test runs (review finding).
+            store.close()
+        }
     }
 }
