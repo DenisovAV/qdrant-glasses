@@ -4,13 +4,18 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption
 
 /**
  * One point queued for upload to the private Qdrant fleet hub (Spec §4 UP flow / §5 dual-write,
  * plan Task 8): the clip vector plus its already-serialized payload JSON. [payloadJson] is opaque
  * to [UploadQueue] — the caller ([tech.qdrant.glasses.pipeline.MomentCapture], Task 10) stamps in
- * `sync_ts`/`thumb_b64` before enqueuing; this class only persists and replays what it's given.
+ * `sync_ts` before enqueuing; this class only persists and replays what it's given. `thumb_b64` is
+ * NOT part of the enqueued payload (round-4 review fix, see [UploadQueue]'s "Concurrency" doc below)
+ * — [tech.qdrant.glasses.fleet.FleetSync] stamps that in lazily, right before the HTTP upsert.
  */
 data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: String)
 
@@ -44,6 +49,16 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * "parse+filter the whole queue" — that's what actually satisfies the "must not block capture" requirement
  * (an async fire-and-forget [enqueue] would satisfy it too, but at the cost of durability — see
  * above — which is the worse trade for a queue whose entire point is surviving a crash/reboot).
+ *
+ * **Round-4 review fix — this invariant briefly broke, then was restored.** Between Task 10 (which
+ * added a thumbnail to the fleet-upload payload) and this round, [enqueue]'s "small, fixed-cost"
+ * framing above stopped being true: the caller was stamping a base64-encoded JPEG (tens-to-hundreds
+ * of KB, not the "multi-KB clip vector" this doc means) into [QueuedPoint.payloadJson] before ever
+ * calling [enqueue], so every JSONL line — and therefore every [ack]'s `writeAtomic` rewrite of the
+ * remaining backlog, still done under [lock] — carried that same blob. `thumb_b64` is no longer part
+ * of the enqueued payload at all (see [QueuedPoint]'s doc) — [FleetSync] reads and stamps it in
+ * lazily, off this class and off `embedLane` entirely, right before the HTTP upsert — so this
+ * invariant is accurate again for every point [MomentCapture] enqueues from here on.
  *
  * A synchronous [enqueue] that ISN'T serialized with [ack] at all would risk a subtler bug: if an
  * [enqueue] appends a line while [ack] is mid-read, [ack]'s rewrite (built from an earlier snapshot)
@@ -95,6 +110,15 @@ data class QueuedPoint(val id: String, val clip: FloatArray, val payloadJson: St
  * with the original file untouched, and the whole rewrite is retried from scratch on the next [ack]
  * call — "leave it queued and retry" instead of "maybe corrupt it now," matching every other
  * fail-soft path in this class.
+ *
+ * **Round-4 fix — this was atomic-VISIBILITY, not crash-DURABLE.** Write-then-rename alone
+ * guarantees no reader/JVM-crash ever sees a torn file, but says nothing about a real hard-power-loss
+ * event (UVLO battery brownout — a documented, recurring failure mode on this exact glasses hardware,
+ * CLAUDE.md): a rename that already returned to the caller can still lose the tmp file's bytes, or in
+ * rarer cases the rename itself, if power dies before the filesystem journals it. [writeAtomic] now
+ * `fsync`s the tmp file before the rename (durable content) and best-effort `fsync`s the parent
+ * directory after it (durable rename), closing that gap — see [writeAtomic]'s own doc for exactly
+ * what's guaranteed vs. best-effort.
  *
  * **[ack]'s return value (round-1 fix):** [ack] used to swallow every failure silently (`Unit`
  * return), so [FleetSync.pushDrain] could not tell a successful rewrite from a failed one — it
@@ -225,6 +249,26 @@ class UploadQueue(private val file: File, private val maxEntries: Int = DEFAULT_
      * the atomic rename fails (round-1 fix) — callers must NOT fall back to a non-atomic copy-then-
      * overwrite of the live file (see class doc "Durability of ack"); [ack]'s own try/catch turns
      * this into a logged, fail-soft `false` return with the ORIGINAL file left untouched.
+     *
+     * **Round-4 review fix — fsync before the rename.** Write-then-rename alone is atomic w.r.t.
+     * VISIBILITY (a reader, or a crash in the JVM itself, never observes a torn file — the original
+     * claim this KDoc made) but is NOT crash-DURABLE on its own: a rename that has already returned
+     * to the caller is not guaranteed to have the tmp file's bytes on flash yet, and on a real
+     * hard-power-loss event the write can simply vanish. That gap matters on THIS hardware
+     * specifically — UVLO battery-brownout is a documented, recurring failure mode on the AR1
+     * glasses (CLAUDE.md), not a hypothetical. [FileOutputStream.getFD] + [java.io.FileDescriptor.sync]
+     * is `fsync(2)`: it blocks until the tmp file's data AND metadata are durable, so by the time the
+     * rename is requested there is nothing left for a crash to lose from the write itself. A sync
+     * failure here throws (same contract as a rename failure — [ack] turns it into a logged, fail-
+     * soft `false`, original file untouched, retried next time).
+     *
+     * A best-effort fsync of the PARENT DIRECTORY follows the rename, so the directory-entry update
+     * (the rename itself) is also durable, not just the tmp file's bytes — same UVLO concern, the
+     * other half of it. This is deliberately best-effort (caught, logged, never rethrown): opening a
+     * directory for `force()` is standard POSIX but its exact guarantees are filesystem-dependent and
+     * this path is not exercised on-device as part of this fix (no adb/on-device I/O experiments were
+     * run to confirm it), so a platform/filesystem that rejects it must degrade to "no worse than
+     * before this fix," not turn an otherwise-successful [ack] into a failure.
      */
     private fun writeAtomic(remaining: List<QueuedPoint>) {
         if (remaining.isEmpty()) {
@@ -233,11 +277,25 @@ class UploadQueue(private val file: File, private val maxEntries: Int = DEFAULT_
         }
         val body = remaining.joinToString("\n") { it.toLine() } + "\n"
         val tmp = File(file.absoluteFile.parentFile, file.name + ".tmp")
-        tmp.writeText(body)
+        FileOutputStream(tmp).use { fos ->
+            fos.write(body.toByteArray(Charsets.UTF_8))
+            fos.fd.sync()   // fsync(2) — durable on disk before we ever ask for the rename
+        }
         if (!tmp.renameTo(file)) {
             // Same-filesystem rename should always succeed for an app-private filesDir path; if it
             // somehow doesn't, throw rather than silently truncating the live file — see class doc.
             throw IOException("upload queue: atomic rename of ${tmp.name} -> ${file.name} failed")
+        }
+        try {
+            // parentFile is nullable in general (a bare root path has none) but never null in
+            // practice here — [file] is always constructed with an explicit parent directory
+            // (`filesDir`/`fleet_queue.jsonl` in production, a temp dir in tests) — the `?.let` is
+            // just the null-safe way to express "skip this best-effort step" for that edge case.
+            file.absoluteFile.parentFile?.toPath()?.let { dir ->
+                FileChannel.open(dir, StandardOpenOption.READ).use { it.force(true) }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "upload queue: parent-directory fsync after rename failed (non-fatal, best-effort durability hardening): ${e.message}")
         }
     }
 

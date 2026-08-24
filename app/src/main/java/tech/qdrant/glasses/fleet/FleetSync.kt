@@ -1,11 +1,13 @@
 package tech.qdrant.glasses.fleet
 
+import android.util.Base64
 import android.util.Log
 import io.qdrant.edge.unpackSnapshotAsync
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -115,7 +117,15 @@ class FleetSync(
                     coroutineContext.ensureActive()
                     val batch = queue.drain(BATCH)
                     if (batch.isEmpty()) break
-                    client.upsertPoints(collection, batch)   // throws on HTTP failure → caught below; batch stays queued
+                    // Round-4 review fix: read+base64-encode each point's thumbnail HERE, right
+                    // before the PUT — not back at [tech.qdrant.glasses.pipeline.MomentCapture]'s
+                    // enqueue call, and not stored in the queue file at all. See [withThumbB64]'s
+                    // own doc for why. This is I/O (a JPEG read per point in the batch) but it runs
+                    // on whatever dispatcher called [pushDrain] (a dedicated `Dispatchers.IO` launch
+                    // or the fleet lane, per [MomentCapture]'s `onFleetEnqueued` wiring / the startup
+                    // flush) — never [MomentCapture.embedLane] — so it can never block capture.
+                    val withThumbs = batch.map(::withThumbB64)
+                    client.upsertPoints(collection, withThumbs)   // throws on HTTP failure → caught below; batch stays queued
                     if (!queue.ack(batch.map { it.id })) {
                         // ack failed (already logged by UploadQueue) — stop this pass instead of
                         // re-upserting the same still-queued batch in a tight loop; retried whole on the
@@ -129,6 +139,48 @@ class FleetSync(
                 Log.w(TAG, "fleet pushDrain failed (non-fatal, will retry): ${e.message}")
             }
         }
+    }
+
+    /**
+     * Returns a copy of [point] whose payload additionally carries `thumb_b64` — the on-device
+     * thumbnail JPEG (found via the payload's own `thumb_path`, stamped at capture time by
+     * [tech.qdrant.glasses.pipeline.MomentCapture]), base64-encoded — for the upcoming upsert PUT.
+     * The thumbnail bytes have to travel because `thumb_path` is a device-local path, meaningless
+     * off-device (Spec §6); reading them HERE, right before the HTTP call, rather than back at
+     * enqueue time, is what keeps [tech.qdrant.glasses.pipeline.MomentCapture.embedLane] from ever
+     * touching the JPEG a second time.
+     *
+     * Round-4 review fix (blocker + major): until this round, [tech.qdrant.glasses.pipeline.
+     * MomentCapture.confirmAndStore] did this read+encode INLINE, synchronously, as part of the
+     * enqueue call it makes on `embedLane` — so `busy` stayed set (dropping capture candidates) for
+     * however long a tens-to-hundreds-of-KB disk read + base64 encode took, violating Spec §7's
+     * "fleet work must never block capture". It also meant every [UploadQueue] JSONL line embedded
+     * that same blob, so [UploadQueue.ack]'s `writeAtomic` — which runs INSIDE the queue's `lock`,
+     * the same lock `enqueue()` needs — could hold that lock for however long it took to
+     * re-serialize a whole thumb-bearing backlog to disk. Moving the read+encode HERE fixes both:
+     * [UploadQueue.enqueue]'s line is back to just the clip vector + small payload (the class doc's
+     * original "multi-KB clip vector" framing, from before Task 10 added thumbnails), and this runs
+     * off [tech.qdrant.glasses.pipeline.MomentCapture.embedLane] entirely — [pushDrain] already does
+     * blocking network I/O under [pushMutex] on a fleet lane / `Dispatchers.IO`, so one more
+     * blocking disk read per point changes nothing about what it's allowed to block.
+     *
+     * Fail-soft per-point (Spec §7): a missing or unreadable thumbnail (deleted, corrupted, a stale
+     * queue entry whose `thumb_path` no longer resolves) degrades that ONE point to `thumb_b64=""`
+     * — mirrors [tech.qdrant.glasses.pipeline.buildUploadPayloadJson]'s existing "" convention for a
+     * thumbnail write that failed at capture time — rather than failing the whole batch's upsert.
+     */
+    private fun withThumbB64(point: QueuedPoint): QueuedPoint {
+        val payload = JSONObject(point.payloadJson)
+        val thumbPath = payload.optString("thumb_path")
+        val thumbB64 = if (thumbPath.isNotBlank()) {
+            try {
+                Base64.encodeToString(File(thumbPath).readBytes(), Base64.NO_WRAP)
+            } catch (e: Throwable) {
+                Log.w(TAG, "fleet pushDrain: thumb read failed for id=${point.id}, uploading without it (non-fatal): ${e.message}")
+                ""
+            }
+        } else ""
+        return point.copy(payloadJson = payload.put("thumb_b64", thumbB64).toString())
     }
 
     // Single-flight guard (round-2 review fix, Finding 2): UploadQueue.ack's "fold in appends that

@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -30,6 +31,13 @@ import java.io.File
  * completion synchronously within the call that posted it — no need to await/join a background
  * coroutine to observe the store+enqueue side effects below. The injected [nowMs] clock (a mutable
  * local, not the wall clock) is what actually drives the gate/window timing deterministically.
+ *
+ * Round-4 review regression coverage: the enqueued payload must NOT carry `thumb_b64` (moved to
+ * [tech.qdrant.glasses.fleet.FleetSync]'s `withThumbB64`, read lazily off `embedLane` right before
+ * the HTTP PUT — see that class's doc) but MUST carry `thumb_path`, since that's what
+ * `withThumbB64` reads from later. Before this round's fix, the test asserted the OPPOSITE
+ * (`thumb_b64` present at enqueue time) — that read+encode inline, on `embedLane`, was exactly the
+ * blocking-capture defect the review flagged.
  */
 @RunWith(RobolectricTestRunner::class)
 class MomentCaptureUploadTest {
@@ -107,7 +115,14 @@ class MomentCaptureUploadTest {
         val uploadPayload = JSONObject(drained[0].payloadJson)
         assertEquals("frame", uploadPayload.getString("type"))
         assertTrue("sync_ts present", uploadPayload.has("sync_ts"))
-        assertTrue("thumb_b64 present", uploadPayload.has("thumb_b64"))
+        // Round-4 review fix: thumb_b64 must NOT be built at enqueue time — that was a
+        // synchronous JPEG-read-and-base64-encode inline on embedLane, blocking capture for its
+        // duration (the review's blocker finding). thumb_path (already part of framePayload) is
+        // what lets FleetSync.pushDrain's withThumbB64 read+encode it lazily, later, off embedLane.
+        assertFalse("thumb_b64 must NOT be present at enqueue time (moved to FleetSync.withThumbB64)",
+            uploadPayload.has("thumb_b64"))
+        assertTrue("thumb_path present (what FleetSync reads the thumbnail from later)",
+            uploadPayload.has("thumb_path"))
         // Round-1 regression: the upload payload's moment_id must match the enqueued point's OWN
         // id (Spec §6 frame invariant) — framePayload is built with a momentId="" placeholder
         // BEFORE storeMoment stamps its own internal copy, so reusing it unstamped silently

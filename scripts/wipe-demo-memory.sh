@@ -4,7 +4,12 @@
 # The object memory lives in TWO places that must be cleared together:
 #   1. Glasses: Qdrant Edge shards + thumbnail JPEGs — the crop-store path
 #      (files/objects_shard_*, object_thumbs) AND the opt-in episodic-memory moment path
-#      (files/moments_shard_*, moment_thumbs — episodic-memory plan Task 1.7, Spec §7)
+#      (files/moments_shard_*, moment_thumbs — episodic-memory plan Task 1.7, Spec §7) AND, when the
+#      optional fleet-sync tier (Config.FLEET_URL) is on, the device->cloud upload queue
+#      (files/fleet_queue.jsonl — fleet-sync plan Task 8) — a not-yet-acked queue left behind by a
+#      wipe re-uploads the supposedly-just-wiped moments to fleet_inbox the instant the app relaunches
+#      and its startup pushDrain() fires (review round-4 finding — same ghost-data failure class as #2
+#      below, just a third place instead of a second).
 #   2. Mac relay: HUD rail + pushed thumbs, held in embed_server process RAM
 # Wiping only one side leaves ghost cards on the dashboard (bitten twice at rehearsals).
 #
@@ -68,7 +73,13 @@ adb -s "$SERIAL" shell am force-stop tech.qdrant.glasses
 # moments_shard_*/moment_thumbs are the episodic-memory plan's opt-in moment path (Task 1.5,
 # QdrantEdgeMomentStore) — same per-namespace glob rule, or a ghost moment shard survives a wipe
 # exactly the way a stale objects_shard_* used to (Spec §7 / CLAUDE.md).
-adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs files/moments_shard_* files/moment_thumbs'" 2>/dev/null || true
+# fleet_queue.jsonl is the fleet-sync plan's opt-in device->cloud upload queue (Task 8,
+# UploadQueue) — left out of an earlier version of this glob (review round-4 finding): a wipe that
+# skips it leaves any not-yet-acked queued moments on disk, and the very next line's app relaunch
+# fires GlassesComponents.load()'s startup pushDrain(), silently re-uploading them to fleet_inbox
+# right after the wipe. Only relevant when Config.FLEET_URL is set; a harmless no-op glob match
+# otherwise (the file simply doesn't exist).
+adb -s "$SERIAL" shell run-as tech.qdrant.glasses sh -c "'rm -rf files/objects_shard_* files/object_thumbs files/moments_shard_* files/moment_thumbs files/fleet_queue.jsonl'" 2>/dev/null || true
 echo "glasses memory wiped"
 
 # 3) Re-point the relay property (setprop does NOT survive a reboot — a glasses

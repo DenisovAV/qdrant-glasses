@@ -1,5 +1,6 @@
 package tech.qdrant.glasses.fleet
 
+import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -8,6 +9,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Test
@@ -73,6 +75,75 @@ class FleetSyncPushDrainTest {
             emptyList<QueuedPoint>(),
             queue.drain(100),
         )
+        srv.shutdown()
+    }
+
+    /**
+     * Round-4 review regression test (blocker + major findings): `thumb_b64` must be read off disk
+     * and base64-encoded by [FleetSync.pushDrain] itself — via `thumb_path`, from the payload
+     * [MomentCapture] enqueued WITHOUT a thumbnail — not by the capture path. This drives that
+     * whole path: enqueue a point whose payload carries only `thumb_path` (the enqueue-time shape
+     * after the round-4 fix, see `MomentCaptureUploadTest`), run a real [pushDrain], and assert the
+     * bytes actually PUT to the server were read from that file and base64-encoded.
+     */
+    @Test
+    fun pushDrainReadsAndBase64EncodesTheThumbnailFromDiskBeforeUpserting() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setResponseCode(200).setBody("""{"status":"ok"}"""))
+        srv.start()
+
+        val dir = kotlin.io.path.createTempDirectory("fleetsync-thumb-test").toFile()
+        val thumbBytes = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9)
+        val thumbFile = File(dir, "thumb.jpg").apply { writeBytes(thumbBytes) }
+        val queue = UploadQueue(File(dir, "fleet_queue.jsonl"))
+        val payloadJson = JSONObject().put("thumb_path", thumbFile.absolutePath).put("label", "cup").toString()
+        queue.enqueue("id-1", floatArrayOf(0.1f), payloadJson)
+
+        val client = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        val sync = FleetSync(client, dir, clipDim = 1, uploadQueue = queue)
+
+        runBlocking { sync.pushDrain() }
+
+        val sentPayload = JSONObject(srv.takeRequest().body.readUtf8())
+            .getJSONArray("points").getJSONObject(0).getJSONObject("payload")
+        assertEquals(
+            "the HTTP-PUT payload's thumb_b64 must be the thumb_path file's bytes, base64-encoded " +
+                "(read lazily by FleetSync, off embedLane, right before the PUT)",
+            Base64.encodeToString(thumbBytes, Base64.NO_WRAP),
+            sentPayload.getString("thumb_b64"),
+        )
+        assertEquals("cup", sentPayload.getString("label"))
+        assertEquals(emptyList<QueuedPoint>(), queue.drain(10))
+        srv.shutdown()
+    }
+
+    /** Fail-soft companion to the test above: a `thumb_path` that no longer resolves (deleted,
+     *  moved, whatever) must degrade that ONE point to `thumb_b64=""`, not fail the whole batch's
+     *  upsert (Spec §7). */
+    @Test
+    fun pushDrainDegradesToEmptyThumbB64WhenTheFileIsMissing() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setResponseCode(200).setBody("""{"status":"ok"}"""))
+        srv.start()
+
+        val dir = kotlin.io.path.createTempDirectory("fleetsync-thumb-missing-test").toFile()
+        val queue = UploadQueue(File(dir, "fleet_queue.jsonl"))
+        val payloadJson = JSONObject().put("thumb_path", File(dir, "does-not-exist.jpg").absolutePath).toString()
+        queue.enqueue("id-1", floatArrayOf(0.1f), payloadJson)
+
+        val client = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        val sync = FleetSync(client, dir, clipDim = 1, uploadQueue = queue)
+
+        runBlocking { sync.pushDrain() }
+
+        val sentPayload = JSONObject(srv.takeRequest().body.readUtf8())
+            .getJSONArray("points").getJSONObject(0).getJSONObject("payload")
+        assertEquals(
+            "a missing thumbnail must degrade this ONE point to an empty thumb_b64, never fail " +
+                "the whole batch's upsert",
+            "", sentPayload.getString("thumb_b64"),
+        )
+        assertEquals(emptyList<QueuedPoint>(), queue.drain(10))
         srv.shutdown()
     }
 }
