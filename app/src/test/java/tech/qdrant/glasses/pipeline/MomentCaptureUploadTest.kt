@@ -91,7 +91,6 @@ class MomentCaptureUploadTest {
             momentThumbsDir = thumbsDir,
             isRecording = { true },
             uploadQueue = queue,
-            fleetLane = Dispatchers.Unconfined,   // enqueue now runs on scope.launch(fleetLane); Unconfined → synchronous, observable
             nowMs = { clockRef[0] },
         )
 
@@ -138,7 +137,6 @@ class MomentCaptureUploadTest {
             momentThumbsDir = thumbsDir,
             isRecording = { true },
             uploadQueue = queue,
-            fleetLane = Dispatchers.Unconfined,   // Unconfined → the enqueue+trigger run synchronously, observable below
             onFleetEnqueued = { fired++ },
             nowMs = { clockRef[0] },
         )

@@ -160,39 +160,37 @@ class MomentCapture(
     // contract as [labelCache]/[ocrEngine] above; GlassesComponents only builds a non-null queue
     // when the fleet tier is actually configured.
     private val uploadQueue: UploadQueue? = null,
-    // Fleet-sync Task 10 review fix: the upload-side work triggered by [uploadQueue] above — a
-    // thumbnail file read + base64 encode, then [UploadQueue.enqueue]'s own file append (it takes a
-    // lock and does I/O, per its class doc's "Concurrency" section) — used to run INLINE on
-    // [embedLane], the SAME lane that does the NPU crop embed and [MomentStore.storeMoment] for
-    // every future keyframe. That violates the "fleet sync must never block capture" half of Spec
-    // §7: a slow disk (or another enqueue's momentarily-held lock) stalls this call, which stalls
-    // embedLane, which stalls the NEXT frame's [confirmAndStore] — busy's hard backpressure gate
-    // then drops candidates that arrive while embedLane is stuck on someone else's fleet I/O,
-    // exactly the failure mode Spec §7 rules out. [fleetLane] gives that upload-side work its OWN
-    // single-thread dispatcher — same "pull slow/optional work off embedLane onto a dedicated lane"
-    // shape as [ocrLane] just below (OCR's ~4s CPU pass, this class's OTHER off-embedLane escape
-    // hatch), except this one is INJECTED rather than hardcoded so a test can pass
-    // `Dispatchers.Unconfined` and observe the enqueue synchronously (see
-    // `MomentCaptureUploadTest`) the same way [embedLane] itself is injected for that reason.
-    // Defaults to `Dispatchers.IO.limitedParallelism(1)` — an I/O-shaped lane (file read + append,
-    // not CPU inference), mirroring `GlassesViewModel`'s own `embedLane = Dispatchers.IO.
-    // limitedParallelism(1)`. Durability doesn't depend on WHEN this runs relative to
-    // confirmAndStore returning: [UploadQueue.enqueue] itself is synchronous-durable (the point is
-    // on disk by the time the call returns) and survives a process restart via its JSONL file, so
-    // moving the call a few milliseconds later onto a different thread doesn't weaken the "a stored
-    // moment eventually gets queued for upload" obligation — it only means embedLane is no longer
-    // the thread paying for it. The one gap this accepts (same as the OCR side-channel above): a
-    // process death in the narrow window between storeMoment() returning and this coroutine actually
-    // running would skip that one moment's upload — never its local copy (decision C, unaffected
-    // either way) — a best-effort side-channel loss, not a Spec §7 violation (Spec §7 requires
-    // fail-soft, not zero-loss-across-a-crash for the optional upload path).
-    private val fleetLane: CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1),
+    // Fleet-sync P2 round-3 review fix: the upload-side work below — thumb read + base64 +
+    // [UploadQueue.enqueue] — used to run on a SEPARATELY LAUNCHED coroutine (formerly dispatched
+    // onto a dedicated `fleetLane`, fire-and-forget from [confirmAndStore]'s point of view). That
+    // reintroduced, at THIS call site, exactly the hazard [UploadQueue.enqueue]'s own class doc says
+    // it was built to avoid ("[enqueue] is synchronous and durable: a crash the instant after it
+    // returns can never lose the point — unlike a fire-and-forget async append would"): a process
+    // death between [store.storeMoment] returning and that detached coroutine actually running
+    // skipped the moment's upload PERMANENTLY (no backfill from local storage on restart —
+    // `GlassesComponents.load` only drains the queue FILE via `FleetSync.pushDrain`, it never
+    // re-derives missing entries from [store] itself), silently violating P2's "enqueue each stored
+    // moment" contract for a real, if narrow, window. The local copy was never at risk (decision C)
+    // — only the optional cloud mirror could miss a moment.
+    //
+    // Fixed by calling this block INLINE below, synchronously, on whatever thread runs
+    // [confirmAndStore] (production: [embedLane]; tests: the injected dispatcher) — so by the time
+    // [confirmAndStore] returns, the point is durably enqueued (or the failure is logged), matching
+    // [UploadQueue.enqueue]'s own documented guarantee at its actual call site. This is safe against
+    // the ORIGINAL "must never block capture" concern (Spec §7) because the work involved — reading
+    // back the JPEG this same call just wrote moments earlier (already synchronous on embedLane,
+    // never separately flagged) plus [UploadQueue.enqueue]'s own critical section (deliberately kept
+    // small across rounds 1-2, per that class's "Concurrency" doc: "a cap check, one append, a
+    // counter bump") — is the same small, bounded cost class already accepted for the thumb write
+    // right above, not the multi-second class of work (OCR) that genuinely needs its own lane
+    // ([ocrLane] just below). [onFleetEnqueued] (which only fires an ALREADY-detached
+    // `Dispatchers.IO` launch, see its own doc) stays cheap to call inline too.
     // Fleet-sync P2 round-2 review fix (Finding 1): the UP half must be an ONGOING loop (Spec §4:
     // "new local moment -> queue -> (online) batch upsert"), not a single once-per-process flush.
     // Before this fix, [tech.qdrant.glasses.fleet.FleetSync.pushDrain] was called exactly once, at
     // GlassesComponents.load() time — a moment captured during the CURRENT live session sat
     // durably queued (no loss, the JSONL file is the source of truth) but never actually reached
-    // `fleet_inbox` until the app was killed and relaunched. Invoked on [fleetLane], right after a
+    // `fleet_inbox` until the app was killed and relaunched. Invoked inline, right after a
     // successful [UploadQueue.enqueue] call, whenever [uploadQueue] is non-null — fire-and-forget:
     // this class never awaits it or learns whether the drain it triggers actually ran or succeeded
     // (same "already durable, only log on failure" spirit as the enqueue call itself). Null (no-op)
@@ -600,35 +598,35 @@ class MomentCapture(
             // succeeded, so an enqueue failure here must never look like a store failure, and
             // [UploadQueue.enqueue] itself is already fail-soft (never throws) — the try/catch here
             // only guards [thumbFile.readBytes] / [buildUploadPayloadJson] ahead of it.
+            //
+            // Round-3 review fix: this now runs INLINE (no separately-launched coroutine) — see the
+            // constructor's `uploadQueue` doc for why. By the time this method returns, the point is
+            // either durably enqueued or the failure is logged; a process death after this point can
+            // no longer silently drop a stored moment's upload the way a detached fire-and-forget
+            // dispatch could.
             val queue = uploadQueue
             if (queue != null) {
-                // OFF embedLane onto [fleetLane]: the thumb read + base64 + [UploadQueue.enqueue]'s
-                // file append must never stall embedLane's next keyframe embed/store (Spec §7 — fleet
-                // sync never blocks capture). All captured values are per-call locals that nothing
-                // else mutates (`vec` is this call's fresh gate embedding; `thumbFile` is durable on
-                // disk; `framePayload`/`id`/`ts` are immutable), so deferring the read is safe.
-                scope.launch(fleetLane) {
-                    try {
-                        val thumbB64 = if (thumbOk) {
-                            Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
-                        } else ""
-                        // Round-1 fix: `framePayload` (the pre-store local) still carries the
-                        // placeholder momentId="" — store.storeMoment stamped ITS OWN copy
-                        // (`payload.copy(momentId = id)`) internally and only returned the bare
-                        // `id`, never handing the stamped payload back (see QdrantEdgeMomentStore.
-                        // storeMoment). Reusing framePayload.toJson() as-is here silently uploaded
-                        // every point to fleet_inbox with moment_id:"" instead of moment_id:<its own
-                        // id> — violating the documented frame invariant ("momentId == the point's
-                        // own id") the onMoment callback below already gets right. .copy(momentId =
-                        // id) re-stamps this local copy the same way storeMoment stamped its own.
-                        queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.copy(momentId = id).toJson(), ts, thumbB64))
-                        // Round-2 review fix (Finding 1): trigger a push pass for THIS moment (and
-                        // anything else currently queued) instead of only ever draining at process
-                        // start — see [onFleetEnqueued]'s own doc.
-                        onFleetEnqueued?.invoke()
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
-                    }
+                try {
+                    val thumbB64 = if (thumbOk) {
+                        Base64.encodeToString(thumbFile.readBytes(), Base64.NO_WRAP)
+                    } else ""
+                    // Round-1 fix: `framePayload` (the pre-store local) still carries the
+                    // placeholder momentId="" — store.storeMoment stamped ITS OWN copy
+                    // (`payload.copy(momentId = id)`) internally and only returned the bare
+                    // `id`, never handing the stamped payload back (see QdrantEdgeMomentStore.
+                    // storeMoment). Reusing framePayload.toJson() as-is here silently uploaded
+                    // every point to fleet_inbox with moment_id:"" instead of moment_id:<its own
+                    // id> — violating the documented frame invariant ("momentId == the point's
+                    // own id") the onMoment callback below already gets right. .copy(momentId =
+                    // id) re-stamps this local copy the same way storeMoment stamped its own.
+                    queue.enqueue(id, vec, buildUploadPayloadJson(framePayload.copy(momentId = id).toJson(), ts, thumbB64))
+                    // Round-2 review fix (Finding 1): trigger a push pass for THIS moment (and
+                    // anything else currently queued) instead of only ever draining at process
+                    // start — see [onFleetEnqueued]'s own doc. Cheap to call inline: it only fires
+                    // an already-detached `Dispatchers.IO` launch and returns immediately.
+                    onFleetEnqueued?.invoke()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "moment stored (id=$id) but fleet upload enqueue failed (non-fatal): ${e.message}")
                 }
             }
 
