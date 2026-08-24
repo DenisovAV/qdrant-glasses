@@ -40,7 +40,7 @@ import java.util.UUID
  * condition). `Task 5` wires this behind a `FleetSource` seam so [MomentSearcher] can fake it in a JVM
  * test without the native `.so`.
  */
-class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) {
+class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : FleetSource {
 
     companion object {
         private const val TAG = "FleetShardStore"
@@ -93,7 +93,7 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) {
     }
 
     /** Nearest-neighbor search against the fleet corpus's `"clip"` vector; every hit tagged `source="fleet"`. */
-    fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> {
+    override fun searchFrames(qvec: FloatArray, topK: Int, sinceMs: Long?, untilMs: Long?): List<MomentHit> {
         // Mirrors QdrantEdgeMomentStore.channelSearch's guard: reject a malformed query vector before
         // it ever reaches NamedVector.Dense / the native API.
         require(qvec.size == clipDim) { "dim ${qvec.size} != $clipDim" }
