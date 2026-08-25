@@ -90,4 +90,33 @@ class FleetQdrantClientTest {
         assertEquals(0, srv.requestCount)
         srv.shutdown()
     }
+    // Regression: an unparseable payload must never be silently substituted with `{}` and upserted —
+    // a "successful" upsert of empty JSON would get the local point wrongly flagged synced=true
+    // despite its real data never reaching the hub. The call must throw and send NO request at all,
+    // leaving every point in the batch (including the well-formed one) synced=false for retry.
+    @Test fun upsertPointsWithUnparseablePayloadThrowsAndSendsNoRequest() {
+        val srv = MockWebServer()
+        srv.start()
+        val c = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        val points = listOf(
+            FleetPoint(
+                id = "11111111-1111-1111-1111-111111111111",
+                vector = floatArrayOf(0.1f, 0.2f, 0.3f),
+                payload = "{not valid json",
+            ),
+            FleetPoint(
+                id = "22222222-2222-2222-2222-222222222222",
+                vector = floatArrayOf(0.4f, 0.5f, 0.6f),
+                payload = """{"label":"mug","timestamp_ms":43}""",
+            ),
+        )
+        try {
+            c.upsertPoints("fleet_inbox", points)
+            org.junit.Assert.fail("expected IllegalArgumentException for unparseable payload")
+        } catch (_: IllegalArgumentException) {
+            // expected
+        }
+        assertEquals(0, srv.requestCount)
+        srv.shutdown()
+    }
 }

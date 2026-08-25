@@ -5,6 +5,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -90,12 +91,28 @@ class FleetQdrantClient(
      * that finds nothing to sync must not fire a request). Synchronous, same fail-soft contract as
      * every other method here — throws on a non-2xx/network error; callers wrap and fall back to
      * "stays unsynced, retried next idle pass" (never a crash).
+     *
+     * Every point's [FleetPoint.payload] is parsed BEFORE any request is built or sent — an
+     * unparseable payload throws immediately and skips the network call entirely, so a batch can
+     * never upsert a substitute empty `{}` in place of a point's real payload. That would otherwise
+     * let a "successful" upsert of empty JSON get treated as confirmed by the caller and flip the
+     * point's local `synced` flag despite its real data never reaching the hub (Spec §5/§6's
+     * crash-safe invariant is confirmed-implies-uploaded, not confirmed-implies-something-uploaded).
+     * Failing the whole call leaves every point in the batch `synced=false`, retried next idle pass.
      */
     fun upsertPoints(collection: String, points: List<FleetPoint>) {
         if (points.isEmpty()) return
         val pointsJson = JSONArray()
         points.forEach { p ->
-            val payloadObj = try { JSONObject(p.payload) } catch (_: Throwable) { JSONObject() }
+            val payloadObj = try {
+                JSONObject(p.payload)
+            } catch (e: JSONException) {
+                throw IllegalArgumentException(
+                    "upsertPoints: unparseable payload for point id=${p.id}, aborting batch " +
+                        "(leaving it — and the rest of this batch — unsynced for retry)",
+                    e,
+                )
+            }
             val vectorJson = JSONArray()
             p.vector.forEach { vectorJson.put(it.toDouble()) }
             pointsJson.put(
