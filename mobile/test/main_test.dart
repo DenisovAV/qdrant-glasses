@@ -87,7 +87,7 @@ void main() {
           pullOverride: (edgeClient) async {
             captured = edgeClient;
             await edgeClient.loadFromDir(shardDir);
-            return PullLoaded(count: await edgeClient.count(), dir: shardDir);
+            return PullLoaded(count: await edgeClient.count() ?? 0, dir: shardDir);
           },
         ),
       );

@@ -159,6 +159,23 @@ class FleetPull {
       liveHandleDisturbed = true;
       await edgeClient.loadFromDir(stagingDir.path);
       final count = await edgeClient.count();
+      // round-2 review fix #4: a count() FAILURE (`null`) is an unknown
+      // state, not a known-empty one — must not be reported as [PullEmpty]
+      // (which a user-facing banner reads as "the hub is fine, there's just
+      // nothing there yet"). Route it through the same
+      // restore-live/discard-staging path as every other unreachable-hub
+      // failure below, as [PullUnreachable] instead.
+      if (count == null) {
+        fleetLog(
+          'FleetPull.pull: count() on the staged shard at ${stagingDir.path} '
+          'failed (native error, not a genuine empty answer) — restoring the '
+          'previous corpus (if any), NOT promoting',
+          level: 900,
+        );
+        await _restoreLiveOrClose(liveDir);
+        await _deleteDirQuietly(stagingDir);
+        return const PullUnreachable('count() failed on the staged shard');
+      }
       if (count <= 0) {
         fleetLog(
           'FleetPull.pull: staged shard at ${stagingDir.path} has 0 points — '

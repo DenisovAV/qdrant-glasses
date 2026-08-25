@@ -446,6 +446,76 @@ void main() {
       expect(postCount, 2);
     },
   );
+
+  // Round-2 review fix #4 (silent-failure): `count()` erroring right after a
+  // good staging load must NOT be classified the same as a real empty shard
+  // — a native count() failure is "we don't know", not "we know it's 0".
+  test(
+    "count() failing on the staged shard -> PullUnreachable, not PullEmpty "
+    "(round-2 review fix #4)",
+    () async {
+      final liveDir = Directory('${workDir.path}/fleet_shard');
+      liveDir.createSync(recursive: true);
+      _seedShard(liveDir.path, momentId: 'old-good-moment');
+
+      final fakeEdgeClient = _CountFailsFakeEdgeClient();
+      final client = MockClient((request) async {
+        if (request.method == 'POST') {
+          return http.Response('{"result":{"name":"snap-count-fail.snapshot"}}', 200);
+        }
+        if (request.method == 'GET') {
+          return http.Response.bytes([1], 200);
+        }
+        if (request.method == 'DELETE') {
+          return http.Response('', 200);
+        }
+        return http.Response('unexpected', 500);
+      });
+      final fleetHttp = FleetHttp(baseUrl: 'http://localhost:6333', client: client);
+      final fleetPull = FleetPull(
+        http: fleetHttp,
+        edgeClient: fakeEdgeClient,
+        workDir: workDir.path,
+        unpackSnapshotFn: ({required snapshotPath, required targetPath}) {
+          // No-op: the fake's count() always errors regardless of what's on
+          // disk at targetPath, same technique the "validated-but-empty"
+          // test above uses.
+        },
+      );
+
+      final result = await fleetPull.pull(collection: 'fleet_curated');
+
+      expect(
+        result,
+        isA<PullUnreachable>(),
+        reason: 'a count() FAILURE is not the same outcome as a genuine empty shard',
+      );
+      expect(result, isNot(isA<PullEmpty>()));
+      // The live directory on disk was never promoted-over: still there.
+      expect(liveDir.existsSync(), isTrue);
+      expect(Directory('${workDir.path}/fleet_shard_staging').existsSync(), isFalse);
+    },
+  );
+}
+
+/// `loadFromDir` succeeds (records every path, mirrors
+/// [_AlwaysEmptyFakeEdgeClient]) but `count()` always throws its way to
+/// `null` — stands in for "the native count() call itself failed" (distinct
+/// from a real, successful 0-point answer) without needing to force an
+/// actual native failure.
+class _CountFailsFakeEdgeClient extends EdgeClient {
+  final List<String> loadedPaths = [];
+
+  @override
+  Future<void> loadFromDir(String dir) async {
+    loadedPaths.add(dir);
+  }
+
+  @override
+  Future<int?> count() async => null;
+
+  @override
+  Future<void> close() async {}
 }
 
 /// Reloads normally EXCEPT it throws on the SECOND time [loadFromDir] is

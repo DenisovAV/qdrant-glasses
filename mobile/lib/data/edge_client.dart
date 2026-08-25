@@ -118,16 +118,22 @@ class EdgeClient {
   }
 
   /// Exact point count in the loaded shard (every channel, not just frames) —
-  /// mainly a pull-succeeded sanity check (`count() > 0`). 0 if nothing is
-  /// loaded or the native call fails.
-  Future<int> count() async {
+  /// mainly a pull-succeeded sanity check (`count() > 0`). 0 when nothing is
+  /// loaded (a genuine, known answer: there is nothing to count); **`null`
+  /// when the native call itself fails (round-2 review fix #4, silent-
+  /// failure)** — a real, distinct outcome from a real 0. The old body
+  /// coalesced BOTH to `0`, which made [FleetPull.pull] unable to tell "the
+  /// hub answered with a genuinely empty shard" apart from "count() errored
+  /// right after a good load" — the former is [PullEmpty], the latter must
+  /// be [PullUnreachable] (an unknown state, not a known-empty one).
+  Future<int?> count() async {
     final shard = _shard;
     if (shard == null) return 0;
     try {
       return shard.count(request: qe.CountRequest());
     } catch (e) {
-      fleetLog('EdgeClient.count: native call failed, reporting 0: $e', level: 900);
-      return 0;
+      fleetLog('EdgeClient.count: native call failed: $e', level: 900);
+      return null;
     }
   }
 
