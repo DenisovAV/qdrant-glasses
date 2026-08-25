@@ -79,6 +79,24 @@ void main() {
 
       expect(hits, isEmpty);
     });
+
+    test(
+      'a label match older than the newest `limit` frames is still '
+      'returned — filtering runs BEFORE truncation, not after',
+      () async {
+        final client = EdgeClient();
+        await client.loadFromDir(shardDir);
+
+        // m1 (ts=1000, label=cup) is the OLDEST of the 3 seeded frames; m2
+        // and m3 (both "plant") are the 2 newest. A `limit: 2` cut that
+        // truncated to newest-first BEFORE filtering by label would keep
+        // only m3+m2 (plant, plant) and then find zero "cup" matches.
+        final hits = await client.timeline(label: 'cup', limit: 2);
+
+        expect(hits, hasLength(1));
+        expect(hits.single.momentId, 'm1');
+      },
+    );
   });
 
   group('searchFrames', () {
@@ -135,7 +153,36 @@ void main() {
     // 3 frame points + 1 region-only point seeded below.
     expect(await client.count(), 4);
   });
+
+  test(
+    'loadFromDir unloads the previously loaded shard (no leaked WAL lock)',
+    () async {
+      final client = EdgeClient();
+      await client.loadFromDir(shardDir);
+
+      final otherDir = '${tmp.path}/shard2';
+      Directory(otherDir).createSync(recursive: true);
+      _seedShard(otherDir);
+      await client.loadFromDir(otherDir);
+
+      // If loadFromDir failed to unload shardDir's handle, re-opening it
+      // directly here throws ShardLockedEdgeException (proven against this
+      // exact SDK build — see the Phase-1 review-fix commit that added this
+      // test).
+      final reopened = qe.EdgeShard.load(path: shardDir, config: _shardConfig());
+      reopened.unload();
+
+      await client.close();
+    },
+  );
 }
+
+qe.EdgeConfig _shardConfig() => qe.EdgeConfig(
+  vectorData: {
+    'clip': qe.VectorDataConfig(size: _clipDim, distance: qe.Distance.cosine),
+    'text': qe.VectorDataConfig(size: _textDim, distance: qe.Distance.cosine),
+  },
+);
 
 Float32List _unitVector(int dim) {
   final v = Float32List(dim);
@@ -147,13 +194,7 @@ Float32List _unitVector(int dim) {
 }
 
 void _seedShard(String dir) {
-  final config = qe.EdgeConfig(
-    vectorData: {
-      'clip': qe.VectorDataConfig(size: _clipDim, distance: qe.Distance.cosine),
-      'text': qe.VectorDataConfig(size: _textDim, distance: qe.Distance.cosine),
-    },
-  );
-  final shard = qe.EdgeShard.create(path: dir, config: config);
+  final shard = qe.EdgeShard.create(path: dir, config: _shardConfig());
   try {
     final points = [
       _framePoint(

@@ -9,16 +9,17 @@ import 'package:flutter_test/flutter_test.dart';
 /// hit list — MemoryRepository is the one responsible for doing the actual
 /// time/label narrowing on top of it (Phase 1: no vector search yet).
 class FakeEdgeClient extends EdgeClient {
-  final List<({int? sinceMs, int? untilMs, int limit})> timelineCalls = [];
+  final List<({int? sinceMs, int? untilMs, String? label, int limit})> timelineCalls = [];
   List<MomentHit> timelineResult = const [];
 
   @override
   Future<List<MomentHit>> timeline({
     int? sinceMs,
     int? untilMs,
+    String? label,
     int limit = 50,
   }) async {
-    timelineCalls.add((sinceMs: sinceMs, untilMs: untilMs, limit: limit));
+    timelineCalls.add((sinceMs: sinceMs, untilMs: untilMs, label: label, limit: limit));
     // Mirror the real EdgeClient's own time-window contract, so a test that
     // combines a window with a label sees the same AND-of-both-filters shape
     // MemoryRepository actually gets from the real thing.
@@ -81,6 +82,20 @@ void main() {
       expect(fake.timelineCalls.single.untilMs, 2500);
       expect(hits.map((h) => h.momentId), ['m1', 'm2']);
     });
+
+    test(
+      'a label is passed DOWN into EdgeClient.timeline — the real source of '
+      'truth for filtering runs there, before EdgeClient enforces `limit` '
+      '(not just applied client-side after the fact)',
+      () async {
+        final fake = FakeEdgeClient()..timelineResult = [_hit('m1', 1000, 'cup')];
+        final repo = MemoryRepository(edgeClient: fake);
+
+        await repo.search(const ParsedQuery(phrase: '', label: 'cup'));
+
+        expect(fake.timelineCalls.single.label, 'cup');
+      },
+    );
 
     test('a label filters the timeline results client-side', () async {
       final fake = FakeEdgeClient()
