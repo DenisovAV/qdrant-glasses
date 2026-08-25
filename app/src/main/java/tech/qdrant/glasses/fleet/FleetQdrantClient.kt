@@ -1,12 +1,31 @@
 package tech.qdrant.glasses.fleet
 
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+
+/**
+ * One point to upsert to a private-Qdrant fleet collection over REST (upstream flag design, Spec
+ * §5/§6): the wire shape [FleetQdrantClient.upsertPoints] needs, distinct from the native
+ * `io.qdrant.edge.Point` the local shard writes use ([tech.qdrant.glasses.storage.QdrantEdgeMomentStore]).
+ * [id] is the point's PointId as a string — every local write is a `PointId.Uuid`, so this is always
+ * a UUID string in practice, sent as a bare JSON string the server parses as its UUID id form.
+ * [vector] is the raw "clip" named-vector floats. [payload] is a JSON OBJECT string — the exact
+ * output of [tech.qdrant.glasses.storage.MomentPayload.toJson] plus the `synced` flag stripped/added
+ * by the caller — kept as a String (not `org.json.JSONObject`) so this class carries no JSON-library
+ * dependency of its own; [upsertPoints] parses it back into the request body.
+ */
+data class FleetPoint(
+    val id: String,
+    val vector: FloatArray,
+    val payload: String,
+)
 
 /**
  * Thin REST client to the private Qdrant fleet hub (Sovereign Fleet Memory PoC). Reuses OkHttp (same
@@ -18,6 +37,12 @@ class FleetQdrantClient(
     private val http: OkHttpClient = OkHttpClient.Builder()
         .callTimeout(30, TimeUnit.SECONDS).build(),
 ) {
+    companion object {
+        // Matches QdrantEdgeMomentStore/FleetShardStore's named-vector key — every collection this
+        // client talks to (fleet_inbox, fleet_curated) is provisioned with the SAME schema (Spec §6).
+        private const val CLIP_FIELD = "clip"
+    }
+
     /** POST create a shard snapshot; returns the snapshot file name. */
     fun createShardSnapshot(collection: String, shard: Int = 0): String {
         val req = Request.Builder()
@@ -53,6 +78,40 @@ class FleetQdrantClient(
             .url("$baseUrl/collections/$collection/shards/$shard/snapshots/$name").delete().build()
         http.newCall(req).execute().use { resp ->
             require(resp.isSuccessful) { "snapshot delete ${resp.code}" }
+        }
+    }
+
+    /**
+     * PUT-upserts [points] to [collection] in ONE batch (the "up" half of the upstream flag design,
+     * Spec §5): `?wait=true` so the call only returns after the server has durably applied the
+     * write — [tech.qdrant.glasses.fleet.FleetSync]'s local `synced` flag-flip (Spec §5/§6) must
+     * happen ONLY after a confirmed upsert, and an async ack here would let it flip the flag on a
+     * write the server hadn't actually committed yet. A no-op for an empty [points] (an idle pass
+     * that finds nothing to sync must not fire a request). Synchronous, same fail-soft contract as
+     * every other method here — throws on a non-2xx/network error; callers wrap and fall back to
+     * "stays unsynced, retried next idle pass" (never a crash).
+     */
+    fun upsertPoints(collection: String, points: List<FleetPoint>) {
+        if (points.isEmpty()) return
+        val pointsJson = JSONArray()
+        points.forEach { p ->
+            val payloadObj = try { JSONObject(p.payload) } catch (_: Throwable) { JSONObject() }
+            val vectorJson = JSONArray()
+            p.vector.forEach { vectorJson.put(it.toDouble()) }
+            pointsJson.put(
+                JSONObject()
+                    .put("id", p.id)
+                    .put("vector", JSONObject().put(CLIP_FIELD, vectorJson))
+                    .put("payload", payloadObj)
+            )
+        }
+        val body = JSONObject().put("points", pointsJson).toString()
+        val req = Request.Builder()
+            .url("$baseUrl/collections/$collection/points?wait=true")
+            .put(body.toRequestBody("application/json".toMediaType())).build()
+        http.newCall(req).execute().use { resp ->
+            val respBody = resp.body?.string().orEmpty()
+            require(resp.isSuccessful) { "upsert points ${resp.code}: $respBody" }
         }
     }
 }
