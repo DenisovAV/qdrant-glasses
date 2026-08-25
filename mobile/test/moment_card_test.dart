@@ -64,6 +64,32 @@ void main() {
     expect(find.text('plant'), findsOneWidget);
   });
 
+  testWidgets(
+    'valid-base64 non-image bytes never crash the card — falls back to text',
+    (tester) async {
+      // `_decodeThumb` happily base64-decodes this (it IS valid base64); the
+      // bytes just aren't a real image, so the failure surfaces later, at
+      // Image.memory's own async IMAGE-decode step, not at base64 decode.
+      final garbageBytes = utf8.encode('not actually image bytes, just text');
+      final thumbB64 = base64Encode(garbageBytes);
+      final hit = MomentHit(
+        id: 'id1',
+        score: 0,
+        momentId: 'm1',
+        timestampMs: 1700000000000,
+        label: 'plant',
+        thumbB64: thumbB64,
+      );
+
+      await _pump(tester, MomentCard(hit: hit));
+      // Let the async image-decode failure resolve and errorBuilder rebuild.
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('plant'), findsOneWidget);
+    },
+  );
+
   testWidgets('an empty label shows a placeholder, not a blank card', (tester) async {
     const hit = MomentHit(
       id: 'id1',

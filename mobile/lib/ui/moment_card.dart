@@ -36,7 +36,24 @@ class MomentCard extends StatelessWidget {
               children: [
                 AspectRatio(
                   aspectRatio: 1,
-                  child: Image.memory(thumb, fit: BoxFit.cover),
+                  // errorBuilder (Phase 1 review fix G): _decodeThumb only
+                  // guards the base64 DECODE step — well-formed base64 of
+                  // NON-image bytes decodes fine there and only fails later,
+                  // asynchronously, at Image.memory's own image-decode step,
+                  // which otherwise throws past this widget and violates
+                  // MomentCard's "never crash the card" claim. Falls back to
+                  // a neutral placeholder rather than repeating the label
+                  // (the Padding below already renders it once).
+                  child: Image.memory(
+                    thumb,
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, error, stackTrace) => Center(
+                      child: Icon(
+                        Icons.broken_image_outlined,
+                        color: Theme.of(context).disabledColor,
+                      ),
+                    ),
+                  ),
                 ),
                 Padding(
                   padding: const EdgeInsets.all(4),
