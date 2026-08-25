@@ -90,6 +90,34 @@ void main() {
     expect(find.byKey(const Key('message_list')), findsOneWidget);
   });
 
+  testWidgets(
+    'the thread auto-scrolls to the bottom as turns are appended, so new '
+    'turns are not stranded below the fold',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(400, 300));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final repo = FakeMemoryRepository();
+      await tester.pumpWidget(MaterialApp(home: ChatScreen(repository: repo)));
+
+      // Enough turns (each with 2 inline MomentCards) to overflow the small
+      // viewport above.
+      for (var i = 0; i < 6; i++) {
+        await _typeAndSend(tester, 'вопрос $i');
+        repo.pendingSearch!.complete([_hit('a$i'), _hit('b$i')]);
+        await tester.pumpAndSettle();
+      }
+
+      final listView = tester.widget<ListView>(find.byKey(const Key('message_list')));
+      final controller = listView.controller!;
+      expect(
+        controller.position.maxScrollExtent,
+        greaterThan(0),
+        reason: 'the test setup must actually overflow the viewport, or this assertion is vacuous',
+      );
+      expect(controller.offset, moreOrLessEquals(controller.position.maxScrollExtent, epsilon: 1.0));
+    },
+  );
+
   testWidgets('blank input is not sent', (tester) async {
     final repo = FakeMemoryRepository();
     await tester.pumpWidget(MaterialApp(home: ChatScreen(repository: repo)));

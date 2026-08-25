@@ -41,6 +41,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.add(ChatMessage(role: ChatRole.user, text: raw));
       _isSearching = true;
     });
+    _scrollToBottom();
 
     // Fail-soft by construction: MemoryRepository/EdgeClient never throw —
     // an unreachable hub or an empty corpus just means zero hits below, not
@@ -56,6 +57,23 @@ class _ChatScreenState extends State<ChatScreen> {
           text: hits.isEmpty ? 'Ничего не нашёл.' : 'Нашёл ${hits.length}.',
           hits: hits,
         ),
+      );
+    });
+    _scrollToBottom();
+  }
+
+  /// Fix H (code-reviewer): `_scrollController` was wired to the `ListView`
+  /// but nothing ever drove it — new turns appended below the fold with no
+  /// way to see them without a manual scroll. Runs after the frame that
+  /// laid out the newly-appended turn (so `maxScrollExtent` already
+  /// reflects it), not inside `setState` itself.
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
       );
     });
   }
