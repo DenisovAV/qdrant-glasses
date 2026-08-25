@@ -15,6 +15,7 @@ import 'package:fleet_node/data/pull_result.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:path/path.dart' as p;
 import 'package:qdrant_edge/qdrant_edge.dart' as qe;
 
 const _clipDim = 768;
@@ -256,6 +257,167 @@ void main() {
       );
     },
   );
+
+  // Round-2 review fix #1 (IMPORTANT — flutter-architect reproduced actual
+  // data loss). The OLD promote sequence was
+  // `close -> deleteDirQuietly(liveDir) -> stagingDir.rename(liveDir)`, with
+  // the catch unconditionally deleting `stagingDir` too — so if `rename`
+  // threw AFTER `liveDir` had already been deleted, BOTH the old corpus
+  // (deleted) and the just-validated staging (deleted by the catch) were
+  // gone: zero shards on disk. The fix never deletes the old corpus before
+  // the new one is confirmed in place (a plain rename to a `fleet_shard_old`
+  // backup, not a delete), and never deletes staging once that backup-rename
+  // has happened. This drives the exact "rename throws after validation but
+  // before/at promotion" gap via the injectable `renameDirFn` seam — a real
+  // "pre-create a file at the target path" trick isn't reliably portable
+  // across filesystems/platforms for a directory-onto-existing-entry rename,
+  // so this pins down precisely WHICH rename call fails instead.
+  test(
+    'a rename failure after validation but during promotion leaves the OLD '
+    'corpus usable on disk — never zero shards (round-2 review fix #1)',
+    () async {
+      final liveDir = Directory('${workDir.path}/fleet_shard');
+      liveDir.createSync(recursive: true);
+      _seedShard(liveDir.path, momentId: 'old-good-moment');
+
+      final edgeClient = EdgeClient();
+      await edgeClient.loadFromDir(liveDir.path);
+      expect(await edgeClient.count(), 1);
+
+      final client = MockClient((request) async {
+        if (request.method == 'POST') {
+          return http.Response('{"result":{"name":"snap-good.snapshot"}}', 200);
+        }
+        if (request.method == 'GET') {
+          // The bytes themselves are irrelevant: `unpackSnapshotFn` below is
+          // faked to seed a real staged shard directly, the same technique
+          // the "validated-but-empty" test above uses (package:qdrant_edge
+          // exposes no snapshot-CREATE API to fabricate real bytes with).
+          return http.Response.bytes([1], 200);
+        }
+        if (request.method == 'DELETE') {
+          return http.Response('', 200);
+        }
+        return http.Response('unexpected', 500);
+      });
+      final fleetHttp = FleetHttp(baseUrl: 'http://localhost:6333', client: client);
+      final fleetPull = FleetPull(
+        http: fleetHttp,
+        edgeClient: edgeClient,
+        workDir: workDir.path,
+        unpackSnapshotFn: ({required snapshotPath, required targetPath}) {
+          _seedShard(targetPath, momentId: 'new-good-moment');
+        },
+        renameDirFn: (from, to) async {
+          // Force ONLY the staging->live rename to fail — the exact call
+          // the original bug's data loss hinged on — regardless of call
+          // order, so this stays correct even if the promote sequence is
+          // reshuffled later.
+          if (p.basename(from.path) == 'fleet_shard_staging') {
+            throw const FileSystemException('forced: staging->live rename failed');
+          }
+          await from.rename(to.path);
+        },
+      );
+
+      final result = await fleetPull.pull(collection: 'fleet_curated');
+
+      expect(result, isA<PullUnreachable>());
+      // Exactly one usable shard on disk: the OLD one, since the promotion
+      // (staging -> live) never completed.
+      expect(edgeClient.isLoaded, isTrue);
+      expect(await edgeClient.count(), 1, reason: 'the old corpus must survive the failed promote');
+      final hits = await edgeClient.timeline();
+      expect(hits.map((h) => h.momentId), contains('old-good-moment'));
+      expect(
+        hits.map((h) => h.momentId),
+        isNot(contains('new-good-moment')),
+        reason: 'the never-promoted staged corpus must not appear as if it were live',
+      );
+      // No backup left dangling, no orphan directories beyond the live one.
+      expect(Directory('${workDir.path}/fleet_shard_old').existsSync(), isFalse);
+
+      await edgeClient.close();
+    },
+  );
+
+  // The other half of the same guarantee: if the staging->live rename DOES
+  // succeed (promotion completes data-wise) and only the RELOAD afterwards
+  // fails, the NEW corpus must be what's left on disk — not a stale
+  // roll-back to the old one, and not a double-delete of both.
+  test(
+    'promotion completing but the post-promote reload failing keeps the NEW '
+    'corpus on disk, not a rollback to the old one (round-2 review fix #1)',
+    () async {
+      final liveDir = Directory('${workDir.path}/fleet_shard');
+      liveDir.createSync(recursive: true);
+      _seedShard(liveDir.path, momentId: 'old-good-moment');
+
+      final edgeClient = _FailsToReloadOnceEdgeClient();
+      await edgeClient.loadFromDir(liveDir.path);
+
+      final client = MockClient((request) async {
+        if (request.method == 'POST') {
+          return http.Response('{"result":{"name":"snap-good-2.snapshot"}}', 200);
+        }
+        if (request.method == 'GET') {
+          return http.Response.bytes([1], 200);
+        }
+        if (request.method == 'DELETE') {
+          return http.Response('', 200);
+        }
+        return http.Response('unexpected', 500);
+      });
+      final fleetHttp = FleetHttp(baseUrl: 'http://localhost:6333', client: client);
+      final fleetPull = FleetPull(
+        http: fleetHttp,
+        edgeClient: edgeClient,
+        workDir: workDir.path,
+        unpackSnapshotFn: ({required snapshotPath, required targetPath}) {
+          _seedShard(targetPath, momentId: 'new-good-moment');
+        },
+      );
+
+      final result = await fleetPull.pull(collection: 'fleet_curated');
+
+      expect(result, isA<PullUnreachable>());
+      // The staging->live rename genuinely completed on disk (real
+      // Directory.rename, not faked) — the new corpus, not the old one,
+      // must be what's left at `fleet_shard`. Checked via the SAME
+      // `edgeClient` `_restoreLiveOrClose` already retried the reload on
+      // (its own forced-failure only fires once) — a SEPARATE fresh
+      // `EdgeClient` on the same path here would just deadlock against the
+      // still-open handle instead of proving anything.
+      expect(Directory('${workDir.path}/fleet_shard_old').existsSync(), isFalse);
+      expect(edgeClient.isLoaded, isTrue, reason: 'the retried reload after the forced failure must have recovered');
+      final hits = await edgeClient.timeline();
+      expect(hits.map((h) => h.momentId), contains('new-good-moment'));
+      expect(hits.map((h) => h.momentId), isNot(contains('old-good-moment')));
+      await edgeClient.close();
+    },
+  );
+}
+
+/// Reloads normally EXCEPT it throws on the SECOND time [loadFromDir] is
+/// called on a path ending in exactly `fleet_shard` (the test's own initial
+/// setup load is the first such call; the post-promote reload inside
+/// `FleetPull.pull` is the second) — stands in for "the directory swap
+/// succeeded but the native reload afterwards failed" without needing to
+/// corrupt a real shard on disk. `fleet_shard_staging`'s validation load
+/// never matches (different basename), so it always goes through untouched.
+class _FailsToReloadOnceEdgeClient extends EdgeClient {
+  var _liveDirLoadCalls = 0;
+
+  @override
+  Future<void> loadFromDir(String dir) async {
+    if (p.basename(dir) == 'fleet_shard') {
+      _liveDirLoadCalls++;
+      if (_liveDirLoadCalls == 2) {
+        throw StateError('forced: post-promote reload failed');
+      }
+    }
+    await super.loadFromDir(dir);
+  }
 }
 
 /// Reports `loadFromDir` was called (recording every path) but always
