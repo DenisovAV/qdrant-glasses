@@ -23,6 +23,7 @@ import io.qdrant.edge.PointId
 import io.qdrant.edge.Query
 import io.qdrant.edge.QueryRequest
 import io.qdrant.edge.RangeFloat
+import io.qdrant.edge.Record
 import io.qdrant.edge.ScoredPoint
 import io.qdrant.edge.ScoringQuery
 import io.qdrant.edge.ScrollRequest
@@ -30,6 +31,8 @@ import io.qdrant.edge.ValueVariants
 import io.qdrant.edge.Vector
 import io.qdrant.edge.WithPayload
 import io.qdrant.edge.WithVector
+import org.json.JSONObject
+import tech.qdrant.glasses.fleet.FleetPoint
 import java.io.File
 import java.util.UUID
 
@@ -113,7 +116,7 @@ class QdrantEdgeMomentStore(
     init {
         shard = EdgeShard.load(dir, config)
         ensurePayloadIndexes()
-        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))} (payload indexes: timestamp_ms, type)")
+        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))} (payload indexes: timestamp_ms, type, synced)")
     }
 
     /**
@@ -136,6 +139,10 @@ class QdrantEdgeMomentStore(
         }.onFailure { Log.d(TAG, "payload index 'timestamp_ms' not (re)created: ${it.message}") }
         runCatching { shard.update(UpdateOperation.createFieldIndex("type", PayloadSchemaType.KEYWORD)) }
             .onFailure { Log.d(TAG, "payload index 'type' not (re)created: ${it.message}") }
+        // Fleet-sync upstream flag (Spec §5/§6): accelerates scrollUnsyncedFrames's `synced != true`
+        // filter, same reasoning as the `type` KEYWORD index just above.
+        runCatching { shard.update(UpdateOperation.createFieldIndex("synced", PayloadSchemaType.BOOL)) }
+            .onFailure { Log.d(TAG, "payload index 'synced' not (re)created: ${it.message}") }
         shard.flush()
     }
 
@@ -295,6 +302,96 @@ class QdrantEdgeMomentStore(
     // second `Filter.must` list, same as [searchFrames]/[searchRegions] already do via [channelSearch].
     override fun frameCount(): Long = synchronized(lock) {
         shard.count(CountRequest(filter = typeAndTimeFilter(MomentType.FRAME, null, null), exact = true)).toLong()
+    }
+
+    /**
+     * The upload backlog for the fleet-sync flag-on-store design (Spec §5): up to [limit] `type=frame`
+     * points whose payload's `synced` is not `true` (`Filter.mustNot` on `synced == true`, so a point
+     * that never had the key set — pre-fleet-sync capture — matches too, same as the KDoc on
+     * [MomentStore.scrollUnsyncedFrames] promises). Unlike every other read here, vectors ARE
+     * requested (`withVector = WithVector.Bool(true)`) — the upload needs them.
+     *
+     * A record whose id isn't a [PointId.Uuid] or whose `clip` vector doesn't parse out of the
+     * returned vector JSON is skipped (logged, not thrown) rather than failing the whole batch — this
+     * store only ever WRITES `PointId.Uuid` ids with a `clip` vector on a frame point (see
+     * [storeMoment]), so neither should happen in practice; the guard is defensive, not expected.
+     */
+    override fun scrollUnsyncedFrames(limit: Int): List<FleetPoint> = synchronized(lock) {
+        val resp = shard.scroll(ScrollRequest(
+            offset = null, limit = limit.toULong(),
+            filter = unsyncedFrameFilter(),
+            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(true),
+            orderBy = null,
+        ))
+        resp.records.mapNotNull { toFleetPoint(it) }
+            .also { Log.i(TAG, "scrollUnsyncedFrames: limit=$limit returned=${it.size}") }
+    }
+
+    // `type == frame` AND NOT (`synced == true`) — Filter.must/mustNot both AND into the overall
+    // filter (must = AND, mustNot = AND-of-NOT, standard Qdrant semantics), so this reads as
+    // "frame points whose synced flag is not true", including points with no `synced` key at all.
+    private fun unsyncedFrameFilter(): Filter = Filter(
+        must = listOf(Condition.Field(FieldCondition(
+            key = "type", match = Match.Value(ValueVariants.String(MomentType.FRAME)),
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+        ))),
+        should = null,
+        mustNot = listOf(Condition.Field(FieldCondition(
+            key = "synced", match = Match.Value(ValueVariants.Bool(true)),
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+        ))),
+    )
+
+    // A [Record]'s `vector` field is a JSON string keyed by named-vector field (Edge FFI:
+    // `vector_struct_internal_to_json` serializes the collection's `VectorStructInternal::Named` map
+    // straight to `{"clip": [...], "text": [...]}` — see io.qdrant.edge.EdgeShard.scroll's Rust impl),
+    // never a bare FloatArray, so this store must parse it itself for [FleetPoint.vector]. Only the
+    // `clip` field is ever wanted here (frame points never carry a `text` vector — see [storeMoment]).
+    // `synced` is stripped from the payload before it travels: it's LOCAL-only bookkeeping (Spec §6),
+    // never uploaded — [FleetPoint.payload]'s KDoc documents the caller doing exactly this.
+    private fun toFleetPoint(rec: Record): FleetPoint? {
+        val id = (rec.id as? PointId.Uuid)?.value
+        if (id == null) {
+            Log.w(TAG, "scrollUnsyncedFrames: skipping a point with no PointId.Uuid (unexpected — this store only writes UUID ids)")
+            return null
+        }
+        val vec = parseClipVector(rec.vector)
+        if (vec == null) {
+            Log.w(TAG, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$CLIP_FIELD' vector")
+            return null
+        }
+        return FleetPoint(id = id, vector = vec, payload = stripSynced(rec.payload))
+    }
+
+    private fun parseClipVector(vectorJson: String?): FloatArray? {
+        if (vectorJson == null) return null
+        return try {
+            val arr = JSONObject(vectorJson).optJSONArray(CLIP_FIELD) ?: return null
+            FloatArray(arr.length()) { i -> arr.getDouble(i).toFloat() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun stripSynced(payloadJson: String?): String {
+        val o = try { JSONObject(payloadJson ?: "{}") } catch (_: Throwable) { JSONObject() }
+        o.remove("synced")
+        return o.toString()
+    }
+
+    /**
+     * Flips `synced=true` for exactly [ids] via a payload MERGE patch (`UpdateOperation.setPayload`,
+     * NOT `overwritePayload` — every other key on each point's payload is left untouched), called only
+     * after [tech.qdrant.glasses.fleet.FleetSync] has a CONFIRMED upsert of those points to the fleet
+     * hub (Spec §5's crash-safe invariant). A no-op for an empty [ids] — mirrors
+     * [tech.qdrant.glasses.fleet.FleetQdrantClient.upsertPoints]'s same empty-batch guard, so an idle
+     * pass that found nothing to sync touches neither the network nor the shard.
+     */
+    override fun markSynced(ids: List<String>): Unit = synchronized(lock) {
+        if (ids.isEmpty()) return@synchronized
+        shard.update(UpdateOperation.setPayload(ids.map { PointId.Uuid(it) }, "{\"synced\":true}"))
+        shard.flush()
+        Log.i(TAG, "markSynced: flipped synced=true for ${ids.size} point(s)")
     }
 
     override fun deleteAll(): Unit = synchronized(lock) {

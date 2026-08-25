@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.storage
 
 import org.json.JSONObject
+import tech.qdrant.glasses.fleet.FleetPoint
 
 /**
  * The two [MomentPayload.type] wire values, shared so "frame"/"region" stop drifting as independent
@@ -56,6 +57,13 @@ data class MomentHit(
  *
  * Engine-independent — the [MomentStore] contract is expressed in terms of this and [MomentHit],
  * so every backend stores and returns the same payload shape (mirrors [VectorStore]/[ObjectPayload]).
+ *
+ * [synced] is the fleet-sync upstream flag (flag-on-store design, Spec §5/§6): defaults `false` on
+ * every freshly-captured point ([MomentCapture] is otherwise UNCHANGED by fleet sync) and is flipped
+ * `true` on the LOCAL store only, via [MomentStore.markSynced], after a CONFIRMED upsert to the fleet
+ * hub — never uploaded itself ("LOCAL-only bookkeeping", Spec §6). The durable local store IS the
+ * upload backlog: [MomentStore.scrollUnsyncedFrames] is how the idle-pass sync loop finds what still
+ * needs to go up.
  */
 data class MomentPayload(
     val type: String,
@@ -69,6 +77,7 @@ data class MomentPayload(
     val yoloConf: Float,
     val verifyCos: Float,
     val text: String,
+    val synced: Boolean = false,
 ) {
     fun toJson(): String = JSONObject()
         .put("type", type)
@@ -82,6 +91,7 @@ data class MomentPayload(
         .put("yolo_conf", yoloConf.toDouble())
         .put("verify_cos", verifyCos.toDouble())
         .put("text", text)
+        .put("synced", synced)
         .toString()
 
     companion object {
@@ -99,6 +109,7 @@ data class MomentPayload(
                 yoloConf = o.optDouble("yolo_conf", 0.0).toFloat(),
                 verifyCos = o.optDouble("verify_cos", 0.0).toFloat(),
                 text = o.optString("text"),
+                synced = o.optBoolean("synced", false),
             )
         }
     }
@@ -169,4 +180,24 @@ interface MomentStore : AutoCloseable {
 
     /** Clear the whole collection in-process (the demo wipe gesture — see `wipe-demo-memory.sh`). */
     fun deleteAll()
+
+    /**
+     * Up to [limit] `type=frame` points whose payload's [MomentPayload.synced] is not `true` — the
+     * upload backlog for the fleet-sync flag-on-store design (Spec §5): the durable local store IS
+     * the queue, and this scroll is how [tech.qdrant.glasses.fleet.FleetSync]'s idle-pass "up" loop
+     * finds what to upload next. Unlike every other read path on this interface, vectors ARE
+     * included — [tech.qdrant.glasses.fleet.FleetPoint.vector] needs them for the upsert. A point
+     * whose own [MomentPayload.synced] was never explicitly set (pre-fleet-sync capture) still
+     * matches — `!= true`, not `== false` — so old points get swept up too.
+     */
+    fun scrollUnsyncedFrames(limit: Int = 100): List<FleetPoint>
+
+    /**
+     * Flips [MomentPayload.synced] to `true` on the local store for exactly these point [ids], via a
+     * payload MERGE patch (existing keys untouched, same discipline as every other field this store
+     * doesn't own end-to-end) — call ONLY after a CONFIRMED upsert of those points to the fleet hub
+     * (Spec §5's crash-safe invariant: confirmed-implies-flag-flipped, never flipped first). A no-op
+     * for an empty [ids].
+     */
+    fun markSynced(ids: List<String>)
 }
