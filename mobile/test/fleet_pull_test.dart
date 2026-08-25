@@ -396,6 +396,56 @@ void main() {
       await edgeClient.close();
     },
   );
+
+  // Round-2 review fix #3 (codex HIGH, inert in Phase 1 but real once a
+  // Phase 2/3 refresh calls `pull()` on a timer/background trigger
+  // concurrently with a user-triggered one): `pull()` uses shared
+  // `fleet_snap`/`fleet_shard_staging`/`fleet_shard` paths with no
+  // serialization, so two concurrent calls can race and delete/rename out
+  // from under each other. A second call while one is already in flight
+  // must reuse it, not start a fresh race.
+  test(
+    'two concurrent pull() calls share one in-flight future, never race '
+    '(round-2 review fix #3)',
+    () async {
+      var postCount = 0;
+      final client = MockClient((request) async {
+        if (request.method == 'POST') {
+          postCount++;
+          // Give both calls a real chance to overlap before either settles.
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          return http.Response('{"result":{"name":"snap-concurrent.snapshot"}}', 200);
+        }
+        if (request.method == 'GET') return http.Response('gone', 404);
+        if (request.method == 'DELETE') return http.Response('', 200);
+        return http.Response('unexpected', 500);
+      });
+      final fleetHttp = FleetHttp(baseUrl: 'http://localhost:6333', client: client);
+      final edgeClient = EdgeClient();
+      final fleetPull = FleetPull(http: fleetHttp, edgeClient: edgeClient, workDir: workDir.path);
+
+      final future1 = fleetPull.pull();
+      final future2 = fleetPull.pull();
+
+      expect(
+        identical(future1, future2),
+        isTrue,
+        reason: 'the second concurrent call must reuse the in-flight pull, not start a new one',
+      );
+
+      final results = await Future.wait([future1, future2]);
+      expect(results[0], isA<PullUnreachable>());
+      expect(identical(results[0], results[1]), isTrue);
+      expect(postCount, 1, reason: 'a concurrent second call must not race a second createShardSnapshot');
+
+      // A later, SEPARATE call (after the first has fully settled) must run
+      // fresh, not keep reusing a stale completed future forever.
+      final future3 = fleetPull.pull();
+      expect(identical(future1, future3), isFalse);
+      await future3;
+      expect(postCount, 2);
+    },
+  );
 }
 
 /// Reloads normally EXCEPT it throws on the SECOND time [loadFromDir] is

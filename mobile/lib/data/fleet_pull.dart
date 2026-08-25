@@ -93,10 +93,35 @@ class FleetPull {
   final UnpackSnapshotFn _unpackSnapshot;
   final RenameDirFn _renameDir;
 
+  /// The currently-running [_pullOnce] call, if any (round-2 review fix #3,
+  /// codex HIGH). `pull()` uses shared `fleet_snap`/`fleet_shard_staging`/
+  /// `fleet_shard` paths under [workDir] with no locking of its own — two
+  /// overlapping calls (e.g. a user-triggered refresh racing a Phase 2/3
+  /// background one) would otherwise step on each other's staging/rename/
+  /// delete sequence. A second call while one is already in flight just
+  /// awaits the SAME [Future] instead of starting a fresh, racing one.
+  Future<PullResult>? _inFlight;
+
   /// Pulls [collection]'s shard [shard] down as a snapshot, stages +
   /// validates it, and — only on success — promotes it over the live
   /// corpus. See the class doc for the stage/validate/promote shape.
-  Future<PullResult> pull({String collection = 'fleet_curated', int shard = 0}) async {
+  ///
+  /// Safe to call concurrently: a call made while another is still running
+  /// reuses that SAME in-flight [Future] rather than racing it (fix #3).
+  Future<PullResult> pull({String collection = 'fleet_curated', int shard = 0}) {
+    final inFlight = _inFlight;
+    if (inFlight != null) return inFlight;
+    final future = _pullOnce(collection: collection, shard: shard);
+    _inFlight = future;
+    // _pullOnce's own try/catch/return contract means this Future always
+    // completes (with a PullResult), never with an error — whenComplete
+    // always runs, so `_inFlight` never gets stuck pointing at a settled
+    // Future.
+    unawaited(future.whenComplete(() => _inFlight = null));
+    return future;
+  }
+
+  Future<PullResult> _pullOnce({required String collection, required int shard}) async {
     final snapFile = File(p.join(workDir, 'fleet_snap.bin'));
     final liveDir = Directory(p.join(workDir, 'fleet_shard'));
     final stagingDir = Directory(p.join(workDir, 'fleet_shard_staging'));
