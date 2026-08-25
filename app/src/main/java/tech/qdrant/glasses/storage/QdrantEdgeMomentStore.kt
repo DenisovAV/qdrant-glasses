@@ -66,7 +66,10 @@ internal fun recordToFleetPoint(rec: Record, clipField: String, tag: String): Fl
     }
     val vec = parseClipVectorJson(rec.vector, clipField)
     if (vec == null) {
-        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$clipField' vector")
+        // Include a truncated raw string: the shape here is FFI-serialization-dependent (see
+        // parseClipVectorJson) and doc-rot-prone, so a future re-break is diagnosable from the log
+        // alone instead of costing another device round trip.
+        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$clipField' vector (raw=${rec.vector?.take(80)})")
         return null
     }
     val payload = stripSyncedPayload(rec.payload)
@@ -77,10 +80,35 @@ internal fun recordToFleetPoint(rec: Record, clipField: String, tag: String): Fl
     return FleetPoint(id = id, vector = vec, payload = payload)
 }
 
+/**
+ * Extracts the `clip` dense vector from a scrolled [Record]'s `vector` JSON string.
+ *
+ * **On-device shape (verified against the Rust FFI, NOT the old `{"clip":[...]}` guess):** the FFI's
+ * `vector_struct_internal_to_json` serializes a NAMED vector as `serde_json::to_string` of a
+ * `HashMap<String, VectorInternal>`, and `VectorInternal` derives a PLAIN `Serialize` (no
+ * `#[serde(untagged)]`, no `rename_all`) — so its `Dense` variant is EXTERNALLY TAGGED. A frame
+ * point (always written via `Vector.Named(mapOf("clip" to NamedVector.Dense(..)))`) therefore reads
+ * back as `{"clip":{"Dense":[..]}}`, where the value under `clip` is an OBJECT, not an array. The
+ * earlier bare-array assumption only ever holds for a `Single`/default-named vector (the Rust
+ * `From<NamedVectors>` collapse needs `DEFAULT_VECTOR_NAME`), which this store never writes — so it
+ * silently skipped every frame on-device (`optJSONArray` → null), and no moment ever synced upstream.
+ *
+ * Accepts BOTH shapes defensively: the tagged `{"Dense":[..]}` object (real), or a bare array
+ * (future-proofing / a `Single` vector), so a later Edge-serialization change can't re-break this
+ * the same silent way.
+ */
 private fun parseClipVectorJson(vectorJson: String?, clipField: String): FloatArray? {
     if (vectorJson == null) return null
     return try {
-        val arr = JSONObject(vectorJson).optJSONArray(clipField) ?: return null
+        val obj = JSONObject(vectorJson)
+        val arr = obj.optJSONArray(clipField)
+            ?: obj.optJSONObject(clipField)?.optJSONArray("Dense")
+            ?: return null
+        // A zero-length (dimensionless) vector must be SKIPPED, not turned into an empty FleetPoint:
+        // it can never be a real CLIP/SigLIP embed, and uploading it would fail the hub's dim check
+        // (throwing the whole batch) — the point stays synced=false and is retried, same fail-soft as
+        // the null-vector case. (review: caught as a would-be degraded upload.)
+        if (arr.length() == 0) return null
         FloatArray(arr.length()) { i -> arr.getDouble(i).toFloat() }
     } catch (_: Throwable) {
         null
@@ -411,11 +439,11 @@ class QdrantEdgeMomentStore(
     )
 
     // Record -> FleetPoint mapping ([recordToFleetPoint], file-scope above the class) parses the
-    // Edge FFI's JSON-string `vector`/`payload` fields itself: `vector` is keyed by named-vector
-    // field (`vector_struct_internal_to_json` serializes straight to `{"clip": [...], "text": [...]}`
-    // — see io.qdrant.edge.EdgeShard.scroll's Rust impl), never a bare FloatArray, and `synced` is
-    // stripped from `payload` before it travels — LOCAL-only bookkeeping (Spec §6), never uploaded
-    // ([FleetPoint.payload]'s KDoc documents the caller doing exactly this).
+    // Edge FFI's JSON-string `vector`/`payload` fields itself: `vector` comes back keyed by
+    // named-vector field with the value EXTERNALLY TAGGED — `{"clip":{"Dense":[...]}}`, NOT a bare
+    // array (see [parseClipVectorJson]'s KDoc for the FFI serde chain that produces this) — and
+    // `synced` is stripped from `payload` before it travels — LOCAL-only bookkeeping (Spec §6),
+    // never uploaded ([FleetPoint.payload]'s KDoc documents the caller doing exactly this).
 
     /**
      * Flips `synced=true` for exactly [ids] via a payload MERGE patch (`UpdateOperation.setPayload`,

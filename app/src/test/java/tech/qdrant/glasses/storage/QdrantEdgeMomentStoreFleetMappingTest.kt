@@ -28,7 +28,10 @@ import org.robolectric.RobolectricTestRunner
 class QdrantEdgeMomentStoreFleetMappingTest {
 
     private val id = "11111111-1111-1111-1111-111111111111"
-    private val vectorJson = """{"clip":[0.1,0.2,0.3]}"""
+    // The REAL on-device shape (Edge FFI serializes a Named vector's externally-tagged `VectorInternal`):
+    // `{"clip":{"Dense":[..]}}`, NOT the old `{"clip":[..]}` guess that silently skipped every frame
+    // on-device. See parseClipVectorJson's KDoc.
+    private val vectorJson = """{"clip":{"Dense":[0.1,0.2,0.3]}}"""
     private val validPayload = """{"type":"frame","moment_id":"$id","synced":false}"""
 
     private fun record(payload: String?, vector: String? = vectorJson, pointId: PointId? = PointId.Uuid(id)) =
@@ -66,6 +69,28 @@ class QdrantEdgeMomentStoreFleetMappingTest {
         assertEquals(3, result.vector.size)
     }
 
+    @Test fun taggedDenseVector_parsesCorrectValues() {
+        // The externally-tagged {"clip":{"Dense":[..]}} shape must yield the actual components — the
+        // on-device regression was a SILENT skip, so assert the numbers, not just the arity.
+        val result = recordToFleetPoint(record(payload = validPayload), clipField = "clip", tag = "test")
+        assertTrue(result != null)
+        assertEquals(0.1f, result!!.vector[0], 1e-6f)
+        assertEquals(0.2f, result.vector[1], 1e-6f)
+        assertEquals(0.3f, result.vector[2], 1e-6f)
+    }
+
+    @Test fun bareArrayVector_isAlsoAccepted() {
+        // Defensive fallback in parseClipVectorJson: a bare-array {"clip":[..]} (a Single/default-named
+        // vector, or a future Edge-serialization change) must still parse, not silently skip.
+        val result = recordToFleetPoint(
+            record(payload = validPayload, vector = """{"clip":[0.4,0.5,0.6]}"""),
+            clipField = "clip", tag = "test",
+        )
+        assertTrue(result != null)
+        assertEquals(3, result!!.vector.size)
+        assertEquals(0.4f, result.vector[0], 1e-6f)
+    }
+
     @Test fun stripSyncedPayload_removesOnlySyncedKey() {
         val stripped = stripSyncedPayload("""{"type":"frame","synced":true,"label":"cup"}""")
         assertTrue(stripped != null)
@@ -93,6 +118,27 @@ class QdrantEdgeMomentStoreFleetMappingTest {
     @Test fun unparseableVector_isSkipped() {
         val result = recordToFleetPoint(
             record(payload = validPayload, vector = "not json"),
+            clipField = "clip", tag = "test",
+        )
+        assertNull(result)
+    }
+
+    // A non-Dense tagged variant (Sparse/MultiDense) must fail SOFT (skip), never crash: the store
+    // only ever writes Dense clip vectors, but the parser is now the log-diagnosable "future re-break"
+    // seam, so lock in that an unexpected shape degrades to a skip.
+    @Test fun taggedSparseVector_isSkipped_notCrashed() {
+        val result = recordToFleetPoint(
+            record(payload = validPayload, vector = """{"clip":{"Sparse":{"indices":[0],"values":[0.5]}}}"""),
+            clipField = "clip", tag = "test",
+        )
+        assertNull(result)
+    }
+
+    // {"clip":{"Dense":[]}} — a zero-length/dimensionless vector must SKIP, not become an empty
+    // FleetPoint that would fail the hub's dim check and get stuck retrying (review fix).
+    @Test fun emptyDenseVector_isSkipped() {
+        val result = recordToFleetPoint(
+            record(payload = validPayload, vector = """{"clip":{"Dense":[]}}"""),
             clipField = "clip", tag = "test",
         )
         assertNull(result)
