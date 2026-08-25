@@ -251,8 +251,12 @@ class GlassesComponents(
                         val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
                             tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
                             app.filesDir, cropEncoder.dim,
+                            momentStore = ms, isRecording = isRecording,
                         )
                         fleetStore = fleetSync.pull()
+                        // The UP half (syncOnce/syncLoop) is constructed here but not yet started —
+                        // wiring its background loop onto a lane + this GlassesComponents' lifecycle
+                        // is a follow-up task, not part of this pull-only wiring.
                         Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
                     }
                 }
