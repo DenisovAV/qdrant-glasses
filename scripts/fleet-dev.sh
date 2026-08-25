@@ -118,36 +118,56 @@ PYEOF
 import sys
 from qdrant_client import QdrantClient
 c = QdrantClient(url=sys.argv[1]); pid = sys.argv[2]
+# Inbox ids are UUID strings (device UP path) or ints (seed-shard). Coerce all-digit args to int so a
+# numeric id targets the right point instead of a never-matching string.
+pid = int(pid) if pid.isdigit() else pid
+# Qdrant's set_payload with an explicit `points` selector does NOT error on a missing id — it returns
+# status=completed having touched nothing. For a harness whose whole job is proving "invisible until
+# approved", a silent no-op that still prints "approved" is the exact false-success this must avoid.
+# So: verify the point exists BEFORE, and confirm the flag actually landed AFTER — fail loudly otherwise.
+if not c.retrieve("fleet_inbox", ids=[pid]):
+    sys.exit(f"approve FAILED: no point {pid!r} in fleet_inbox — nothing approved")
 c.set_payload("fleet_inbox", payload={"curated": True}, points=[pid], wait=True)
+back = c.retrieve("fleet_inbox", ids=[pid], with_payload=True)
+if not back or back[0].payload.get("curated") is not True:
+    sys.exit(f"approve FAILED: curated flag did not take on {pid!r}")
 print(f"approved (curated=true): {pid}")
 PYEOF
     ;;
   curate)
     # Pillar 3 (Spec §8): copy the APPROVED subset (curated=true) from fleet_inbox into fleet_curated,
-    # preserving id/vector/payload so a re-run is idempotent (upsert by id). Devices snapshot-pull ONLY
+    # preserving id/vectors/payload so a re-run is idempotent (upsert by id). Devices snapshot-pull ONLY
     # fleet_curated, so a contribution stays invisible to the fleet until it is approved here — then it
     # propagates on the next pull. curated=true points are the only knowledge that ever reaches a device.
+    # Safe to re-run: upsert-by-id overwrites, so a partial run (e.g. an error mid-pagination, which
+    # `set -e` surfaces loudly) is recovered simply by running `curate` again.
     PY=$(venv_py)
     "$PY" - "$URL" <<'PYEOF'
 import sys
 from qdrant_client import QdrantClient, models
 c = QdrantClient(url=sys.argv[1])
 flt = models.Filter(must=[models.FieldCondition(key="curated", match=models.MatchValue(value=True))])
-moved, offset = 0, None
+moved, skipped, offset = 0, 0, None
 while True:
     recs, offset = c.scroll("fleet_inbox", scroll_filter=flt, with_payload=True, with_vectors=True,
                             limit=256, offset=offset)
     pts = []
     for r in recs:
-        vec = r.vector or {}
-        clip = vec.get("clip") if hasattr(vec, "get") else None
-        if clip is None:
-            continue  # frames carry a clip vector; skip anything without one (never upload a dimless point)
-        pts.append(models.PointStruct(id=r.id, vector={"clip": list(clip)}, payload=dict(r.payload or {})))
+        vecmap = r.vector or {}
+        # Preserve EVERY named vector the point carries (clip today; text too once OCR/speech fills it),
+        # not just clip — the point travels whole.
+        vecs = {k: list(v) for k, v in vecmap.items()} if hasattr(vecmap, "items") else {}
+        if "clip" not in vecs:
+            skipped += 1   # an approved point with no clip vector can't be a searchable frame — surface it, never drop silently
+            continue
+        pts.append(models.PointStruct(id=r.id, vector=vecs, payload=dict(r.payload or {})))
     if pts:
         c.upsert("fleet_curated", points=pts, wait=True); moved += len(pts)
     if offset is None:
         break
+if skipped:
+    # A curator approved these but they can't be curated — loud, so lost approvals are never invisible.
+    print(f"WARNING: skipped {skipped} approved point(s) with no clip vector — NOT curated (approval lost)", file=sys.stderr)
 print(f"curated {moved} approved point(s) into fleet_curated; total={c.count('fleet_curated').count}")
 PYEOF
     ;;
