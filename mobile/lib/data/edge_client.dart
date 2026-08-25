@@ -354,7 +354,17 @@ class EdgeClient {
         ),
       );
     }
-    if (label != null) {
+    // An empty label means "unfiltered", not "match the empty string"
+    // (round-2 review fix #5, codex MEDIUM) — no point in the corpus has
+    // `label: ''`, so sending it down as a server-side match condition
+    // would (wrongly) return zero frames instead of every frame; only a
+    // genuinely non-empty label narrows the result.
+    //
+    // Phase 3: normalize case here (this match is exact/case-sensitive) —
+    // inert in Phase 1, since the UI never sets a label yet
+    // ([MemoryRepository.search]'s own client-side re-filter documents the
+    // same deferral on its side).
+    if (label != null && label.isNotEmpty) {
       must.add(
         qe.FieldConditionVariant(
           qe.FieldCondition(

@@ -98,6 +98,22 @@ void main() {
       },
     );
 
+    // Round-2 review fix #5 (codex MEDIUM): an empty label means
+    // "unfiltered", not "match the empty string" — no seeded point has
+    // `label: ''`, so a server-side condition matching it literally would
+    // (wrongly) return zero frames instead of every frame.
+    test(
+      'an empty label is treated as unfiltered, not "match empty string"',
+      () async {
+        final client = EdgeClient();
+        await client.loadFromDir(shardDir);
+
+        final hits = await client.timeline(label: '');
+
+        expect(hits, hasLength(3), reason: 'an empty label must not filter anything out');
+      },
+    );
+
     // Round-2 review fix #2 (codex HIGH): [loadFromDir] (re)creates a
     // `timestamp_ms` range index every time so `timeline()` can `orderBy`
     // server-side, but if that index-creation attempt itself ever fails
@@ -191,6 +207,17 @@ void main() {
       final hits = await client.searchFrames(clip: _unitVector(_clipDim));
 
       expect(hits, hasLength(3));
+    });
+
+    // Round-2 review fix #5 (codex MEDIUM): same guard as timeline()'s —
+    // an empty label must not be sent down as a server-side match condition.
+    test('an empty label is treated as unfiltered, not "match empty string"', () async {
+      final client = EdgeClient();
+      await client.loadFromDir(shardDir);
+
+      final hits = await client.searchFrames(clip: _unitVector(_clipDim), label: '');
+
+      expect(hits, hasLength(3), reason: 'an empty label must not filter anything out');
     });
 
     test('no shard loaded → empty, never throws', () async {
