@@ -37,6 +37,74 @@ import java.io.File
 import java.util.UUID
 
 /**
+ * Pure `Record` -> [FleetPoint] mapping behind [QdrantEdgeMomentStore.scrollUnsyncedFrames] (Spec
+ * §5/§6) — factored to file scope, not a private class member, so it's unit-testable (see
+ * `QdrantEdgeMomentStoreFleetMappingTest`) without a live native `EdgeShard`: every step here is
+ * plain JSON/string parsing over [Record]'s own already-pure-Kotlin fields, no native call involved.
+ * `internal`, not `private`: visible to the test above, not part of this module's public API.
+ *
+ * Three independent reasons a [rec] is skipped (returns null) rather than turned into a degraded
+ * [FleetPoint] — every one of them, patched over with a placeholder instead, would let a
+ * "successful" upsert flip the point's local `synced` flag despite its real data never reaching the
+ * fleet hub (Spec §5/§6's crash-safe invariant is confirmed-implies-UPLOADED, not
+ * confirmed-implies-something-uploaded — [FleetQdrantClient.upsertPoints] enforces the exact same
+ * thing on the send side; this is its read-side mirror):
+ *  1. no [PointId.Uuid] id (this store only ever writes UUID ids on frame points — defensive, not
+ *     expected in practice).
+ *  2. no parseable `clip` vector (ditto).
+ *  3. **null or unparseable payload** (review fix: [stripSyncedPayload] used to coerce a null or
+ *     malformed payload into `"{}"` — syntactically valid JSON, so the send-side guard in
+ *     [FleetQdrantClient.upsertPoints] couldn't catch it; it just isn't the point's real
+ *     [MomentPayload]). Skipping here instead means the point stays `synced=false` and is retried
+ *     next idle pass — no data loss, just a delay, exactly like case 1 and 2 already behaved.
+ */
+internal fun recordToFleetPoint(rec: Record, clipField: String, tag: String): FleetPoint? {
+    val id = (rec.id as? PointId.Uuid)?.value
+    if (id == null) {
+        Log.w(tag, "scrollUnsyncedFrames: skipping a point with no PointId.Uuid (unexpected — this store only writes UUID ids)")
+        return null
+    }
+    val vec = parseClipVectorJson(rec.vector, clipField)
+    if (vec == null) {
+        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$clipField' vector")
+        return null
+    }
+    val payload = stripSyncedPayload(rec.payload)
+    if (payload == null) {
+        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, null/unparseable payload (staying synced=false for retry)")
+        return null
+    }
+    return FleetPoint(id = id, vector = vec, payload = payload)
+}
+
+private fun parseClipVectorJson(vectorJson: String?, clipField: String): FloatArray? {
+    if (vectorJson == null) return null
+    return try {
+        val arr = JSONObject(vectorJson).optJSONArray(clipField) ?: return null
+        FloatArray(arr.length()) { i -> arr.getDouble(i).toFloat() }
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+/**
+ * Strips the LOCAL-only `synced` bookkeeping key (Spec §6) out of a stored payload before it travels
+ * to the fleet hub. Returns null — NEVER a placeholder — when [payloadJson] is null or fails to
+ * parse, so [recordToFleetPoint] can skip the record instead of silently upserting a degraded/empty
+ * payload as though it were the point's real data (review fix, see [recordToFleetPoint]'s KDoc case 3).
+ */
+internal fun stripSyncedPayload(payloadJson: String?): String? {
+    if (payloadJson == null) return null
+    val o = try {
+        JSONObject(payloadJson)
+    } catch (_: Throwable) {
+        return null
+    }
+    o.remove("synced")
+    return o.toString()
+}
+
+/**
  * Moment memory: one Qdrant Edge collection holding two point channels distinguished by
  * [MomentPayload.type] — whole-frame keyframes ("frame") and the CLIP-verified YOLO regions within
  * them ("region") (plan Task 1.3, Spec §6). First (and so far only) [MomentStore] implementation,
@@ -311,10 +379,10 @@ class QdrantEdgeMomentStore(
      * [MomentStore.scrollUnsyncedFrames] promises). Unlike every other read here, vectors ARE
      * requested (`withVector = WithVector.Bool(true)`) — the upload needs them.
      *
-     * A record whose id isn't a [PointId.Uuid] or whose `clip` vector doesn't parse out of the
-     * returned vector JSON is skipped (logged, not thrown) rather than failing the whole batch — this
-     * store only ever WRITES `PointId.Uuid` ids with a `clip` vector on a frame point (see
-     * [storeMoment]), so neither should happen in practice; the guard is defensive, not expected.
+     * Per-record mapping is [recordToFleetPoint] (file-scope, unit-tested independently) — see its
+     * KDoc for the three skip cases (missing UUID id / unparseable vector / null-or-malformed
+     * payload). A skipped record is simply left out of this batch: nothing calls [markSynced] for an
+     * id that was never returned, so it stays `synced=false` and is retried next idle pass.
      */
     override fun scrollUnsyncedFrames(limit: Int): List<FleetPoint> = synchronized(lock) {
         val resp = shard.scroll(ScrollRequest(
@@ -323,7 +391,7 @@ class QdrantEdgeMomentStore(
             withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(true),
             orderBy = null,
         ))
-        resp.records.mapNotNull { toFleetPoint(it) }
+        resp.records.mapNotNull { recordToFleetPoint(it, CLIP_FIELD, TAG) }
             .also { Log.i(TAG, "scrollUnsyncedFrames: limit=$limit returned=${it.size}") }
     }
 
@@ -342,42 +410,12 @@ class QdrantEdgeMomentStore(
         ))),
     )
 
-    // A [Record]'s `vector` field is a JSON string keyed by named-vector field (Edge FFI:
-    // `vector_struct_internal_to_json` serializes the collection's `VectorStructInternal::Named` map
-    // straight to `{"clip": [...], "text": [...]}` — see io.qdrant.edge.EdgeShard.scroll's Rust impl),
-    // never a bare FloatArray, so this store must parse it itself for [FleetPoint.vector]. Only the
-    // `clip` field is ever wanted here (frame points never carry a `text` vector — see [storeMoment]).
-    // `synced` is stripped from the payload before it travels: it's LOCAL-only bookkeeping (Spec §6),
-    // never uploaded — [FleetPoint.payload]'s KDoc documents the caller doing exactly this.
-    private fun toFleetPoint(rec: Record): FleetPoint? {
-        val id = (rec.id as? PointId.Uuid)?.value
-        if (id == null) {
-            Log.w(TAG, "scrollUnsyncedFrames: skipping a point with no PointId.Uuid (unexpected — this store only writes UUID ids)")
-            return null
-        }
-        val vec = parseClipVector(rec.vector)
-        if (vec == null) {
-            Log.w(TAG, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$CLIP_FIELD' vector")
-            return null
-        }
-        return FleetPoint(id = id, vector = vec, payload = stripSynced(rec.payload))
-    }
-
-    private fun parseClipVector(vectorJson: String?): FloatArray? {
-        if (vectorJson == null) return null
-        return try {
-            val arr = JSONObject(vectorJson).optJSONArray(CLIP_FIELD) ?: return null
-            FloatArray(arr.length()) { i -> arr.getDouble(i).toFloat() }
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun stripSynced(payloadJson: String?): String {
-        val o = try { JSONObject(payloadJson ?: "{}") } catch (_: Throwable) { JSONObject() }
-        o.remove("synced")
-        return o.toString()
-    }
+    // Record -> FleetPoint mapping ([recordToFleetPoint], file-scope above the class) parses the
+    // Edge FFI's JSON-string `vector`/`payload` fields itself: `vector` is keyed by named-vector
+    // field (`vector_struct_internal_to_json` serializes straight to `{"clip": [...], "text": [...]}`
+    // — see io.qdrant.edge.EdgeShard.scroll's Rust impl), never a bare FloatArray, and `synced` is
+    // stripped from `payload` before it travels — LOCAL-only bookkeeping (Spec §6), never uploaded
+    // ([FleetPoint.payload]'s KDoc documents the caller doing exactly this).
 
     /**
      * Flips `synced=true` for exactly [ids] via a payload MERGE patch (`UpdateOperation.setPayload`,
