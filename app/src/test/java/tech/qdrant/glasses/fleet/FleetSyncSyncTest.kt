@@ -142,6 +142,29 @@ class FleetSyncSyncTest {
         srv.shutdown()
     }
 
+    // Review fix: the idle-gate must be re-checked immediately before the upsert/flag write too, not
+    // only once at entry — recording can start in the gap between the entry check and the scroll
+    // (Spec §3/§5). Model that gap with a call-counting isRecording: false on the entry check, true
+    // on the re-check right before the upload — the pass must bail with NO request and NO flag flip,
+    // exactly like the "already recording at entry" case above.
+    @Test fun recordingStartingAfterEntryCheckStillBlocksTheUploadAndFlagFlip() {
+        val srv = MockWebServer(); srv.start()
+        val store = FakeMomentStore(backlog = listOf(point("11111111-1111-1111-1111-111111111111")))
+        var calls = 0
+        val recordingStartsMidPass = { (++calls) > 1 }   // false, then true on every call after
+        val sync = FleetSync(
+            client(srv), filesDir = File("."), clipDim = 8, momentStore = store,
+            isRecording = recordingStartsMidPass,
+        )
+
+        val n = runBlocking { sync.syncOnce() }
+
+        assertEquals(0, n)
+        assertEquals(0, srv.requestCount)
+        assertTrue(store.markSyncedCalls.isEmpty())
+        srv.shutdown()
+    }
+
     @Test fun collectionOverrideIsRespected() {
         val srv = MockWebServer()
         srv.enqueue(MockResponse().setBody("""{"result":{"operation_id":1,"status":"completed"},"status":"ok"}"""))

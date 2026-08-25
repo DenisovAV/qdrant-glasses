@@ -94,6 +94,15 @@ class FleetSync(
      * same "idle + online only" invariant [syncLoop] enforces, not one that only holds when entered
      * through the loop.
      *
+     * The entry check alone isn't enough: [momentStore.scrollUnsyncedFrames] and — far more so —
+     * [client.upsertPoints]'s network round trip take real wall-clock time, during which recording
+     * can start on another thread (this runs on its own dedicated lane, `isRecording` reads shared
+     * state written elsewhere). So [isRecording] is re-checked immediately before the upsert/flag
+     * write, right after the batch is known non-empty: a recording session that starts in that gap
+     * makes this pass a no-op (`0`, no request sent, no flag flipped) instead of uploading — or
+     * flagging as uploaded — while capture is active (Spec §3/§5). The batch simply stays
+     * `synced=false` and is retried on the very next idle pass.
+     *
      * Crash-safe by construction (Spec §5): a crash between the upsert and the flag-flip leaves the
      * batch `synced=false`, so the NEXT [syncOnce] just re-uploads it — safely, because upsert-by-id
      * is idempotent (overwrite, never duplicate). Fail-soft (Spec §7): any `Throwable` from the
@@ -101,8 +110,8 @@ class FleetSync(
      * [MomentStore.markSynced] is only ever reached on the success path, so a failed pass leaves
      * every point in the batch `synced=false` for retry — never partially/incorrectly flagged.
      *
-     * @return the number of points actually synced this pass (`0` while recording, on an empty
-     *   backlog, OR on a failure).
+     * @return the number of points actually synced this pass (`0` while recording — at entry OR
+     *   just before the upload, on an empty backlog, OR on a failure).
      */
     suspend fun syncOnce(collection: String = UP_COLLECTION): Int = try {
         if (isRecording()) {
@@ -110,6 +119,11 @@ class FleetSync(
         } else {
             val batch = momentStore.scrollUnsyncedFrames(UP_BATCH_SIZE)
             if (batch.isEmpty()) {
+                0
+            } else if (isRecording()) {
+                // Recording started while we were scrolling the local store — bail before the
+                // upload/flag write ever happen (see the re-check note above). Nothing was sent,
+                // nothing was flagged; the batch is picked up again next idle pass.
                 0
             } else {
                 client.upsertPoints(collection, batch)
