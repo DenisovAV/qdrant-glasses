@@ -2,6 +2,7 @@ package tech.qdrant.glasses.fleet
 
 import android.util.Log
 import io.qdrant.edge.Condition
+import io.qdrant.edge.CountRequest
 import io.qdrant.edge.Distance
 import io.qdrant.edge.EdgeConfig
 import io.qdrant.edge.EdgeShard
@@ -74,8 +75,18 @@ class FleetShardStore(private val shard: EdgeShard, private val clipDim: Int) : 
         )
 
         /** Opens an already-unpacked snapshot dir (see [io.qdrant.edge.unpackSnapshotAsync]) read-only. */
-        fun load(dir: String, clipDim: Int): FleetShardStore =
-            FleetShardStore(EdgeShard.load(dir, config(clipDim)), clipDim)
+        fun load(dir: String, clipDim: Int): FleetShardStore {
+            val shard = EdgeShard.load(dir, config(clipDim))
+            // Log the pulled corpus size — makes the P3 "curated trust" loop observable: after a
+            // contribution is approved+curated server-side, the NEXT pull's count grows by that point
+            // (invisible until approved, then propagates on pull). Uses exact=true DELIBERATELY (the
+            // sibling open-time logs use the cheap exact=false estimate) because this demo's proof is
+            // single-point precision — count 0->1->2 must be exact right after a write. Best-effort: a
+            // count failure never blocks load.
+            val n = runCatching { shard.count(CountRequest(filter = null, exact = true)).toLong() }.getOrDefault(-1L)
+            Log.i(TAG, "fleet shard loaded from $dir, count=$n")
+            return FleetShardStore(shard, clipDim)
+        }
 
         /**
          * TEST ONLY (androidTest, [FleetShardStoreTest]): builds a brand-new tiny shard at [dir] and
