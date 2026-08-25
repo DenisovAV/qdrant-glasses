@@ -80,12 +80,19 @@ class FleetSync(
     }
 
     /**
-     * One upstream pass (Spec §5 "up"): scrolls the LOCAL store for up to [UP_BATCH_SIZE] points
-     * whose `synced` flag is not yet `true` ([MomentStore.scrollUnsyncedFrames] — the durable local
-     * store IS the backlog, no separate queue), and — only if that batch is non-empty — upserts it
-     * to [collection] and, ONLY AFTER that upsert returns successfully, flips every point's local
-     * `synced` flag via [MomentStore.markSynced]. An empty backlog sends no request at all (mirrors
-     * [FleetQdrantClient.upsertPoints]'s own empty-batch no-op).
+     * One upstream pass (Spec §5 "up"): ONLY when the app is idle (`!isRecording()` — Spec §3's
+     * "ONLY when the app is idle … and the hub is reachable"; reachability is this function's own
+     * fail-soft concern below), scrolls the LOCAL store for up to [UP_BATCH_SIZE] points whose
+     * `synced` flag is not yet `true` ([MomentStore.scrollUnsyncedFrames] — the durable local store
+     * IS the backlog, no separate queue), and — only if that batch is non-empty — upserts it to
+     * [collection] and, ONLY AFTER that upsert returns successfully, flips every point's local
+     * `synced` flag via [MomentStore.markSynced]. An empty backlog, or a recording session, sends no
+     * request at all (mirrors [FleetQdrantClient.upsertPoints]'s own empty-batch no-op).
+     *
+     * The idle check lives HERE, not just in [syncLoop]'s caller-side gate, because [syncOnce] is a
+     * public entry point: any caller reaching it directly (test, future call site, …) must get the
+     * same "idle + online only" invariant [syncLoop] enforces, not one that only holds when entered
+     * through the loop.
      *
      * Crash-safe by construction (Spec §5): a crash between the upsert and the flag-flip leaves the
      * batch `synced=false`, so the NEXT [syncOnce] just re-uploads it — safely, because upsert-by-id
@@ -94,18 +101,23 @@ class FleetSync(
      * [MomentStore.markSynced] is only ever reached on the success path, so a failed pass leaves
      * every point in the batch `synced=false` for retry — never partially/incorrectly flagged.
      *
-     * @return the number of points actually synced this pass (`0` on an empty backlog OR a failure).
+     * @return the number of points actually synced this pass (`0` while recording, on an empty
+     *   backlog, OR on a failure).
      */
     suspend fun syncOnce(collection: String = UP_COLLECTION): Int = try {
-        val batch = momentStore.scrollUnsyncedFrames(UP_BATCH_SIZE)
-        if (batch.isEmpty()) {
+        if (isRecording()) {
             0
         } else {
-            client.upsertPoints(collection, batch)
-            val ids = batch.map { it.id }
-            momentStore.markSynced(ids)
-            Log.i(TAG, "syncOnce: synced ${ids.size} point(s) to $collection")
-            ids.size
+            val batch = momentStore.scrollUnsyncedFrames(UP_BATCH_SIZE)
+            if (batch.isEmpty()) {
+                0
+            } else {
+                client.upsertPoints(collection, batch)
+                val ids = batch.map { it.id }
+                momentStore.markSynced(ids)
+                Log.i(TAG, "syncOnce: synced ${ids.size} point(s) to $collection")
+                ids.size
+            }
         }
     } catch (e: CancellationException) {
         throw e   // structured concurrency: propagate, don't swallow as a sync failure (see pull()).
@@ -116,11 +128,10 @@ class FleetSync(
 
     /**
      * The background upstream loop (Spec §3/§5 "up"): while this coroutine is active, runs
-     * [syncOnce] ONLY when the app is idle (`!isRecording()` — Spec §3's "ONLY when the app is idle
-     * … and the hub is reachable"; reachability is [syncOnce]'s own fail-soft concern, not this
-     * loop's), then sleeps [SYNC_INTERVAL_MS] before the next pass. A recording session simply
-     * skips a pass rather than pausing the loop outright — the very next check after the delay
-     * picks sync back up the moment recording stops, no separate resume signal needed.
+     * [syncOnce] every [SYNC_INTERVAL_MS] — [syncOnce] itself is what enforces "idle only" (see its
+     * doc), so a recording session simply gets a `0`-result no-op pass rather than the loop pausing
+     * outright; the very next pass after recording stops finds real work again, no separate resume
+     * signal needed.
      *
      * Never returns normally — exits only via cancellation of the coroutine that calls it (the
      * caller is expected to `scope.launch(fleetLane) { fleetSync.syncLoop() }`, same shape as
@@ -131,7 +142,7 @@ class FleetSync(
     suspend fun syncLoop() {
         while (true) {
             coroutineContext.ensureActive()
-            if (!isRecording()) syncOnce()
+            syncOnce()
             delay(SYNC_INTERVAL_MS)
         }
     }

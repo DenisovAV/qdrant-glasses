@@ -126,6 +126,22 @@ class FleetSyncSyncTest {
         srv.shutdown()
     }
 
+    // Idle-gate must be enforced INSIDE syncOnce itself (Spec §3/§5 "idle + online only"), not just
+    // by syncLoop's caller-side check — otherwise any direct caller of the public syncOnce() could
+    // sync mid-recording. isRecording = { true } here, unlike every other test in this file.
+    @Test fun recordingBlocksSyncEvenWithNonEmptyBacklog() {
+        val srv = MockWebServer(); srv.start()
+        val store = FakeMomentStore(backlog = listOf(point("11111111-1111-1111-1111-111111111111")))
+        val sync = FleetSync(client(srv), filesDir = File("."), clipDim = 8, momentStore = store, isRecording = { true })
+
+        val n = runBlocking { sync.syncOnce() }
+
+        assertEquals(0, n)
+        assertEquals(0, srv.requestCount)
+        assertTrue(store.markSyncedCalls.isEmpty())
+        srv.shutdown()
+    }
+
     @Test fun collectionOverrideIsRespected() {
         val srv = MockWebServer()
         srv.enqueue(MockResponse().setBody("""{"result":{"operation_id":1,"status":"completed"},"status":"ok"}"""))
