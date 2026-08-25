@@ -113,6 +113,22 @@ class FleetSyncSyncTest {
         srv.shutdown()
     }
 
+    // Codex coverage gap: the failure path must include a 2xx whose Qdrant body is NOT {"status":"ok"}
+    // (a proxy/captive-portal 200 that never reached the hub), not just HTTP 500. syncOnce must return
+    // 0 and NEVER markSynced — otherwise frames get flagged synced without confirmed remote storage.
+    @Test fun nonOk2xxUpsertNeverMarksSyncedAndReturnsZero() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setResponseCode(200).setBody("""{"status":"error"}"""))
+        srv.start()
+        val store = FakeMomentStore(backlog = listOf(point("11111111-1111-1111-1111-111111111111")))
+
+        val n = runBlocking { sync(srv, store).syncOnce() }
+
+        assertEquals(0, n)
+        assertTrue(store.markSyncedCalls.isEmpty())
+        srv.shutdown()
+    }
+
     @Test fun unreachableServerNeverMarksSyncedAndReturnsZero() {
         val srv = MockWebServer(); srv.start()
         val store = FakeMomentStore(backlog = listOf(point("11111111-1111-1111-1111-111111111111")))

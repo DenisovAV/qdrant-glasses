@@ -175,6 +175,22 @@ class QdrantEdgeMomentStore(
         // native scroll() round trips low at demo scale (low hundreds of frames) while capping how
         // much payload JSON is materialized per call.
         private const val SCROLL_PAGE_SIZE = 256UL
+        // scrollUnsyncedFrames bounds how many records it will page through past a "poison window"
+        // (unmappable records) before giving up this pass — keeps the store lock held for a bounded
+        // time even in the pathological all-poison case. Far above demo scale (low hundreds of frames),
+        // so the normal path (first page is all mappable) never approaches it.
+        //
+        // KNOWN LIMIT (deliberate PoC tradeoff, spec §1 "no production hardening"): a run of MORE than
+        // this many CONSECUTIVE unmappable records at the head of the scroll would stall healthy frames
+        // behind it — each pass restarts at offset=null and re-scans the same prefix. This is a genuine
+        // bound-vs-completeness tension: a hard lock-hold bound and unbounded poison traversal can't
+        // both hold in one lock-held call without persistent cursor state (which then delays
+        // newly-captured frames sorting before the cursor). Accepted because the trigger — >1000
+        // corrupted frames — is NOT producible by the validated store path (storeMoment requires a
+        // clipDim vector + writes valid JSON), and IF it ever happened the poison-only branch logs at
+        // ERROR every pass (loud, not silent). The product-path fix is to quarantine a poison record
+        // with a dedicated payload flag added to unsyncedFrameFilter's mustNot, so it stops matching.
+        private const val UNSYNCED_MAX_SCAN = 1000
     }
 
     // The `clip` named-vector's dim, promoted from the constructor param to a property so every
@@ -411,16 +427,46 @@ class QdrantEdgeMomentStore(
      * KDoc for the three skip cases (missing UUID id / unparseable vector / null-or-malformed
      * payload). A skipped record is simply left out of this batch: nothing calls [markSynced] for an
      * id that was never returned, so it stays `synced=false` and is retried next idle pass.
+     *
+     * **Pages PAST a poison window (review fix).** A single scroll from `offset=null` re-fetches the
+     * SAME leading page every pass; if the first [limit] unsynced frames all fail to map (corruption —
+     * the validated store can't create one, but the defensive skips exist because it *can* happen), the
+     * mapped batch is empty forever and healthy frames BEHIND them never sync — a silent head-of-line
+     * stall. So this advances the scroll cursor ([io.qdrant.edge.ScrollResponse.nextOffset]) past
+     * skipped records until it has [limit] mappable points, the scroll is exhausted, or
+     * [UNSYNCED_MAX_SCAN] records have been examined (bounds lock-hold time even if the whole unsynced
+     * set is poison). A poison-only window (records returned, none mappable) is logged at ERROR —
+     * distinct and loud, so a stuck backlog is observable instead of masquerading as "all caught up".
+     *
+     * Returns an empty list when [closed] (a teardown can free the native shard while this runs on the
+     * fleet lane — see [markSynced]); the fleet lane just treats it as "nothing to sync this pass".
      */
     override fun scrollUnsyncedFrames(limit: Int): List<FleetPoint> = synchronized(lock) {
-        val resp = shard.scroll(ScrollRequest(
-            offset = null, limit = limit.toULong(),
-            filter = unsyncedFrameFilter(),
-            withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(true),
-            orderBy = null,
-        ))
-        resp.records.mapNotNull { recordToFleetPoint(it, CLIP_FIELD, TAG) }
-            .also { Log.i(TAG, "scrollUnsyncedFrames: limit=$limit returned=${it.size}") }
+        if (closed) return@synchronized emptyList()
+        val out = ArrayList<FleetPoint>(limit)
+        var offset: PointId? = null
+        var examined = 0
+        var skipped = 0
+        while (out.size < limit && examined < UNSYNCED_MAX_SCAN) {
+            val resp = shard.scroll(ScrollRequest(
+                offset = offset, limit = (limit - out.size).toULong(),
+                filter = unsyncedFrameFilter(),
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(true),
+                orderBy = null,
+            ))
+            if (resp.records.isEmpty()) break
+            for (rec in resp.records) {
+                examined++
+                recordToFleetPoint(rec, CLIP_FIELD, TAG)?.let { out.add(it) } ?: skipped++
+            }
+            offset = resp.nextOffset ?: break   // null cursor => scroll exhausted
+        }
+        if (skipped > 0 && out.isEmpty()) {
+            Log.e(TAG, "scrollUnsyncedFrames: examined $examined record(s), ALL skipped as unmappable " +
+                "(poison window) — upstream STALLED with no valid frame to sync")
+        }
+        Log.i(TAG, "scrollUnsyncedFrames: limit=$limit examined=$examined skipped=$skipped returned=${out.size}")
+        out
     }
 
     // `type == frame` AND NOT (`synced == true`) — Filter.must/mustNot both AND into the overall
@@ -454,6 +500,12 @@ class QdrantEdgeMomentStore(
      * pass that found nothing to sync touches neither the network nor the shard.
      */
     override fun markSynced(ids: List<String>): Unit = synchronized(lock) {
+        // A native call on a closed shard is a SIGSEGV, not a catchable exception (see the `closed`
+        // guard in deleteAll and QdrantEdgeStore's reasoning). This runs on the fleet lane AFTER a
+        // blocking upsert that can outlive the ViewModel teardown's short drain window, so `close()`
+        // may have freed the shard by the time we get here — guard exactly as deleteAll does. A skipped
+        // flag flip at shutdown just means a benign re-upload next session (idempotent by point id).
+        if (closed) return@synchronized
         if (ids.isEmpty()) return@synchronized
         shard.update(UpdateOperation.setPayload(ids.map { PointId.Uuid(it) }, "{\"synced\":true}"))
         shard.flush()

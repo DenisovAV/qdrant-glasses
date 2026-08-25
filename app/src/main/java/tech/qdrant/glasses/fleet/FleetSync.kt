@@ -65,7 +65,7 @@ class FleetSync(
             // cancelled (app closing) — propagate it, don't swallow it as a fleet-pull failure. The
             // fail-soft contract below is for real errors only; `finally` still runs on this path.
             if (e is kotlinx.coroutines.CancellationException) throw e
-            Log.w(TAG, "fleet pull failed (non-fatal): ${e.message}")
+            Log.w(TAG, "fleet pull failed (non-fatal)", e)
             null
         } finally {
             snap.delete()
@@ -103,6 +103,13 @@ class FleetSync(
      * flagging as uploaded — while capture is active (Spec §3/§5). The batch simply stays
      * `synced=false` and is retried on the very next idle pass.
      *
+     * This re-check NARROWS but does not fully close the window: a recording that starts DURING the
+     * `upsertPoints` network call itself still lets this batch's `markSynced` fire once the call
+     * returns. That is deliberate and safe — the idle-gate is a resource-contention heuristic (keep
+     * network/flush off the cores capture needs), NOT a data-safety invariant. The invariant that
+     * actually matters — confirmed-implies-uploaded — holds regardless of recording state: `markSynced`
+     * is reached only after a durable, confirmed upsert of exactly these ids.
+     *
      * Crash-safe by construction (Spec §5): a crash between the upsert and the flag-flip leaves the
      * batch `synced=false`, so the NEXT [syncOnce] just re-uploads it — safely, because upsert-by-id
      * is idempotent (overwrite, never duplicate). Fail-soft (Spec §7): any `Throwable` from the
@@ -136,7 +143,10 @@ class FleetSync(
     } catch (e: CancellationException) {
         throw e   // structured concurrency: propagate, don't swallow as a sync failure (see pull()).
     } catch (e: Throwable) {
-        Log.w(TAG, "syncOnce failed (non-fatal, retried next idle pass): ${e.message}")
+        // Log the throwable itself, not just `.message`: an NPE/IllegalState from a REAL bug has a
+        // null message, which would print "...: null" and look identical to a benign "hub unreachable",
+        // then retry silently every 30s forever. The stack trace keeps a genuine defect diagnosable.
+        Log.w(TAG, "syncOnce failed (non-fatal, retried next idle pass)", e)
         0
     }
 

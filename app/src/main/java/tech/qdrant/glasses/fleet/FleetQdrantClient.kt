@@ -129,6 +129,17 @@ class FleetQdrantClient(
         http.newCall(req).execute().use { resp ->
             val respBody = resp.body?.string().orEmpty()
             require(resp.isSuccessful) { "upsert points ${resp.code}: $respBody" }
+            // Confirmed-implies-uploaded (Spec §5/§6): a bare HTTP 2xx is NOT proof the write reached
+            // Qdrant — a reverse proxy / captive portal / misrouted host in front of the hub can
+            // synthesize a 200 it never forwarded. Qdrant's own upsert(?wait=true) response carries a
+            // top-level {"status":"ok", ...}; require that ack too, so a 200-from-something-else can't
+            // false-confirm and let the caller flip `synced` on frames that never actually landed.
+            val ackOk = try {
+                JSONObject(respBody).optString("status") == "ok"
+            } catch (_: JSONException) {
+                false
+            }
+            require(ackOk) { "upsert points: HTTP ${resp.code} but Qdrant ack not ok: $respBody" }
         }
     }
 }

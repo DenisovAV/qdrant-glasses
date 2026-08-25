@@ -259,7 +259,13 @@ class GlassesComponents(
                         // Task 4: launch the UP half's background loop on its OWN dedicated lane — a
                         // single-thread dispatcher separate from embedLane/ocrLane, so a slow or
                         // unreachable hub (network I/O in FleetQdrantClient.upsertPoints) never
-                        // competes with moment capture's NPU work. `scope.launch` (fire-and-forget,
+                        // competes with moment capture's NPU work. It draws from Dispatchers.IO (the
+                        // elastic blocking-I/O pool), NOT Dispatchers.Default: upsertPoints is a
+                        // SYNCHRONOUS blocking OkHttp call (up to a 30s callTimeout on a hung hub), and
+                        // a limitedParallelism view of Default would park one of the ~4 shared CPU-pool
+                        // threads on this 4-core SoC — starving the detector/OCR lanes that are also
+                        // Default-derived. embedLane already sets this precedent (IO.limitedParallelism).
+                        // `scope.launch` (fire-and-forget,
                         // NOT `withContext`/`.join()`) so this call returns immediately — syncLoop
                         // itself never returns while the app runs (see its KDoc) — and does NOT
                         // block the rest of `load()`'s boot sequence. `scope` here is the same
@@ -267,7 +273,7 @@ class GlassesComponents(
                         // structured child of it and is cancelled automatically on ViewModel clear —
                         // no separate Job/close() bookkeeping needed, same lifecycle shape as
                         // AppStateHolder's recording ticker (see FleetSync.syncLoop's KDoc).
-                        val fleetLane = kotlinx.coroutines.Dispatchers.Default.limitedParallelism(1)
+                        val fleetLane = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1)
                         scope.launch(fleetLane) { fleetSync.syncLoop() }
                         Log.i(TAG, "load: fleet syncLoop launched on dedicated lane")
                     }

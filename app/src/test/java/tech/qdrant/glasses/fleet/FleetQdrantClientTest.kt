@@ -119,4 +119,44 @@ class FleetQdrantClientTest {
         assertEquals(0, srv.requestCount)
         srv.shutdown()
     }
+    // Confirmed-implies-uploaded (Spec §5/§6): a bare HTTP 2xx is NOT proof the write reached Qdrant —
+    // a reverse proxy / captive portal can synthesize a 200 that never forwarded the upsert. A 2xx
+    // whose body is not Qdrant's own {"status":"ok"} MUST be treated as a failure, or the caller would
+    // flip `synced` on frames that never landed. require(ackOk) throws IllegalArgumentException.
+    @Test fun upsertPoints2xxWithNonOkStatusThrows() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setResponseCode(200).setBody("""{"status":"error","result":null}"""))
+        srv.start()
+        val c = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        val points = listOf(FleetPoint(
+            id = "11111111-1111-1111-1111-111111111111",
+            vector = floatArrayOf(0.1f, 0.2f, 0.3f),
+            payload = """{"label":"cup"}""",
+        ))
+        try {
+            c.upsertPoints("fleet_inbox", points)
+            org.junit.Assert.fail("expected failure for a 2xx response with a non-ok Qdrant status")
+        } catch (_: IllegalArgumentException) {
+            // expected
+        }
+        srv.shutdown()
+    }
+    @Test fun upsertPoints2xxWithMalformedBodyThrows() {
+        val srv = MockWebServer()
+        srv.enqueue(MockResponse().setResponseCode(200).setBody("not json at all"))
+        srv.start()
+        val c = FleetQdrantClient(srv.url("/").toString().trimEnd('/'))
+        val points = listOf(FleetPoint(
+            id = "11111111-1111-1111-1111-111111111111",
+            vector = floatArrayOf(0.1f, 0.2f, 0.3f),
+            payload = """{"label":"cup"}""",
+        ))
+        try {
+            c.upsertPoints("fleet_inbox", points)
+            org.junit.Assert.fail("expected failure for a 2xx response with a malformed body")
+        } catch (_: IllegalArgumentException) {
+            // expected — JSONObject(respBody) throws JSONException → ackOk=false → require fails
+        }
+        srv.shutdown()
+    }
 }
