@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 
 import '../data/edge_client.dart';
+import '../logging.dart';
 
 /// One retrieved moment, shown inline in the chat thread. Renders the
 /// decoded [MomentHit.thumbB64] image when present (Phase 4 corpora); falls
@@ -47,12 +48,24 @@ class MomentCard extends StatelessWidget {
                   child: Image.memory(
                     thumb,
                     fit: BoxFit.cover,
-                    errorBuilder: (context, error, stackTrace) => Center(
-                      child: Icon(
-                        Icons.broken_image_outlined,
-                        color: Theme.of(context).disabledColor,
-                      ),
-                    ),
+                    errorBuilder: (context, error, stackTrace) {
+                      // Round-2 review fix #7 (silent-failure, minor): the
+                      // placeholder icon below already covers the user-
+                      // facing side of this fallback — this just stops the
+                      // swallow from ALSO being fail-silent, matching every
+                      // other fail-soft boundary in this codebase.
+                      fleetLog(
+                        'MomentCard: Image.memory failed to decode '
+                        'thumbnail bytes for ${hit.id}, falling back to a '
+                        'placeholder: $error',
+                      );
+                      return Center(
+                        child: Icon(
+                          Icons.broken_image_outlined,
+                          color: Theme.of(context).disabledColor,
+                        ),
+                      );
+                    },
                   ),
                 ),
                 Padding(
@@ -107,7 +120,11 @@ Uint8List? _decodeThumb(String? b64) {
   if (b64 == null || b64.isEmpty) return null;
   try {
     return base64Decode(b64);
-  } catch (_) {
+  } catch (e) {
+    // Round-2 review fix #7 (silent-failure, minor): the text-card fallback
+    // already covers the user-facing side of this — this just stops the
+    // swallow from also being fail-silent.
+    fleetLog('MomentCard._decodeThumb: malformed base64, falling back to text: $e');
     return null;
   }
 }

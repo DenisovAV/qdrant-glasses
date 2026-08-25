@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:fleet_node/data/edge_client.dart';
+import 'package:fleet_node/logging.dart';
 import 'package:fleet_node/ui/moment_card.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -64,6 +65,32 @@ void main() {
     expect(find.text('plant'), findsOneWidget);
   });
 
+  // Round-2 review fix #7 (silent-failure, minor): the text fallback is
+  // already visible to the user — this just proves the same swallow ALSO
+  // leaves a debug trace, for symmetry with every other fail-soft boundary
+  // in this codebase (all of which log via fleetLog).
+  testWidgets(
+    'malformed base64 also logs via fleetLog, for symmetry with the text fallback',
+    (tester) async {
+      final logs = <String>[];
+      fleetLogSinkForTest = (message, {level = 0}) => logs.add(message);
+      addTearDown(() => fleetLogSinkForTest = null);
+      const hit = MomentHit(
+        id: 'id1',
+        score: 0,
+        momentId: 'm1',
+        timestampMs: 1700000000000,
+        label: 'plant',
+        thumbB64: 'not-valid-base64!!!',
+      );
+
+      await _pump(tester, const MomentCard(hit: hit));
+
+      expect(logs, isNotEmpty, reason: '_decodeThumb\'s catch must log, not swallow silently');
+      expect(logs.single, contains('_decodeThumb'));
+    },
+  );
+
   testWidgets(
     'valid-base64 non-image bytes never crash the card — falls back to text',
     (tester) async {
@@ -87,6 +114,32 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.text('plant'), findsOneWidget);
+    },
+  );
+
+  // Round-2 review fix #7: the same symmetry, for the OTHER swallow site —
+  // Image.memory's own async decode failure, caught by errorBuilder.
+  testWidgets(
+    'a valid-base64 non-image decode failure also logs via fleetLog',
+    (tester) async {
+      final logs = <String>[];
+      fleetLogSinkForTest = (message, {level = 0}) => logs.add(message);
+      addTearDown(() => fleetLogSinkForTest = null);
+      final garbageBytes = utf8.encode('not actually image bytes, just text');
+      final thumbB64 = base64Encode(garbageBytes);
+      final hit = MomentHit(
+        id: 'id1',
+        score: 0,
+        momentId: 'm1',
+        timestampMs: 1700000000000,
+        label: 'plant',
+        thumbB64: thumbB64,
+      );
+
+      await _pump(tester, MomentCard(hit: hit));
+      await tester.pumpAndSettle();
+
+      expect(logs, isNotEmpty, reason: 'the Image.memory errorBuilder must log, not swallow silently');
     },
   );
 
