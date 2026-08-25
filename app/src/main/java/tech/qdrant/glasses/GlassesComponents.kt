@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import tech.qdrant.glasses.detect.DetectorFactory
 import tech.qdrant.glasses.detect.ObjectDetector
 import tech.qdrant.glasses.detect.ObjectTracker
@@ -254,10 +255,21 @@ class GlassesComponents(
                             momentStore = ms, isRecording = isRecording,
                         )
                         fleetStore = fleetSync.pull()
-                        // The UP half (syncOnce/syncLoop) is constructed here but not yet started —
-                        // wiring its background loop onto a lane + this GlassesComponents' lifecycle
-                        // is a follow-up task, not part of this pull-only wiring.
                         Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
+                        // Task 4: launch the UP half's background loop on its OWN dedicated lane — a
+                        // single-thread dispatcher separate from embedLane/ocrLane, so a slow or
+                        // unreachable hub (network I/O in FleetQdrantClient.upsertPoints) never
+                        // competes with moment capture's NPU work. `scope.launch` (fire-and-forget,
+                        // NOT `withContext`/`.join()`) so this call returns immediately — syncLoop
+                        // itself never returns while the app runs (see its KDoc) — and does NOT
+                        // block the rest of `load()`'s boot sequence. `scope` here is the same
+                        // viewModelScope MomentCapture was built with above, so this loop is a
+                        // structured child of it and is cancelled automatically on ViewModel clear —
+                        // no separate Job/close() bookkeeping needed, same lifecycle shape as
+                        // AppStateHolder's recording ticker (see FleetSync.syncLoop's KDoc).
+                        val fleetLane = kotlinx.coroutines.Dispatchers.Default.limitedParallelism(1)
+                        scope.launch(fleetLane) { fleetSync.syncLoop() }
+                        Log.i(TAG, "load: fleet syncLoop launched on dedicated lane")
                     }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
