@@ -11,6 +11,7 @@
 import 'package:fleet_node/data/edge_client.dart';
 import 'package:fleet_node/data/fleet_http.dart';
 import 'package:fleet_node/data/fleet_pull.dart';
+import 'package:fleet_node/data/pull_result.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:path_provider/path_provider.dart';
@@ -30,13 +31,13 @@ void main() {
       workDir: appDir.path,
     );
 
-    final shardDir = await fleetPull.pull(collection: 'fleet_curated');
+    final result = await fleetPull.pull(collection: 'fleet_curated');
 
-    expect(shardDir, isNotNull, reason: 'pull() should succeed against a reachable hub');
+    expect(result, isA<PullLoaded>(), reason: 'pull() should succeed against a reachable hub');
     expect(edgeClient.isLoaded, isTrue);
     final count = await edgeClient.count();
     // ignore: avoid_print
-    print('fleet_pull integration: loaded shard at $shardDir, count=$count');
+    print('fleet_pull integration: $result, count=$count');
     expect(count, greaterThan(0));
 
     final hits = await edgeClient.timeline(limit: 20);
@@ -48,7 +49,7 @@ void main() {
     }
   });
 
-  testWidgets('unreachable hub -> pull() returns null, EdgeClient stays unloaded', (
+  testWidgets('unreachable hub -> PullUnreachable, EdgeClient stays unloaded', (
     tester,
   ) async {
     final appDir = await getApplicationSupportDirectory();
@@ -63,7 +64,7 @@ void main() {
 
     final result = await fleetPull.pull(collection: 'fleet_curated');
 
-    expect(result, isNull);
+    expect(result, isA<PullUnreachable>());
     expect(edgeClient.isLoaded, isFalse);
   });
 }

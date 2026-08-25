@@ -12,6 +12,7 @@ import 'package:fleet_node/data/edge_client.dart';
 import 'package:fleet_node/data/fleet_http.dart';
 import 'package:fleet_node/data/fleet_pull.dart';
 import 'package:fleet_node/data/memory_repository.dart';
+import 'package:fleet_node/data/pull_result.dart';
 import 'package:fleet_node/ui/chat_screen.dart';
 import 'package:fleet_node/ui/moment_card.dart';
 import 'package:flutter/material.dart';
@@ -34,8 +35,8 @@ void main() {
       workDir: appDir.path,
     );
 
-    final shardDir = await fleetPull.pull(collection: 'fleet_curated');
-    expect(shardDir, isNotNull, reason: 'pull() should succeed against a reachable hub');
+    final result = await fleetPull.pull(collection: 'fleet_curated');
+    expect(result, isA<PullLoaded>(), reason: 'pull() should succeed against a reachable hub');
     final corpusCount = await edgeClient.count();
     // ignore: avoid_print
     print('chat_e2e: pulled corpus count=$corpusCount');
