@@ -97,6 +97,62 @@ void main() {
         expect(hits.single.momentId, 'm1');
       },
     );
+
+    // Round-2 review fix #2 (codex HIGH): [loadFromDir] (re)creates a
+    // `timestamp_ms` range index every time so `timeline()` can `orderBy`
+    // server-side, but if that index-creation attempt itself ever fails
+    // (currently swallowed as "harmless"), `orderBy` throws "No range
+    // index" — caught — and the WHOLE timeline used to come back empty,
+    // making the entire memory look empty. `timeline()` must instead
+    // degrade to a slower, unordered scroll + client-side sort, never to
+    // silently-empty. `createTimestampIndexOnLoad: false` is a test-only
+    // seam standing in for "index (re)creation failed" — from `timeline`'s
+    // point of view the two are indistinguishable (no index present when
+    // `orderBy` runs), which is exactly the resilience being proven here;
+    // verified against the real native SDK to throw
+    // "No range index for `order_by` key" in this exact scenario.
+    group('falls back when the timestamp_ms range index is missing', () {
+      test('still returns every frame, newest-first — never silently empty', () async {
+        final client = EdgeClient(createTimestampIndexOnLoad: false);
+        await client.loadFromDir(shardDir);
+
+        final hits = await client.timeline();
+
+        expect(
+          hits.map((h) => h.momentId).toList(),
+          ['m3', 'm2', 'm1'],
+          reason: 'a missing index must degrade to correct-but-slower, not silently-empty',
+        );
+      });
+
+      test('the fallback still honors limit', () async {
+        final client = EdgeClient(createTimestampIndexOnLoad: false);
+        await client.loadFromDir(shardDir);
+
+        final hits = await client.timeline(limit: 2);
+
+        expect(hits.map((h) => h.momentId).toList(), ['m3', 'm2']);
+      });
+
+      test('the fallback still honors label + time-window filters', () async {
+        final client = EdgeClient(createTimestampIndexOnLoad: false);
+        await client.loadFromDir(shardDir);
+
+        final hits = await client.timeline(label: 'cup', limit: 2);
+
+        expect(hits, hasLength(1));
+        expect(hits.single.momentId, 'm1');
+      });
+
+      test('the fallback still excludes non-frame points', () async {
+        final client = EdgeClient(createTimestampIndexOnLoad: false);
+        await client.loadFromDir(shardDir);
+
+        final hits = await client.timeline(limit: 100);
+
+        expect(hits.any((h) => h.momentId == 'region-only'), isFalse);
+      });
+    });
   });
 
   group('searchFrames', () {

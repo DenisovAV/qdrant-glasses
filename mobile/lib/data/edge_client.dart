@@ -53,7 +53,27 @@ class EdgeClient {
   static const _clipDim = 768;
   static const _textDim = 384;
 
+  // A defensive cap on how many scroll pages/records [_timelineFallback]
+  // will walk client-side before giving up — the pre-fix-B approach,
+  // reinstated ONLY for the path taken when the server-side `orderBy` in
+  // [_timelineOrdered] throws (round-2 review fix #2). Fine at
+  // fleet-curated scale; revisit if that corpus grows past this cap.
+  static const _scrollPageSize = 500;
+  static const _maxScrolledRecords = 5000;
+
   qe.EdgeShard? _shard;
+
+  /// Test seam ONLY — production code always uses the default `true`.
+  /// When `false`, [loadFromDir] skips [_ensureTimestampRangeIndex]
+  /// entirely, standing in for "the index (re)creation attempt failed"
+  /// without needing to force an actual native failure: from [timeline]'s
+  /// point of view the two are indistinguishable (no range index present
+  /// when `orderBy` runs, for whatever reason) — exactly the resilience
+  /// round-2 review fix #2's guarding test proves.
+  final bool _createTimestampIndexOnLoad;
+
+  EdgeClient({bool createTimestampIndexOnLoad = true})
+    : _createTimestampIndexOnLoad = createTimestampIndexOnLoad; // ignore: prefer_initializing_formals (renamed for a self-documenting public param name)
 
   /// True once [loadFromDir] has opened a shard.
   bool get isLoaded => _shard != null;
@@ -85,7 +105,7 @@ class EdgeClient {
       },
     );
     _shard = qe.EdgeShard.load(path: dir, config: config);
-    _ensureTimestampRangeIndex();
+    if (_createTimestampIndexOnLoad) _ensureTimestampRangeIndex();
   }
 
   /// (Re)creates the `timestamp_ms` RANGE payload index [timeline] needs to
@@ -96,6 +116,16 @@ class EdgeClient {
   /// freshly-pulled snapshot is not guaranteed to already have one either.
   /// `runCatching`-style (matches the Kotlin reference): creating an index
   /// that already exists throws — swallow it, just log.
+  ///
+  /// **A creation failure is logged LOUDLY, not as "harmless" (round-2
+  /// review fix #2, codex HIGH).** It used to read that way because
+  /// [timeline] silently swallowed the resulting `orderBy` failure into an
+  /// EMPTY result — the whole memory looked empty. Now that [timeline]
+  /// itself degrades to [_timelineFallback] instead, a creation failure here
+  /// is genuinely lower-stakes than before, but still worth a loud log: it
+  /// means every future [timeline] call on this shard pays the slower
+  /// client-side-sort path until the index is retried on a later
+  /// [loadFromDir].
   void _ensureTimestampRangeIndex() {
     final shard = _shard;
     if (shard == null) return;
@@ -112,7 +142,9 @@ class EdgeClient {
     } catch (e) {
       fleetLog(
         "EdgeClient.loadFromDir: 'timestamp_ms' range index not (re)created "
-        '(harmless if it already existed): $e',
+        '— timeline() will fall back to a slower, unordered scroll + '
+        'client-side sort until a later loadFromDir retries this: $e',
+        level: 900,
       );
     }
   }
@@ -198,6 +230,16 @@ class EdgeClient {
   /// `_maxScrolledRecords = 5000` walk cap meant a corpus past that size
   /// could silently omit newer frames from the result; this has no such cap
   /// because the shard does the ordering, not this client.
+  ///
+  /// **Degrades, never silently empties, if the `timestamp_ms` range index
+  /// is missing (round-2 review fix #2, codex HIGH).** [loadFromDir]
+  /// (re)creates that index on every fresh shard handle, but if that attempt
+  /// itself ever fails, the server-side `orderBy` this method relies on
+  /// throws "No range index" — which used to be caught here and reported as
+  /// an EMPTY timeline, making the whole memory look empty. This now falls
+  /// back to [_timelineFallback] (an unordered scroll + client-side sort —
+  /// the pre-fix-B approach) whenever the ordered path throws, for ANY
+  /// reason: correct-but-slower, never silently-empty.
   Future<List<MomentHit>> timeline({
     int? sinceMs,
     int? untilMs,
@@ -207,24 +249,87 @@ class EdgeClient {
     final shard = _shard;
     if (shard == null) return const [];
     try {
+      return _timelineOrdered(shard, sinceMs: sinceMs, untilMs: untilMs, label: label, limit: limit);
+    } catch (e) {
+      fleetLog(
+        'EdgeClient.timeline: server-side orderBy(timestamp_ms) failed (a '
+        "missing 'timestamp_ms' range index is the likely cause) — "
+        'degrading to an unordered scroll + client-side sort instead of an '
+        'empty timeline: $e',
+        level: 900,
+      );
+      try {
+        return await _timelineFallback(shard, sinceMs: sinceMs, untilMs: untilMs, label: label, limit: limit);
+      } catch (e2) {
+        fleetLog('EdgeClient.timeline: fallback scroll also failed, reporting no hits: $e2', level: 900);
+        return const [];
+      }
+    }
+  }
+
+  /// The fast path: asks the shard to `orderBy(timestamp_ms DESC)` and
+  /// `limit` server-side in one `scroll()` call. Throws (does not catch)
+  /// when the `timestamp_ms` range index is missing — [timeline] is what
+  /// catches that and falls back to [_timelineFallback].
+  List<MomentHit> _timelineOrdered(
+    qe.EdgeShard shard, {
+    required int? sinceMs,
+    required int? untilMs,
+    required String? label,
+    required int limit,
+  }) {
+    final resp = shard.scroll(
+      request: qe.ScrollRequest(
+        limit: limit,
+        filter: _frameFilter(sinceMs: sinceMs, untilMs: untilMs, label: label),
+        withPayload: qe.BoolWithPayload(true),
+        orderBy: qe.OrderBy(key: 'timestamp_ms', direction: qe.Direction.desc),
+      ),
+    );
+    final hits = <MomentHit>[];
+    for (final record in resp.records) {
+      final hit = _hitFromPayload(_idString(record.id), 0, record.payload);
+      if (hit != null) hits.add(hit);
+    }
+    return hits;
+  }
+
+  /// The pre-fix-B approach: walks the shard's scroll cursor to completion
+  /// (bounded by [_maxScrolledRecords]), decoding every matching `type=frame`
+  /// record, then sorts + truncates in Dart. Correct regardless of index
+  /// state — only reached when [_timelineOrdered]'s server-side `orderBy`
+  /// throws (round-2 review fix #2), so the extra client-side work only ever
+  /// happens on the degraded path, not the common one.
+  Future<List<MomentHit>> _timelineFallback(
+    qe.EdgeShard shard, {
+    required int? sinceMs,
+    required int? untilMs,
+    required String? label,
+    required int limit,
+  }) async {
+    final hits = <MomentHit>[];
+    qe.PointId? cursor;
+    var scanned = 0;
+    while (scanned < _maxScrolledRecords) {
       final resp = shard.scroll(
         request: qe.ScrollRequest(
-          limit: limit,
+          offset: cursor,
+          limit: _scrollPageSize,
           filter: _frameFilter(sinceMs: sinceMs, untilMs: untilMs, label: label),
           withPayload: qe.BoolWithPayload(true),
-          orderBy: qe.OrderBy(key: 'timestamp_ms', direction: qe.Direction.desc),
         ),
       );
-      final hits = <MomentHit>[];
       for (final record in resp.records) {
         final hit = _hitFromPayload(_idString(record.id), 0, record.payload);
         if (hit != null) hits.add(hit);
       }
-      return hits;
-    } catch (e) {
-      fleetLog('EdgeClient.timeline: native call failed, reporting no hits: $e', level: 900);
-      return const [];
+      scanned += resp.records.length;
+      cursor = resp.nextOffset;
+      if (cursor == null || resp.records.isEmpty) break;
     }
+    hits.sort((a, b) => b.timestampMs.compareTo(a.timestampMs));
+    if (hits.length <= limit) return hits;
+    return hits.sublist(0, limit);
   }
 
   qe.Filter _frameFilter({int? sinceMs, int? untilMs, String? label}) {
