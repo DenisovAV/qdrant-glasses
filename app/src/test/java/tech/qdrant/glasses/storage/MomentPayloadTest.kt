@@ -2,6 +2,7 @@ package tech.qdrant.glasses.storage
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +24,7 @@ class MomentPayloadTest {
             yoloConf = 0.73f,
             verifyCos = 0.31f,
             text = "",
+            synced = true,
         )
         val restored = MomentPayload.fromJson(payload.toJson())
         assertEquals(payload.type, restored.type)
@@ -36,7 +38,29 @@ class MomentPayloadTest {
         assertEquals(payload.yoloConf, restored.yoloConf, 1e-6f)
         assertEquals(payload.verifyCos, restored.verifyCos, 1e-6f)
         assertEquals(payload.text, restored.text)
+        assertEquals(payload.synced, restored.synced)
         assertEquals(payload, restored)
+    }
+
+    @Test fun synced_defaultsFalse_whenOmittedFromConstructor() {
+        val payload = MomentPayload(
+            type = "frame", momentId = "moment-def", episodeId = 1L, timestampMs = 1L, tEndMs = 1L,
+            thumbPath = "", bbox = "", label = "", yoloConf = 0f, verifyCos = 0f, text = "",
+        )
+        assertFalse(payload.synced)
+        assertFalse(MomentPayload.fromJson(payload.toJson()).synced)
+    }
+
+    @Test fun synced_falseRoundTrips_notJustTrue() {
+        val payload = MomentPayload(
+            type = "frame", momentId = "moment-ghi", episodeId = 1L, timestampMs = 1L, tEndMs = 1L,
+            thumbPath = "", bbox = "", label = "", yoloConf = 0f, verifyCos = 0f, text = "",
+            synced = false,
+        )
+        val json = JSONObject(payload.toJson())
+        assertTrue(json.has("synced"))
+        assertFalse(json.getBoolean("synced"))
+        assertFalse(MomentPayload.fromJson(payload.toJson()).synced)
     }
 
     @Test fun toJson_usesExactOnDiskKeys() {
@@ -65,6 +89,7 @@ class MomentPayloadTest {
         assertTrue(json.has("yolo_conf"))
         assertTrue(json.has("verify_cos"))
         assertTrue(json.has("text"))
+        assertTrue(json.has("synced"))
         // pin exact values too, not just key presence
         assertEquals("frame", json.getString("type"))
         assertEquals("moment-xyz", json.getString("moment_id"))
@@ -87,6 +112,7 @@ class MomentPayloadTest {
         assertEquals(0f, restored.yoloConf, 1e-6f)
         assertEquals(0f, restored.verifyCos, 1e-6f)
         assertEquals("", restored.text)
+        assertFalse(restored.synced)
     }
 
     @Test fun fromJson_missingKeys_defaultToEmptyStringAndZero() {
@@ -102,5 +128,6 @@ class MomentPayloadTest {
         assertEquals(0f, restored.yoloConf, 1e-6f)
         assertEquals(0f, restored.verifyCos, 1e-6f)
         assertEquals("", restored.text)
+        assertFalse(restored.synced)
     }
 }

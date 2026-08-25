@@ -63,6 +63,8 @@ class MomentSearcherFleetTest {
         override fun count(): Long = (frameHits.size + regionHits.size).toLong()
         override fun frameCount(): Long = frameHits.size.toLong()
         override fun deleteAll() {}
+        override fun scrollUnsyncedFrames(limit: Int) = error("not used")
+        override fun markSynced(ids: List<String>) = error("not used")
         override fun close() {}
     }
 
