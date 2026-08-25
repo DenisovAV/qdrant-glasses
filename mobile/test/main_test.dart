@@ -72,6 +72,28 @@ void main() {
     expect(find.byKey(const Key('pull_status_banner')), findsNothing);
   });
 
+  // Round-2 review fix #8 (silent-failure, low): `pullOverride`/
+  // `runFleetPull` THROWING (as opposed to resolving to a `PullResult`) is a
+  // real, if rare, path — e.g. `getApplicationSupportDirectory()` itself
+  // throwing on an unsupported platform. The old catch just logged and left
+  // `_pullResult == null`, which `_bannerMessage` treats identically to
+  // "never attempted a pull" — no banner at all, silently hiding a genuine
+  // startup failure.
+  testWidgets(
+    'the pull throwing outright (not resolving to a PullResult) still shows '
+    'the unreachable banner, not silence (round-2 review fix #8)',
+    (tester) async {
+      await _pump(
+        tester,
+        AppRoot(pullOverride: (edgeClient) async => throw Exception('boom-directory-failure')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('pull_status_banner')), findsOneWidget);
+      expect(find.textContaining('boom-directory-failure'), findsOneWidget);
+    },
+  );
+
   testWidgets(
     'disposing AppRoot closes its EdgeClient (fix I: no leaked native shard)',
     (tester) async {

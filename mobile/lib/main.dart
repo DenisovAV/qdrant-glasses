@@ -118,6 +118,14 @@ class _AppRootState extends State<AppRoot> {
       // throw on an unsupported platform, which must not crash startup.
       // Fix F: still logged, not silent.
       developer.log('AppRoot: startup pull failed: $e', name: 'fleet', level: 900);
+      // Round-2 review fix #8 (silent-failure, low): the old body left
+      // `_pullResult == null` here, which `_bannerMessage` treats
+      // identically to "never attempted a pull" — no banner at all, hiding
+      // a genuine startup failure behind silence. Surfacing it as
+      // `PullUnreachable` reuses the SAME banner an unreachable hub already
+      // gets (this failure mode never even reached the hub, but "the fleet
+      // corpus isn't loaded, here's why" is the right message either way).
+      if (mounted) setState(() => _pullResult = PullUnreachable('$e'));
     } finally {
       if (mounted) setState(() => _ready = true);
     }
