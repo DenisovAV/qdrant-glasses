@@ -11,6 +11,8 @@
 #                                           #   and upsert its points into fleet_curated (relabel FLEET:)
 #   scripts/fleet-dev.sh count              # print collection point counts
 #   scripts/fleet-dev.sh pull-device        # adb-pull the glasses' local moment shard to /tmp and seed
+#   scripts/fleet-dev.sh approve <id>       # flip curated=true on a fleet_inbox point (simulate approval)
+#   scripts/fleet-dev.sh curate             # copy curated=true inbox points into fleet_curated (pillar 3)
 set -euo pipefail
 
 QDRANT_IMAGE="qdrant/qdrant:v1.19.0"     # matches qdrant-core 1.19.1 under Edge 0.8 (snapshot-compat, spec §2)
@@ -107,7 +109,49 @@ for n in ("fleet_inbox", "fleet_curated"):
     except Exception as e: print(f"{n}: (missing)")
 PYEOF
     ;;
+  approve)
+    # Simulate a human curator approving ONE device contribution (Spec §8): flip curated=true on a
+    # fleet_inbox point. A real deployment would have an approval UI/workflow; the PoC shows the CONCEPT.
+    id="${1:?usage: approve <point-id>}"
+    PY=$(venv_py)
+    "$PY" - "$URL" "$id" <<'PYEOF'
+import sys
+from qdrant_client import QdrantClient
+c = QdrantClient(url=sys.argv[1]); pid = sys.argv[2]
+c.set_payload("fleet_inbox", payload={"curated": True}, points=[pid], wait=True)
+print(f"approved (curated=true): {pid}")
+PYEOF
+    ;;
+  curate)
+    # Pillar 3 (Spec §8): copy the APPROVED subset (curated=true) from fleet_inbox into fleet_curated,
+    # preserving id/vector/payload so a re-run is idempotent (upsert by id). Devices snapshot-pull ONLY
+    # fleet_curated, so a contribution stays invisible to the fleet until it is approved here — then it
+    # propagates on the next pull. curated=true points are the only knowledge that ever reaches a device.
+    PY=$(venv_py)
+    "$PY" - "$URL" <<'PYEOF'
+import sys
+from qdrant_client import QdrantClient, models
+c = QdrantClient(url=sys.argv[1])
+flt = models.Filter(must=[models.FieldCondition(key="curated", match=models.MatchValue(value=True))])
+moved, offset = 0, None
+while True:
+    recs, offset = c.scroll("fleet_inbox", scroll_filter=flt, with_payload=True, with_vectors=True,
+                            limit=256, offset=offset)
+    pts = []
+    for r in recs:
+        vec = r.vector or {}
+        clip = vec.get("clip") if hasattr(vec, "get") else None
+        if clip is None:
+            continue  # frames carry a clip vector; skip anything without one (never upload a dimless point)
+        pts.append(models.PointStruct(id=r.id, vector={"clip": list(clip)}, payload=dict(r.payload or {})))
+    if pts:
+        c.upsert("fleet_curated", points=pts, wait=True); moved += len(pts)
+    if offset is None:
+        break
+print(f"curated {moved} approved point(s) into fleet_curated; total={c.count('fleet_curated').count}")
+PYEOF
+    ;;
   *)
-    echo "usage: $0 {up|init|seed-shard <dir>|pull-device|count}" >&2; exit 1
+    echo "usage: $0 {up|init|seed-shard <dir>|pull-device|count|approve <id>|curate}" >&2; exit 1
     ;;
 esac
