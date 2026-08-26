@@ -136,6 +136,15 @@ android {
             // mergeNativeLibs (the conflict check runs before abiFilter pruning).
             // Scope pickFirst to x86 ONLY so a future REAL arm64 ORT clash still fails loudly.
             pickFirsts += "lib/x86/libonnxruntime.so"
+            // chroma-android-release-0.0.1.aar (benchmark-flavor only) bundles its OWN
+            // jni/arm64-v8a/libc++_shared.so alongside libchroma_jni.so — a second copy at the
+            // exact path our own manually-added src/main/jniLibs/arm64-v8a/libc++_shared.so
+            // already occupies (see the note below this block). Same class of AAR-vs-manual-copy
+            // clash as the ORT x86 one above; pickFirst is safe here too — libc++_shared's ABI is
+            // stable across recent NDK releases, and every other native lib in this app statically
+            // links libc++ anyway (this .so exists only for djl_tokenizer, see below), so which
+            // copy wins doesn't change behavior.
+            pickFirsts += "lib/arm64-v8a/libc++_shared.so"
         }
         // src/main/jniLibs/arm64-v8a/libc++_shared.so is a manually-added copy (NDK
         // toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so, any
@@ -149,7 +158,10 @@ android {
 }
 
 dependencies {
-    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
+    // "exclude" keeps this all-flavor fileTree from also sweeping up app/libs/chroma-android-*.aar
+    // (added below) — Chroma is benchmark-only, wired via its OWN `benchmarkImplementation` fileTree
+    // a few lines down, exactly the isolation ObjectBox/sqlite-vec already get.
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"), "exclude" to listOf("chroma-android-*.aar"))))
     // sherpa-onnx AAR lives in the ROOT libs/ (per .gitignore convention, fetched manually).
     implementation(fileTree(mapOf("dir" to rootProject.file("libs"), "include" to listOf("sherpa-onnx-*.aar"))))
 
@@ -209,6 +221,15 @@ dependencies {
     // in `demo` (QdrantEdgeStore uses no SQLite) imports it — only SqliteVecStore does.
     "benchmarkImplementation"("androidx.sqlite:sqlite:2.7.0")
     "benchmarkImplementation"("androidx.sqlite:sqlite-bundled:2.7.0")
+
+    // ChromaDB (VectorStoreFactory.backend=CHROMA bench builds) — `benchmark`-flavor ONLY. A
+    // prebuilt Rust/JNI AAR from github.com/chroma-core/chroma-android (beta v0.0.1, no Maven
+    // artifact yet), committed at app/libs/chroma-android-release-0.0.1.aar — same "fetched AAR
+    // lives in app/libs, Apache-2.0" convention as the Qdrant Edge AARs (see NOTICE), but pulled in
+    // by its OWN fileTree (not the all-flavor one above, which explicitly excludes it) so `demo`
+    // never sees it. arm64-v8a only (matches this app's ndk.abiFilters); ships its own
+    // libc++_shared.so, hence the packaging.jniLibs.pickFirsts entry below.
+    "benchmarkImplementation"(fileTree(mapOf("dir" to "libs", "include" to listOf("chroma-android-*.aar"))))
 
     // Instrumented tests (emulator/device) — used to verify each engine end-to-end
     // (insert / kNN / time-filter / recall) without booting the full NPU pipeline.

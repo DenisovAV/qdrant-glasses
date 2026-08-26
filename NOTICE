@@ -20,6 +20,17 @@ Qdrant Edge  —  app/libs/qdrant-edge-ffi-release.aar
     because Qdrant does not currently publish an Android artifact to Maven, and
     the app does not build without them.
 
+Chroma Android  —  app/libs/chroma-android-release-0.0.1.aar
+
+    Embedded vector database (Rust core, reached from Kotlin over JNI) — used
+    ONLY by the `benchmark` build flavor's ChromaStore (VectorStoreFactory
+    Backend.CHROMA); never linked into the `demo` app.
+    Copyright Chroma. Licensed under the Apache License, Version 2.0.
+    https://github.com/chroma-core/chroma-android
+
+    Prebuilt beta (v0.0.1) release AAR, bundled here for the same reason as the
+    Qdrant Edge AARs above: no Maven artifact is published yet.
+
 ================================================================================
 Fetched, not bundled (see README.md → "Binaries you have to supply")
 ================================================================================
