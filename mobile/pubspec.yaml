@@ -45,6 +45,14 @@ dependencies:
   path: ^1.9.0
   http: ^1.2.0
 
+  # Phase 2 (Task 6b Step 2): the pure-Dart SigLIP2 text-tower query embedder runs over
+  # flutter_gemma's runtime-agnostic embedding pipeline + ONNX engine. Pinned to the two open PRs via
+  # dependency_overrides below (see memory `siglip-embedding-prs`) until they merge:
+  #   flutter_gemma_embeddings — the SigLIP tokenizer profile + pooling contracts
+  #   flutter_gemma_onnx       — the OnnxEmbeddingForwardPass + pooler_output picker fix
+  flutter_gemma_embeddings: any
+  flutter_gemma_onnx: any
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -58,6 +66,31 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+# Phase 2 demo overrides — the SigLIP embedder depends on TWO open PRs (memory `siglip-embedding-prs`).
+# Pin the whole flutter_gemma family to PR #467's branch (monorepo → path:) so their inter-package
+# versions align, and dart_sentencepiece to PR #26's branch (SigLIP tokenizer.json's new merges format).
+# Remove these once both PRs merge + release to pub.dev.
+dependency_overrides:
+  flutter_gemma:
+    git:
+      url: https://github.com/DenisovAV/flutter_gemma.git
+      ref: feat/siglip-text-embedding-profile
+      path: packages/flutter_gemma
+  flutter_gemma_embeddings:
+    git:
+      url: https://github.com/DenisovAV/flutter_gemma.git
+      ref: feat/siglip-text-embedding-profile
+      path: packages/flutter_gemma_embeddings
+  flutter_gemma_onnx:
+    git:
+      url: https://github.com/DenisovAV/flutter_gemma.git
+      ref: feat/siglip-text-embedding-profile
+      path: packages/flutter_gemma_onnx
+  dart_sentencepiece_tokenizer:
+    git:
+      url: https://github.com/DenisovAV/dart_sentencepiece_tokenizer.git
+      ref: fix/bpe-merges-list-format
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
