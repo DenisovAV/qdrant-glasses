@@ -32,27 +32,27 @@ class ComparisonBenchmarkTest {
     @Test fun benchmark_all_engines_headtohead() {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
         val max = InstrumentationRegistry.getArguments().getString("maxScale")?.toLongOrNull() ?: 10_000L
+        // Realistic CLUSTERED workload by default; pass `-e workload random` for the adversarial column.
+        val wl = if (InstrumentationRegistry.getArguments().getString("workload").equals("random", ignoreCase = true))
+            VectorStoreBenchmark.Workload.RANDOM else VectorStoreBenchmark.Workload.CLUSTERED
         val bench = VectorStoreBenchmark(ctx)
         val dim = 512
 
         // Both index strategies, IDENTICAL ops per engine:
         //   brute-force: qdrant-edge (scan), sqlite-vec   ·   HNSW: qdrant-hnsw, objectbox, chroma
         // An engine that can't ingest a scale in budget records DNF (never a silent cap).
-        val qdrantEdge = bench.benchmark("qdrant-edge", max, "cmpq") { ns -> QdrantEdgeStore(ctx, dim, ns) }
+        val qdrantEdge = bench.benchmark("qdrant-edge", max, "cmpq", wl) { ns -> QdrantEdgeStore(ctx, dim, ns) }
+        val objectBox = bench.benchmark("objectbox", max, "cmpob", wl) { ns -> ObjectBoxStore(ctx, dim, ns) }
+        val sqliteVec = bench.benchmark("sqlite-vec", max, "cmpsv", wl) { ns -> SqliteVecStore(ctx, dim, ns) }
+        val chroma = bench.benchmark("chroma", max, "cmpch", wl) { ns -> ChromaStore(ctx, dim, ns) }
         // Qdrant in HNSW mode: UNCAPPED — runs the full SCALES sweep (1k→1M) same `max` ceiling as
-        // every other engine (was capped at 100k pending a re-measurement of the graph build
-        // (optimize()) cost after cc2062d switched maxIndexingThreads 1→0/auto). That re-measurement
-        // has NOT happened yet — the old ~5.5min@100k / ~1h46m@1M figures are still the stale,
-        // pre-cc2062d upper bound (see QdrantEdgeStore.buildIndex's own caveat). A 1M HNSW build is
-        // now INTENTIONALLY allowed to take that long: buildIndex()'s optimize() is a single
+        // every other engine (was capped at 100k). buildIndex()'s optimize() is a single
         // non-interruptible native call that VectorStoreBenchmark.LOAD_BUDGET_MS does NOT cover (only
-        // the insert loop does — see its own "Known limitations" note), so this can genuinely run
-        // past 30 min uninterrupted at 1M. Not a bug; that is the intentional trade for finally
-        // getting a real number instead of a stale estimate.
-        val qdrantHnsw = bench.benchmark("qdrant-hnsw", max, "cmpqh") { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
-        val objectBox = bench.benchmark("objectbox", max, "cmpob") { ns -> ObjectBoxStore(ctx, dim, ns) }
-        val sqliteVec = bench.benchmark("sqlite-vec", max, "cmpsv") { ns -> SqliteVecStore(ctx, dim, ns) }
-        val chroma = bench.benchmark("chroma", max, "cmpch") { ns -> ChromaStore(ctx, dim, ns) }
+        // the insert loop does), so a 1M build can genuinely run ~1h46m uninterrupted — intentionally
+        // allowed now to get a real number instead of a stale estimate.
+        // Run LAST on purpose: it is the long/risky pole (that ~1h46m non-interruptible 1M build), so a
+        // UVLO reboot mid-build doesn't cost the other four engines' results, already written+pulled by then.
+        val qdrantHnsw = bench.benchmark("qdrant-hnsw", max, "cmpqh", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
 
         // The run must be able to FAIL — assert the deterministic, device-independent facts only
         // (never exact latency/RAM numbers, which vary with load; see VectorStoreBenchmark's
@@ -91,5 +91,40 @@ class ComparisonBenchmarkTest {
             "exact engine (sqlite-vec, brute-force) recall@5=${sqliteSmallest.recallAtK} at the smallest scale, expected ~1.0",
             sqliteSmallest.recallAtK >= 0.99,
         )
+    }
+
+    /**
+     * CLEAN single-engine run: one engine, selected by `-e engine <name>`, in THIS instrumentation
+     * process. Run once per engine (a fresh `am instrument` each) with a filesDir wipe + force-stop
+     * between — that gives an uncontaminated per-engine RAM (PSS) baseline (the head-to-head shares
+     * ONE process, so its RAM column is polluted by earlier engines) and NO app/camera/NPU contention
+     * (unlike the sysprop path, which boots the full app).
+     *
+     *   adb shell am instrument -w -e class \
+     *     tech.qdrant.glasses.storage.ComparisonBenchmarkTest#benchmark_one \
+     *     -e engine qdrant-binary -e maxScale 1000000 -e workload clustered \
+     *     tech.qdrant.glasses.test/androidx.test.runner.AndroidJUnitRunner
+     */
+    @Test fun benchmark_one() {
+        val args = InstrumentationRegistry.getArguments()
+        val engine = args.getString("engine")
+            ?: error("pass -e engine <qdrant-edge|qdrant-binary|qdrant-hnsw|sqlite-vec|sqlite-binary|chroma|objectbox>")
+        val max = args.getString("maxScale")?.toLongOrNull() ?: 10_000L
+        val wl = if (args.getString("workload").equals("random", ignoreCase = true))
+            VectorStoreBenchmark.Workload.RANDOM else VectorStoreBenchmark.Workload.CLUSTERED
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val bench = VectorStoreBenchmark(ctx)
+        val dim = 512
+        val summaries = when (engine) {
+            "qdrant-edge"   -> bench.benchmark("qdrant-edge", max, "oneqe", wl) { ns -> QdrantEdgeStore(ctx, dim, ns) }
+            "qdrant-binary" -> bench.benchmark("qdrant-binary", max, "oneqb", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, binary = true) }
+            "qdrant-hnsw"   -> bench.benchmark("qdrant-hnsw", max, "oneqh", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
+            "sqlite-vec"    -> bench.benchmark("sqlite-vec", max, "onesv", wl) { ns -> SqliteVecStore(ctx, dim, ns) }
+            "sqlite-binary" -> bench.benchmark("sqlite-binary", max, "onesb", wl) { ns -> SqliteVecStore(ctx, dim, ns, binary = true) }
+            "chroma"        -> bench.benchmark("chroma", max, "onech", wl) { ns -> ChromaStore(ctx, dim, ns) }
+            "objectbox"     -> bench.benchmark("objectbox", max, "oneob", wl) { ns -> ObjectBoxStore(ctx, dim, ns) }
+            else            -> error("unknown engine: $engine")
+        }
+        assertFalse("$engine skipped its smallest scale — maxScale too low?", summaries.first().skipped)
     }
 }

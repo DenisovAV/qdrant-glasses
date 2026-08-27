@@ -18,14 +18,24 @@ import java.util.UUID
  *
  * Beta-API caveats that shape this class (all confirmed against the decompiled AAR + upstream
  * source, not assumed):
- *  - **No distance-metric control.** [Collection] creation (`Client.createCollection`) takes no
- *    metric/dim/HNSW-config argument — the Rust side always calls `create_collection` with
- *    `hnsw: None` (i.e. whatever the frontend's default `KnnIndex` is). It does not matter for
- *    RECALL here: every vector this benchmark inserts is unit-normalized (see
- *    `VectorStoreBenchmark.randomUnitVector`), and for unit vectors every common HNSW space
- *    (squared L2, cosine distance, inner-product distance) is a strictly decreasing function of
- *    cosine similarity — same top-k SET regardless of which one is active. See [scoreOf] for the
- *    (metric-agnostic) score this store reports.
+ *  - **NO index configuration at all — this is the beta AAR's hard ceiling, verified in its source
+ *    (`chroma-core/chroma-android` @ v0.0.1), not assumed.** `clientCreateCollection(ptr, name)`
+ *    takes only a name; `clientUpdateCollection(ptr, name, newName)` is a RENAME (not a config
+ *    setter); `clientQueryCollection(...)` has no query-time `ef`; and `rust/src/chromadb.rs`'s
+ *    `create_collection` hardcodes `hnsw: None`, so every collection runs on Chroma's DEFAULT HNSW
+ *    (documented `hnsw:search_ef = 10`, `space = l2`, `M = 16`, `ef_construction = 100`). Two
+ *    consequences pull in OPPOSITE directions, so keep them separate:
+ *      · **Distance space does NOT hurt recall.** Every benchmark vector is unit-normalized (see
+ *        `VectorStoreBenchmark.randomUnitVector`); for unit vectors squared-L2, cosine-distance and
+ *        IP-distance are all strictly decreasing in cosine similarity → identical top-k SET. See
+ *        [scoreOf] for the (metric-agnostic) score this store reports.
+ *      · **The fixed `search_ef = 10` DOES crater recall at scale, and there is no knob to raise
+ *        it.** With a fixed tiny candidate list, recall@k falls monotonically as N grows
+ *        (measured on-device: recall@5 ≈ 1.0 @1k → 0.46 @10k → 0.04 @100k on random near-orthogonal
+ *        512-d vectors — an adversarial worst case for ANY HNSW; real clustered embeddings score
+ *        higher). This is a property of the shipped SDK (server Chroma exposes `ef_search`; this
+ *        Android beta does not), NOT of this class's usage — do not "fix" it here, there is nothing
+ *        to configure. It IS a fairness caveat for the comparison report.
  *  - **`createCollection` throws if the name already exists** — the ONLY way to reopen a
  *    persisted collection (e.g. the benchmark's cold-load/reopen step) is `getCollection`, so
  *    [openOrCreateCollection] tries create-then-get.

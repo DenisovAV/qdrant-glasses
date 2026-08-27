@@ -52,6 +52,14 @@ class VectorStoreBenchmark(private val context: Context) {
         private const val DIM = 512               // current ViT-B/32 space
         private const val SEED = 1234L            // filler-vector stream (reproducible)
         private const val QUERY_SEED = 99L        // the fixed query vectors (independent of fillers)
+        private const val CENTER_SEED = 4321L     // cluster centers (CLUSTERED workload; independent of fillers/queries)
+        // CLUSTERED workload calibration (measured on host vs chroma-core 1.0.20, 100k, 1000 clusters):
+        // per-dim Gaussian noise around a unit center; std=0.05 puts a vector's nearest neighbour at
+        // cosine ~0.51 — structured like real CLIP/SigLIP embeddings (similar frames of the same
+        // objects), NOT the near-orthogonal random worst case (where any graph ANN collapses). #clusters
+        // = n/CLUSTER_PTS so cluster DENSITY (hence nn-cosine, hence ANN difficulty) is constant across scales.
+        private const val CLUSTER_STD = 0.05f
+        private const val CLUSTER_PTS = 100L      // target points-per-cluster
         private const val CHUNK = 5000            // generate+insert this many at a time; never all N
         private const val N_QUERIES = 10          // fixed query set for search / recall
         private const val TOPK = 5                // headline kNN + recall@k
@@ -74,6 +82,12 @@ class VectorStoreBenchmark(private val context: Context) {
         private val SCALES = longArrayOf(1_000, 10_000, 100_000, 500_000, 1_000_000)
     }
 
+    /** Synthetic workload shape. RANDOM = near-orthogonal unit vectors — the adversarial worst case
+     *  for any graph ANN (in 512-d everything is ~equidistant, so HNSW has no gradient to follow and
+     *  recall collapses while brute-force stays exact). CLUSTERED = vectors drawn around fixed centers,
+     *  structured like real embeddings, so approximate engines are measured on a realistic manifold. */
+    enum class Workload { RANDOM, CLUSTERED }
+
     /** Start the whole matrix on a dedicated daemon thread (never the main thread). */
     fun launch() {
         Thread({
@@ -84,7 +98,11 @@ class VectorStoreBenchmark(private val context: Context) {
     private fun run() {
         val backend = VectorStoreFactory.backend.name.lowercase()
         val maxScale = Config.sysprop("qdrant.dbbench.max").toLongOrNull() ?: DEFAULT_MAX
-        benchmark(backend, maxScale, BENCH_NAMESPACE) { ns -> VectorStoreFactory.create(context, DIM, ns) }
+        // Default to the realistic CLUSTERED workload; `setprop debug.qdrant.dbbench.workload random`
+        // switches to the adversarial one for the worst-case column.
+        val workload = if (Config.sysprop("qdrant.dbbench.workload").equals("random", ignoreCase = true))
+            Workload.RANDOM else Workload.CLUSTERED
+        benchmark(backend, maxScale, BENCH_NAMESPACE, workload) { ns -> VectorStoreFactory.create(context, DIM, ns) }
     }
 
     /**
@@ -100,8 +118,8 @@ class VectorStoreBenchmark(private val context: Context) {
      * several engines back-to-back in ONE process — a clean head-to-head with no NPU/camera contention.
      * Returns one [ScaleSummary] per entry in [SCALES], in order (regardless of maxScale/DNF/failure).
      */
-    fun benchmark(backendName: String, maxScale: Long, namespace: String, makeStore: (String) -> VectorStore): List<ScaleSummary> {
-        Log.i(TAG, "START backend=$backendName dim=$DIM maxScale=$maxScale scales=${SCALES.toList()}")
+    fun benchmark(backendName: String, maxScale: Long, namespace: String, workload: Workload = Workload.CLUSTERED, makeStore: (String) -> VectorStore): List<ScaleSummary> {
+        Log.i(TAG, "START backend=$backendName dim=$DIM maxScale=$maxScale workload=$workload scales=${SCALES.toList()}")
         val rows = ArrayList<ScaleResult>()
         var gaveUp = false   // once a scale DNFs on the ingest budget, larger scales can't do better
         for (scale in SCALES) {
@@ -116,7 +134,7 @@ class VectorStoreBenchmark(private val context: Context) {
             }
             Log.i(TAG, "scale=$scale: begin")
             val r = try {
-                runScale(scale, namespace, makeStore)
+                runScale(scale, namespace, workload, makeStore)
             } catch (e: LoadBudgetExceeded) {
                 gaveUp = true
                 Log.w(TAG, "scale=$scale DNF: ${e.message}")
@@ -127,17 +145,17 @@ class VectorStoreBenchmark(private val context: Context) {
             }
             rows.add(r)
             writeCsv(backendName, r)
-            writeMarkdown(backendName, rows)   // rewrite after every scale so partial results survive a mid-run device death
+            writeMarkdown(backendName, workload, rows)   // rewrite after every scale so partial results survive a mid-run device death
             Log.i(TAG, "scale=$scale: ${r.summaryLine()}")
         }
-        writeMarkdown(backendName, rows)
+        writeMarkdown(backendName, workload, rows)
         Log.i(TAG, "DONE ($backendName) — results in ${context.filesDir}")
         return rows.map { ScaleSummary(it.scale, it.skipped, it.failed, it.dnf, it.recallAtK) }
     }
 
     // ---- one scale --------------------------------------------------------------------------
 
-    private fun runScale(n: Long, namespace: String, makeStore: (String) -> VectorStore): ScaleResult {
+    private fun runScale(n: Long, namespace: String, workload: Workload, makeStore: (String) -> VectorStore): ScaleResult {
         val store = makeStore(namespace)
         // Tracks whichever store is CURRENTLY open, so the finally closes exactly once: `store`
         // gets an intentional close() at the cold-load step below (then this goes null), and
@@ -147,7 +165,11 @@ class VectorStoreBenchmark(private val context: Context) {
         try {
             store.deleteAll() // start from empty regardless of a previous run's leftovers
 
-            val queries = buildQueries()
+            // Cluster centers for the CLUSTERED workload (empty for RANDOM, which keeps its exact former
+            // behaviour — no centers built, no CENTER_SEED draws). Density is held constant across scales
+            // (n/CLUSTER_PTS centers) so nn-cosine — the ANN difficulty — doesn't drift with n.
+            val centers = if (workload == Workload.CLUSTERED) buildCenters(n) else emptyArray()
+            val queries = buildQueries(centers, workload)
             val groundTruth = Array(N_QUERIES) { TopK(TOPK) }
             val rnd = Random(SEED)
 
@@ -161,7 +183,7 @@ class VectorStoreBenchmark(private val context: Context) {
             var slowChunks = 0
             while (inserted < n) {
                 val c = minOf(CHUNK.toLong(), n - inserted).toInt()
-                val vecs = Array(c) { randomUnitVector(rnd) }
+                val vecs = Array(c) { genVector(rnd, centers, workload) }
                 val items = ArrayList<Pair<FloatArray, ObjectPayload>>(c)
                 for (i in 0 until c) {
                     items.add(vecs[i] to payloadFor(TS_BASE + inserted + i))
@@ -259,7 +281,7 @@ class VectorStoreBenchmark(private val context: Context) {
             // ---- insert-single (flush-per-op) measured on top of the loaded store ----
             val singleMs = DoubleArray(SINGLE_INSERTS)
             for (i in 0 until SINGLE_INSERTS) {
-                val v = randomUnitVector(rnd)
+                val v = genVector(rnd, centers, workload)
                 val t0 = System.nanoTime()
                 store.upsert(v, payloadFor(TS_BASE + n + i))
                 singleMs[i] = (System.nanoTime() - t0) / 1e6
@@ -338,10 +360,43 @@ class VectorStoreBenchmark(private val context: Context) {
         return v
     }
 
-    /** The fixed query set — its OWN seed so it's identical across scales and independent of fillers. */
-    private fun buildQueries(): Array<FloatArray> {
+    /** Cluster centers for the CLUSTERED workload: n/CLUSTER_PTS unit centers (at least TOPK+1 so each
+     *  query always has enough same-cluster neighbours to fill a top-k), from CENTER_SEED — stable and
+     *  independent of the filler/query streams. Cheap to hold whole (k×DIM ≪ n×DIM). */
+    private fun buildCenters(n: Long): Array<FloatArray> {
+        val k = maxOf(TOPK + 1, (n / CLUSTER_PTS).toInt())
+        val r = Random(CENTER_SEED)
+        return Array(k) { randomUnitVector(r) }
+    }
+
+    /** One synthetic vector of the given [workload] from the seeded [rnd] stream. RANDOM = a
+     *  near-orthogonal unit vector; CLUSTERED = a randomly-chosen center plus per-dim Gaussian noise
+     *  (CLUSTER_STD), re-normalized so cosine == dot still holds. Deterministic given [rnd], so the
+     *  exact ground truth accumulated from these vectors stays valid. */
+    private fun genVector(rnd: Random, centers: Array<FloatArray>, workload: Workload): FloatArray =
+        when (workload) {
+            Workload.RANDOM -> randomUnitVector(rnd)
+            Workload.CLUSTERED -> {
+                val c = centers[rnd.nextInt(centers.size)]
+                val v = FloatArray(DIM)
+                var norm = 0.0
+                for (i in 0 until DIM) {
+                    val x = c[i] + CLUSTER_STD * rnd.nextGaussian().toFloat()
+                    v[i] = x
+                    norm += (x * x).toDouble()
+                }
+                val inv = if (norm > 0) (1.0 / Math.sqrt(norm)).toFloat() else 0f
+                for (i in 0 until DIM) v[i] *= inv
+                v
+            }
+        }
+
+    /** The fixed query set — its OWN seed so it's identical across scales and independent of fillers.
+     *  For CLUSTERED, queries are drawn near cluster centers (same generator) so each query HAS real
+     *  near-neighbours to retrieve; for RANDOM they're near-orthogonal like the fillers. */
+    private fun buildQueries(centers: Array<FloatArray>, workload: Workload): Array<FloatArray> {
         val rnd = Random(QUERY_SEED)
-        return Array(N_QUERIES) { randomUnitVector(rnd) }
+        return Array(N_QUERIES) { genVector(rnd, centers, workload) }
     }
 
     private fun dot(a: FloatArray, b: FloatArray): Float {
@@ -441,11 +496,13 @@ class VectorStoreBenchmark(private val context: Context) {
         writeOrThrow(f, sb)
     }
 
-    private fun writeMarkdown(backend: String, rows: List<ScaleResult>) {
+    private fun writeMarkdown(backend: String, workload: Workload, rows: List<ScaleResult>) {
         val f = File(context.filesDir, "db_bench_$backend.md")
         val sb = StringBuilder()
         sb.append("# Vector-DB benchmark — `$backend`\n\n")
-        sb.append("dim=$DIM · topK=$TOPK · queries=$N_QUERIES · timed=$TIMED (warmup=$WARMUP discarded) · ")
+        sb.append("workload=$workload")
+        if (workload == Workload.CLUSTERED) sb.append(" (~$CLUSTER_PTS pts/cluster, std=$CLUSTER_STD, nn-cosine≈0.51)")
+        sb.append(" · dim=$DIM · topK=$TOPK · queries=$N_QUERIES · timed=$TIMED (warmup=$WARMUP discarded) · ")
         sb.append("chunk=$CHUNK · seed=$SEED. Latency in ms. \"max\" is the slowest of $TIMED timed runs, ")
         sb.append("NOT a real percentile (too few samples for one). RAM = PSS delta after load. ")
         sb.append("Disk = shard-dir size. Cold-load is a WARM-cache open (page cache not dropped). ")

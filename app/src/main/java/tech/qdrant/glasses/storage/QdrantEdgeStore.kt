@@ -13,10 +13,17 @@ import io.qdrant.edge.Condition
 import io.qdrant.edge.FieldCondition
 import io.qdrant.edge.Filter
 import io.qdrant.edge.HnswIndexConfig
+import io.qdrant.edge.QuantizationConfig
+import io.qdrant.edge.BinaryQuantizationParams
+import io.qdrant.edge.BinaryQuantizationEncoding
+import io.qdrant.edge.BinaryQuantizationQueryEncoding
+import io.qdrant.edge.Memory
 import io.qdrant.edge.NamedVector
 import io.qdrant.edge.PointId
+import io.qdrant.edge.Prefetch
 import io.qdrant.edge.Query
 import io.qdrant.edge.QueryRequest
+import io.qdrant.edge.SearchParams
 import io.qdrant.edge.RangeFloat
 import io.qdrant.edge.ScoredPoint
 import io.qdrant.edge.ScoringQuery
@@ -50,15 +57,23 @@ class QdrantEdgeStore(
     // — the graph is finalized in [buildIndex] (`optimize()`). Lets us benchmark BOTH index strategies
     // in the SAME engine (design: brute-force {Qdrant-scan, sqlite-vec} vs HNSW {Qdrant-HNSW, ObjectBox}).
     private val hnsw: Boolean = false,
+    // When true, binary-quantize the stored vectors (1 bit/dim → 512 bits = 64 B/vector) and search
+    // over the codes (Hamming), i.e. "binary brute-force" — the edge-scale winner we want to measure
+    // in-table, not cite from a stale run. Independent of [hnsw]; our benchmark uses binary+brute-force.
+    private val binary: Boolean = false,
 ) : VectorStore {
 
     companion object {
         private const val TAG = "QdrantEdgeStore"
         private const val FIELD = "crop"
         const val OBJECT_DIM = 768   // SigLIP2 (Mac endpoint) crop-embedding dimension
+        // Binary-quant oversampling: the quantized (1-bit) pass fetches OVERSAMPLE×topK candidates, then
+        // the outer query rescores them with the ORIGINAL f32 vectors. Higher = better recall, more rescore
+        // cost. 4× is Qdrant's common default starting point; tune from the on-device recall check.
+        private const val BINARY_OVERSAMPLE = 32L
     }
 
-    override val name: String get() = if (hnsw) "qdrant-hnsw" else "qdrant-edge"
+    override val name: String get() = when { binary -> "qdrant-binary"; hnsw -> "qdrant-hnsw"; else -> "qdrant-edge" }
 
     // Kept as fields so deleteAll() can drop + recreate the shard on the same directory in-process
     // (no app relaunch): close the native handle, wipe the dir, reload from the same config.
@@ -68,7 +83,18 @@ class QdrantEdgeStore(
         vectorData = mapOf(
             FIELD to VectorDataConfig(
                 size = dim.toULong(), distance = Distance.COSINE,
-                quantizationConfig = null, multivectorConfig = null, datatype = null,
+                // Binary quantization (1 bit/dim). PINNED = keep the tiny codes resident in RAM (64 MB@1M).
+                // queryEncoding = BINARY → the query is ALSO 1-bit, so the scan is a cheap Hamming
+                // (XOR+popcount) — the whole speed point of binary. (SCALAR8_BITS keeps the query at 8-bit
+                // for accuracy, but that turns the scan into an ~8-bit dot ≈ f32 cost, killing the speed;
+                // measured slower than f32 at 500k.) Recall is recovered by the oversample+rescore in
+                // [buildQuery] instead: fetch BINARY_OVERSAMPLE×topK Hamming candidates, re-rank by exact f32.
+                quantizationConfig = if (binary) QuantizationConfig.Binary(BinaryQuantizationParams(
+                    memory = Memory.PINNED,
+                    encoding = BinaryQuantizationEncoding.ONE_BIT,
+                    queryEncoding = BinaryQuantizationQueryEncoding.BINARY,
+                )) else null,
+                multivectorConfig = null, datatype = null,
                 // HNSW mode: m/efConstruct are the Edge SDK's own bench defaults; fullScanThreshold
                 // 10000 means collections under that size still full-scan (HNSW only kicks in above).
                 hnswConfig = if (hnsw) HnswIndexConfig(
@@ -136,17 +162,42 @@ class QdrantEdgeStore(
     }
 
     override fun search(vector: FloatArray, topK: Int): List<ObjectHit> = synchronized(lock) {
-        val results = shard.query(QueryRequest(
-            limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(vector.toList()), using = FIELD)),
-            prefetches = emptyList(),
-            withVector = null, withPayload = WithPayload.Bool(true),
-            filter = null, scoreThreshold = null, params = null
-        ))
+        val results = shard.query(buildQuery(vector, topK, filter = null))
         val hits = results.map { p -> toHit(p) }
         Log.i(TAG, "search: topK=$topK returned=${hits.size} " +
             hits.take(3).joinToString { "%.3f \"%s\"".format(it.score, it.label.take(20)) })
         hits
+    }
+
+    /**
+     * Build the kNN query. Brute-force / HNSW modes: a plain Nearest (quantizationConfig=null →
+     * full-precision scan/graph). BINARY mode: Qdrant's oversampling + rescore — a [Prefetch] pulls
+     * [BINARY_OVERSAMPLE]×topK candidates over the 1-bit codes (`params.exact=false` = the fast
+     * quantized pass), then the OUTER query rescores just those candidates with the ORIGINAL f32
+     * vectors (`params.exact=true`). The Edge SDK exposes no rescore flag, so this prefetch pattern IS
+     * the rescore path — without it binary recall is ~0.4, with it it recovers toward exact.
+     */
+    private fun buildQuery(vector: FloatArray, topK: Int, filter: Filter?): QueryRequest {
+        val nearest = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(vector.toList()), using = FIELD))
+        return if (binary) QueryRequest(
+            limit = topK.toULong(), offset = null,
+            query = nearest,
+            prefetches = listOf(Prefetch(
+                limit = (topK.toLong() * BINARY_OVERSAMPLE).toULong(),
+                query = nearest,
+                prefetches = emptyList(), filter = filter, scoreThreshold = null,
+                params = SearchParams(exact = false),
+            )),
+            withVector = null, withPayload = WithPayload.Bool(true),
+            // filter already applied in the prefetch that produced the candidate set to rescore.
+            filter = null, scoreThreshold = null, params = SearchParams(exact = true),
+        ) else QueryRequest(
+            limit = topK.toULong(), offset = null,
+            query = nearest,
+            prefetches = emptyList(),
+            withVector = null, withPayload = WithPayload.Bool(true),
+            filter = filter, scoreThreshold = null, params = null,
+        )
     }
 
     override fun searchFiltered(
@@ -171,13 +222,7 @@ class QdrantEdgeStore(
             ))),
             should = null, mustNot = null,
         )
-        val results = shard.query(QueryRequest(
-            limit = topK.toULong(), offset = null,
-            query = ScoringQuery.Vector(Query.Nearest(vector = NamedVector.Dense(vector.toList()), using = FIELD)),
-            prefetches = emptyList(),
-            withVector = null, withPayload = WithPayload.Bool(true),
-            filter = filter, scoreThreshold = null, params = null
-        ))
+        val results = shard.query(buildQuery(vector, topK, filter))
         val hits = results.map { p -> toHit(p) }
         Log.i(TAG, "searchFiltered: topK=$topK since=$sinceMs until=$untilMs returned=${hits.size}")
         hits
