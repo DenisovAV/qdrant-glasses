@@ -56,11 +56,18 @@ class GemmaQueryParser implements QueryParser {
   @override
   Future<ParsedQuery> parse(String nl, {DateTime? now}) async {
     final today = now ?? DateTime.now();
-    InferenceModelSession? session;
     try {
-      session = await _model.createSession(
+      // Tool-calling surfaces through the CHAT path: generateChatResponse()
+      // returns a structured ModelResponse — a FunctionCallResponse when the
+      // model calls a tool — whereas the low-level session.getResponse() only
+      // yields text. createChat(supportsFunctionCalls: true) is the documented
+      // way to get Gemma 4's native function-call.
+      final chat = await _model.createChat(
         temperature: 0,
         tools: const [_searchMemoryTool],
+        supportsFunctionCalls: true,
+        toolChoice: ToolChoice.auto,
+        modelType: ModelType.gemma4,
         maxOutputTokens: 256,
         systemInstruction:
             'Today is ${_isoDate(today)}. The user asks about their own visual '
@@ -68,11 +75,12 @@ class GemmaQueryParser implements QueryParser {
             'time range ("yesterday", "last week"), resolve it to absolute '
             'YYYY-MM-DD dates relative to today.',
       );
-      await session.addQueryChunk(Message.text(text: nl, isUser: true));
-      final text = await session.getResponse().timeout(_timeout);
-      final call = FunctionCallParser.parse(text, modelType: ModelType.gemma4);
+      await chat.addQuery(Message.text(text: nl, isUser: true));
+      final response = await chat.generateChatResponse().timeout(_timeout);
       final args =
-          (call != null && call.name == 'search_memory') ? call.args : null;
+          (response is FunctionCallResponse && response.name == 'search_memory')
+              ? response.args
+              : null;
       return parsedQueryFromToolArgs(args, rawText: nl);
     } catch (e) {
       developer.log(
@@ -81,8 +89,6 @@ class GemmaQueryParser implements QueryParser {
         level: 900,
       );
       return ParsedQuery(phrase: nl);
-    } finally {
-      await session?.close();
     }
   }
 
