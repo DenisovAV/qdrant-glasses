@@ -1,4 +1,96 @@
+import 'dart:developer' as developer;
+
+import 'package:flutter_gemma/flutter_gemma.dart';
+
 import 'parsed_query.dart';
+import 'query_parser.dart';
+
+/// The live [QueryParser]: Gemma 4 E2B function-calls a `search_memory` tool to
+/// turn a chat turn into a [ParsedQuery]. Long-lived [InferenceModel] (loaded
+/// once), short-lived session per turn (the `rag_demo` pattern). Fail-soft: any
+/// model error/timeout, or no tool-call, degrades to `ParsedQuery(phrase: nl)`
+/// so retrieval is never blocked. The pure [parsedQueryFromToolArgs] below does
+/// the args → [ParsedQuery] mapping (host-tested); this class only drives the model.
+class GemmaQueryParser implements QueryParser {
+  GemmaQueryParser(
+    this._model, {
+    Duration timeout = const Duration(seconds: 12),
+  }) : _timeout = timeout; // ignore: prefer_initializing_formals (public param name)
+
+  final InferenceModel _model;
+  final Duration _timeout;
+
+  /// The tool Gemma 4 is asked to call. Params are a JSON-schema object; `since`
+  /// / `until` are absolute ISO dates the model resolves from the system
+  /// instruction's "today", so [parsedQueryFromToolArgs] only ever parses absolutes.
+  static const _searchMemoryTool = Tool(
+    name: 'search_memory',
+    description:
+        "Search the wearer's visual memory for moments that match what they're "
+        'asking about. Always call this for a memory question.',
+    parameters: {
+      'type': 'object',
+      'properties': {
+        'phrase': {
+          'type': 'string',
+          'description':
+              'the visual thing to look for, cleaned, e.g. "red coffee mug"',
+        },
+        'since': {
+          'type': 'string',
+          'description': 'inclusive start date YYYY-MM-DD, or omit if no time range',
+        },
+        'until': {
+          'type': 'string',
+          'description': 'inclusive end date YYYY-MM-DD, or omit if no time range',
+        },
+        'label': {
+          'type': 'string',
+          'description': 'an exact object label to filter to, or omit',
+        },
+      },
+      'required': ['phrase'],
+    },
+  );
+
+  @override
+  Future<ParsedQuery> parse(String nl, {DateTime? now}) async {
+    final today = now ?? DateTime.now();
+    InferenceModelSession? session;
+    try {
+      session = await _model.createSession(
+        temperature: 0,
+        tools: const [_searchMemoryTool],
+        maxOutputTokens: 256,
+        systemInstruction:
+            'Today is ${_isoDate(today)}. The user asks about their own visual '
+            'memory. Call search_memory with a cleaned phrase; if they imply a '
+            'time range ("yesterday", "last week"), resolve it to absolute '
+            'YYYY-MM-DD dates relative to today.',
+      );
+      await session.addQueryChunk(Message.text(text: nl, isUser: true));
+      final text = await session.getResponse().timeout(_timeout);
+      final call = FunctionCallParser.parse(text, modelType: ModelType.gemma4);
+      final args =
+          (call != null && call.name == 'search_memory') ? call.args : null;
+      return parsedQueryFromToolArgs(args, rawText: nl);
+    } catch (e) {
+      developer.log(
+        'GemmaQueryParser: parse failed, using raw text unfiltered: $e',
+        name: 'fleet',
+        level: 900,
+      );
+      return ParsedQuery(phrase: nl);
+    } finally {
+      await session?.close();
+    }
+  }
+
+  static String _isoDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+}
 
 /// Maps a `search_memory` tool-call's [args] (what Gemma 4 emits when it
 /// function-calls) into a [ParsedQuery]. Pure + total: the live

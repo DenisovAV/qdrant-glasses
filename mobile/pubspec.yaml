@@ -53,6 +53,14 @@ dependencies:
   flutter_gemma_embeddings: any
   flutter_gemma_onnx: any
 
+  # Phase 3: Gemma 4 E2B for the agentic RAG chat — function-calling query
+  # parse (search_memory tool) + vision answer over the retrieved thumbnails.
+  # flutter_gemma is the core API; flutter_gemma_litertlm is the LiteRT-LM
+  # engine that runs the .litertlm model (its build hook downloads the native
+  # runtime per platform, incl. macos_arm64). Same PR-branch override below.
+  flutter_gemma: any
+  flutter_gemma_litertlm: any
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -87,6 +95,11 @@ dependency_overrides:
       url: https://github.com/DenisovAV/flutter_gemma.git
       ref: feat/siglip-text-embedding-profile
       path: packages/flutter_gemma_onnx
+  flutter_gemma_litertlm:
+    git:
+      url: https://github.com/DenisovAV/flutter_gemma.git
+      ref: feat/siglip-text-embedding-profile
+      path: packages/flutter_gemma_litertlm
   dart_sentencepiece_tokenizer:
     git:
       url: https://github.com/DenisovAV/dart_sentencepiece_tokenizer.git
