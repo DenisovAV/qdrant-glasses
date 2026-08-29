@@ -9,6 +9,7 @@ import io.qdrant.edge.EdgeShard
 import io.qdrant.edge.Point
 import io.qdrant.edge.UpdateOperation
 import io.qdrant.edge.VectorDataConfig
+import io.qdrant.edge.VectorStorageDatatype
 import io.qdrant.edge.Condition
 import io.qdrant.edge.FieldCondition
 import io.qdrant.edge.Filter
@@ -19,6 +20,7 @@ import io.qdrant.edge.BinaryQuantizationEncoding
 import io.qdrant.edge.BinaryQuantizationQueryEncoding
 import io.qdrant.edge.Memory
 import io.qdrant.edge.NamedVector
+import io.qdrant.edge.PayloadSchemaType
 import io.qdrant.edge.PointId
 import io.qdrant.edge.Prefetch
 import io.qdrant.edge.Query
@@ -61,6 +63,20 @@ class QdrantEdgeStore(
     // over the codes (Hamming), i.e. "binary brute-force" — the edge-scale winner we want to measure
     // in-table, not cite from a stale run. Independent of [hnsw]; our benchmark uses binary+brute-force.
     private val binary: Boolean = false,
+    // Vector STORAGE precision (independent of [binary]/[hnsw]). null = FLOAT32 (default, resident f32).
+    // FLOAT16 halves resident RAM, UINT8 quarters it — a memory↔precision lever sqlite-vec has no
+    // equivalent for. Measured against sqlite's streaming footprint for an honest on-device comparison.
+    private val storageDatatype: VectorStorageDatatype? = null,
+    // When true, call optimize() after the bulk load even in brute-force mode — compacts segments and
+    // TRUNCATES the WAL. Measures the WAL-compacted footprint: the uncompacted WAL (~= the full data
+    // size again) otherwise inflates on-disk + mmap'd RAM well beyond the actual vector working set.
+    private val compact: Boolean = false,
+    // When true, build an INTEGER payload index on `timestamp_ms` in [buildIndex] so searchFiltered
+    // prunes via the index instead of deserializing every point's payload during the brute-force scan.
+    // The un-indexed default is the fair-comparison bug: sqlite-vec's vec0 metadata column prunes on
+    // timestamp natively, so an un-indexed Qdrant filter measured ~46x slower — an artifact of a
+    // missing index, not the engine. This variant restores the apples-to-apples filtered comparison.
+    private val payloadIndex: Boolean = false,
 ) : VectorStore {
 
     companion object {
@@ -73,7 +89,14 @@ class QdrantEdgeStore(
         private const val BINARY_OVERSAMPLE = 32L
     }
 
-    override val name: String get() = when { binary -> "qdrant-binary"; hnsw -> "qdrant-hnsw"; else -> "qdrant-edge" }
+    override val name: String get() = when {
+        binary -> "qdrant-binary"
+        hnsw -> "qdrant-hnsw"
+        payloadIndex -> "qdrant-idx"
+        storageDatatype == VectorStorageDatatype.FLOAT16 -> "qdrant-f16"
+        storageDatatype == VectorStorageDatatype.UINT8 -> "qdrant-uint8"
+        else -> "qdrant-edge"
+    }
 
     // Kept as fields so deleteAll() can drop + recreate the shard on the same directory in-process
     // (no app relaunch): close the native handle, wipe the dir, reload from the same config.
@@ -94,13 +117,16 @@ class QdrantEdgeStore(
                     encoding = BinaryQuantizationEncoding.ONE_BIT,
                     queryEncoding = BinaryQuantizationQueryEncoding.BINARY,
                 )) else null,
-                multivectorConfig = null, datatype = null,
+                multivectorConfig = null, datatype = storageDatatype,
                 // HNSW mode: m/efConstruct are the Edge SDK's own bench defaults; fullScanThreshold
                 // 10000 means collections under that size still full-scan (HNSW only kicks in above).
                 hnswConfig = if (hnsw) HnswIndexConfig(
-                    // maxIndexingThreads = 0 → auto (use all cores). Was 1 (copied from the Edge SDK
-                    // bench example), which serialized the graph build on ONE of the AR1's 4 cores and
-                    // ~3–4×'d the build time — the real cause of the low HNSW ingest, not Qdrant itself.
+                    // maxIndexingThreads = 0 → auto (use all cores). MEASURED (2026-08-29, on-device):
+                    // auto really does load all 4 AR1 cores (~373% CPU during optimize), but the build is
+                    // STILL ~30min@100k (55 pts/s) — NOT several-fold faster than the old 1-thread number.
+                    // So thread count is NOT the bottleneck; on-device HNSW graph build is fundamentally
+                    // expensive on this SoC. Do NOT build HNSW on-device — brute-force + payload index is
+                    // the edge default; HNSW belongs in the cloud, shipped to the edge as a snapshot.
                     m = 16uL, efConstruct = 100uL, fullScanThreshold = 10000uL,
                     // 0.8: HnswIndexConfig dropped the boolean `onDisk` for a richer `memory: Memory?`
                     // (default null = the old in-memory behavior `onDisk = false` gave us).
@@ -208,8 +234,9 @@ class QdrantEdgeStore(
     ): List<ObjectHit> = synchronized(lock) {
         // Filter DURING the scan (a post-filtered top-k could return < k): a payload range condition
         // on timestamp_ms. Both bounds optional (null = open end). No bound → no filter at all.
-        // Caveat: the shard has NO payload index on timestamp_ms, so this is a
-        // filter-during-brute-force-scan, not an indexed filter — the measured cost reflects that.
+        // Cost depends on the index: with payloadIndex=true (see buildIndex) an INTEGER index on
+        // timestamp_ms prunes the candidate set first; without it, the filter is evaluated per point
+        // during the brute-force scan (much slower — the un-indexed artifact this variant fixes).
         val filter = if (sinceMs == null && untilMs == null) null else Filter(
             must = listOf(Condition.Field(FieldCondition(
                 key = "timestamp_ms",
@@ -288,12 +315,22 @@ class QdrantEdgeStore(
 
     override fun buildIndex() {
         // HNSW mode only: build the graph over everything inserted (a single native pass, NOT
-        // interruptible). The ~5.5min@100k / ~1h46m@1M figures from the edge-scale bench were
-        // measured under the OLD maxIndexingThreads=1 config; this store now passes 0 (auto, see
-        // above), which should cut the build time several-fold — NOT yet re-measured on this branch,
-        // so treat those numbers as stale/an upper bound, not current fact. Brute-force mode: no
-        // index → no-op.
-        if (hnsw) synchronized(lock) { shard.optimize() }
+        // interruptible). MEASURED on-device (2026-08-29, auto-thread, all 4 AR1 cores): ~30min@100k
+        // at 55 pts/s — super-linear, so 500k+ runs into hours. Prohibitive on-device (and the auto
+        // threads did NOT rescue it; see the maxIndexingThreads note above). Brute-force mode: no
+        // vector index → no optimize(). payloadIndex mode still builds the timestamp_ms index below.
+        synchronized(lock) {
+            if (payloadIndex) {
+                // INTEGER index on timestamp_ms, built once over everything just loaded. A payload
+                // index is an update op (not part of EdgeConfig), so it must be created here — a
+                // deleteAll() recreates the shard from config and would drop an init-time index.
+                shard.update(UpdateOperation.createFieldIndex(
+                    fieldName = "timestamp_ms", schema = PayloadSchemaType.INTEGER,
+                ))
+                shard.flush()
+            }
+            if (hnsw || compact) shard.optimize()
+        }
     }
 
     override fun close() = synchronized(lock) {

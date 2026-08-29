@@ -108,7 +108,7 @@ class ComparisonBenchmarkTest {
     @Test fun benchmark_one() {
         val args = InstrumentationRegistry.getArguments()
         val engine = args.getString("engine")
-            ?: error("pass -e engine <qdrant-edge|qdrant-binary|qdrant-hnsw|sqlite-vec|sqlite-binary|chroma|objectbox>")
+            ?: error("pass -e engine <qdrant-edge|qdrant-idx|qdrant-binary|qdrant-hnsw|sqlite-vec|sqlite-binary|chroma|objectbox>")
         val max = args.getString("maxScale")?.toLongOrNull() ?: 10_000L
         val wl = if (args.getString("workload").equals("random", ignoreCase = true))
             VectorStoreBenchmark.Workload.RANDOM else VectorStoreBenchmark.Workload.CLUSTERED
@@ -117,6 +117,11 @@ class ComparisonBenchmarkTest {
         val dim = 512
         val summaries = when (engine) {
             "qdrant-edge"   -> bench.benchmark("qdrant-edge", max, "oneqe", wl) { ns -> QdrantEdgeStore(ctx, dim, ns) }
+            "qdrant-f16"    -> bench.benchmark("qdrant-f16", max, "oneqf16", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, storageDatatype = io.qdrant.edge.VectorStorageDatatype.FLOAT16) }
+            "qdrant-uint8"  -> bench.benchmark("qdrant-uint8", max, "onequ8", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, storageDatatype = io.qdrant.edge.VectorStorageDatatype.UINT8) }
+            "qdrant-opt"    -> bench.benchmark("qdrant-opt", max, "oneqopt", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, compact = true) }
+            "qdrant-idx"    -> bench.benchmark("qdrant-idx", max, "oneqidx", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, payloadIndex = true) }
+            "qdrant-f16-opt" -> bench.benchmark("qdrant-f16-opt", max, "oneqf16o", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, storageDatatype = io.qdrant.edge.VectorStorageDatatype.FLOAT16, compact = true) }
             "qdrant-binary" -> bench.benchmark("qdrant-binary", max, "oneqb", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, binary = true) }
             "qdrant-hnsw"   -> bench.benchmark("qdrant-hnsw", max, "oneqh", wl) { ns -> QdrantEdgeStore(ctx, dim, ns, hnsw = true) }
             "sqlite-vec"    -> bench.benchmark("sqlite-vec", max, "onesv", wl) { ns -> SqliteVecStore(ctx, dim, ns) }
