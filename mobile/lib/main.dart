@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -10,6 +11,8 @@ import 'data/fleet_http.dart';
 import 'data/fleet_pull.dart';
 import 'data/memory_repository.dart';
 import 'data/pull_result.dart';
+import 'embed/gemma_embeddings_siglip_text.dart';
+import 'embed/siglip_text.dart';
 import 'ui/chat_screen.dart';
 
 void main() {
@@ -78,7 +81,14 @@ class AppRoot extends StatefulWidget {
 
 class _AppRootState extends State<AppRoot> {
   final EdgeClient _edgeClient = EdgeClient();
-  late final MemoryRepository _repository = MemoryRepository(edgeClient: _edgeClient);
+  // Built once the startup pull resolves (in _pullOnStart's finally): the
+  // embedder load is async + filesystem-dependent, so the repository can only
+  // be assembled after we know whether a real SigLIP embedder came up (→
+  // semantic search) or not (→ pure-time). Null only during the initial
+  // spinner, before _ready.
+  MemoryRepository? _repository;
+  // Held for dispose(): the ONNX session must be released like the shard.
+  GemmaEmbeddingsSiglipText? _embedder;
   bool _ready = false;
   bool _bannerDismissed = false;
   PullResult? _pullResult;
@@ -98,10 +108,13 @@ class _AppRootState extends State<AppRoot> {
     // close() is async; fire-and-forget is correct in a synchronous
     // dispose() (there is no "after" to await into once the widget is gone).
     unawaited(_edgeClient.close());
+    // The SigLIP ONNX session is the same kind of native resource — release it.
+    unawaited(_embedder?.close());
     super.dispose();
   }
 
   Future<void> _pullOnStart() async {
+    SiglipText? embedder;
     try {
       final PullResult result;
       final override = widget.pullOverride;
@@ -109,6 +122,10 @@ class _AppRootState extends State<AppRoot> {
         result = await override(_edgeClient);
       } else {
         final appDir = await getApplicationSupportDirectory();
+        // Bring up the semantic embedder BEFORE the pull so the chat is fully
+        // ready when _ready flips. Fail-soft: a missing model or a load error
+        // leaves `embedder` null and the repository on the pure-time path.
+        embedder = await _loadEmbedder(appDir.path);
         result = await runFleetPull(edgeClient: _edgeClient, workDir: appDir.path);
       }
       if (mounted) setState(() => _pullResult = result);
@@ -127,7 +144,53 @@ class _AppRootState extends State<AppRoot> {
       // corpus isn't loaded, here's why" is the right message either way).
       if (mounted) setState(() => _pullResult = PullUnreachable('$e'));
     } finally {
-      if (mounted) setState(() => _ready = true);
+      // Assemble the repository now that we know the embedder outcome. A null
+      // embedder (no model, load failure, or the pullOverride test path) keeps
+      // search on the pure-time branch — same behaviour as before Phase 2.
+      if (mounted) {
+        setState(() {
+          _repository = MemoryRepository(edgeClient: _edgeClient, embedder: embedder);
+          _ready = true;
+        });
+      }
+    }
+  }
+
+  /// Bring up the real SigLIP-text embedder from app storage, fail-soft.
+  /// Returns null (→ the repository's pure-time path) when the model isn't
+  /// present or won't load — the phone still browses/time-filters, it just
+  /// can't rank semantically. The 270 MB `siglip-text-int8.onnx` + its
+  /// tokenizer live under `<appSupport>/models/` (first-run-download in
+  /// production; `adb push`ed there for dev — see the mobile-fleet-node plan).
+  Future<SiglipText?> _loadEmbedder(String appDir) async {
+    final modelPath = '$appDir/models/siglip-text-int8.onnx';
+    final tokenizerPath = '$appDir/models/siglip-tokenizer.json';
+    if (!File(modelPath).existsSync() || !File(tokenizerPath).existsSync()) {
+      developer.log(
+        'AppRoot: SigLIP model not found at $modelPath — semantic search off, '
+        'pure-time only',
+        name: 'fleet',
+        level: 900,
+      );
+      return null;
+    }
+    try {
+      final embedder = GemmaEmbeddingsSiglipText(
+        modelPath: modelPath,
+        tokenizerPath: tokenizerPath,
+      );
+      await embedder.load();
+      _embedder = embedder;
+      developer.log('AppRoot: SigLIP embedder loaded — semantic search on',
+          name: 'fleet');
+      return embedder;
+    } catch (e) {
+      developer.log(
+        'AppRoot: SigLIP embedder failed to load, falling back to pure-time: $e',
+        name: 'fleet',
+        level: 900,
+      );
+      return null;
     }
   }
 
@@ -146,7 +209,8 @@ class _AppRootState extends State<AppRoot> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready) {
+    final repository = _repository;
+    if (!_ready || repository == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     final message = _bannerMessage;
@@ -164,7 +228,7 @@ class _AppRootState extends State<AppRoot> {
               ),
             ],
           ),
-        Expanded(child: ChatScreen(repository: _repository)),
+        Expanded(child: ChatScreen(repository: repository)),
       ],
     );
   }
