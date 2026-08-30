@@ -41,7 +41,7 @@ class SqliteVecStore(
     companion object {
         private const val TAG = "SqliteVecStore"
         private const val TABLE = "vec_items"
-        private const val BINARY_OVERSAMPLE = 16L   // match QdrantEdgeStore's binary oversampling
+        private const val BINARY_OVERSAMPLE = 32L   // MUST equal QdrantEdgeStore.BINARY_OVERSAMPLE for a like-for-like binary comparison (same candidate count reranked)
     }
 
     override val name: String = if (binary) "sqlite-binary" else "sqlite-vec"

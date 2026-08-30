@@ -14,13 +14,14 @@ import io.qdrant.edge.Condition
 import io.qdrant.edge.FieldCondition
 import io.qdrant.edge.Filter
 import io.qdrant.edge.HnswIndexConfig
+import io.qdrant.edge.IntegerIndexParams
+import io.qdrant.edge.PayloadIndexParams
 import io.qdrant.edge.QuantizationConfig
 import io.qdrant.edge.BinaryQuantizationParams
 import io.qdrant.edge.BinaryQuantizationEncoding
 import io.qdrant.edge.BinaryQuantizationQueryEncoding
 import io.qdrant.edge.Memory
 import io.qdrant.edge.NamedVector
-import io.qdrant.edge.PayloadSchemaType
 import io.qdrant.edge.PointId
 import io.qdrant.edge.Prefetch
 import io.qdrant.edge.Query
@@ -71,8 +72,12 @@ class QdrantEdgeStore(
     // TRUNCATES the WAL. Measures the WAL-compacted footprint: the uncompacted WAL (~= the full data
     // size again) otherwise inflates on-disk + mmap'd RAM well beyond the actual vector working set.
     private val compact: Boolean = false,
-    // When true, build an INTEGER payload index on `timestamp_ms` in [buildIndex] so searchFiltered
-    // prunes via the index instead of deserializing every point's payload during the brute-force scan.
+    // When true, build a RANGE-enabled INTEGER payload index on `timestamp_ms` in [buildIndex] so
+    // searchFiltered prunes via the index instead of deserializing every point's payload during the
+    // brute-force scan. The index MUST be range-enabled (`IntegerIndexParams(range = true)`): the
+    // DEFAULT integer index is LOOKUP-ONLY and does NOT accelerate a range/`gte..lte` condition — the
+    // exact form searchFiltered issues — so a lookup-only index would silently reproduce the very
+    // artifact this variant exists to remove (mirrors the product store's QdrantEdgeMomentStore).
     // The un-indexed default is the fair-comparison bug: sqlite-vec's vec0 metadata column prunes on
     // timestamp natively, so an un-indexed Qdrant filter measured ~46x slower — an artifact of a
     // missing index, not the engine. This variant restores the apples-to-apples filtered comparison.
@@ -321,11 +326,13 @@ class QdrantEdgeStore(
         // vector index → no optimize(). payloadIndex mode still builds the timestamp_ms index below.
         synchronized(lock) {
             if (payloadIndex) {
-                // INTEGER index on timestamp_ms, built once over everything just loaded. A payload
+                // RANGE-enabled INTEGER index on timestamp_ms, built once over everything just loaded.
+                // range = true is REQUIRED: searchFiltered issues a gte..lte RangeFloat condition, and
+                // the default lookup-only integer index does NOT prune a range predicate. A payload
                 // index is an update op (not part of EdgeConfig), so it must be created here — a
                 // deleteAll() recreates the shard from config and would drop an init-time index.
-                shard.update(UpdateOperation.createFieldIndex(
-                    fieldName = "timestamp_ms", schema = PayloadSchemaType.INTEGER,
+                shard.update(UpdateOperation.createFieldIndexWithParams(
+                    "timestamp_ms", PayloadIndexParams.Integer(IntegerIndexParams(range = true)),
                 ))
                 shard.flush()
             }

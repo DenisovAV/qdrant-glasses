@@ -266,13 +266,26 @@ class VectorStoreBenchmark(private val context: Context) {
             // ---- search-filtered (time window covering the last FILTER_WINDOW points) ----
             val untilMs = TS_BASE + n
             val sinceMs = TS_BASE + maxOf(0L, n - FILTER_WINDOW)
-            val filteredReturned = store.searchFiltered(queries[0], TOPK, sinceMs, untilMs).size
+            val filteredHits = store.searchFiltered(queries[0], TOPK, sinceMs, untilMs)
             // Unlike the unfiltered search above, < topK is EXPECTED here (the window can legitimately
             // hold fewer than topK points) — only zero is suspect: the window always covers at least
             // one point once n > 0, so an empty result means the filter (or the index under it) is broken.
-            if (filteredReturned == 0) {
+            if (filteredHits.isEmpty()) {
                 val msg = "searchFiltered returned 0 results for window [sinceMs=$sinceMs, " +
                     "untilMs=$untilMs] on a non-empty store (n=$n) — suspect (filter or index bug)"
+                Log.e(TAG, "scale=$n INTEGRITY FAIL: $msg")
+                return ScaleResult.failed(n, msg, storedCount = storedCount)
+            }
+            // A nonzero count is NOT enough: an engine that silently IGNORES the range predicate (or
+            // whose index doesn't prune it) returns ordinary top-k — some of it out of window — and
+            // would still pass the count gate, publishing an artificially fast "filtered" latency for
+            // a search that never actually filtered. So assert every returned hit's timestamp really
+            // lies within [sinceMs, untilMs]; any out-of-window hit means the filter didn't apply.
+            val escaped = filteredHits.firstOrNull { it.timestampMs < sinceMs || it.timestampMs > untilMs }
+            if (escaped != null) {
+                val msg = "searchFiltered returned an OUT-OF-WINDOW hit (timestampMs=${escaped.timestampMs} " +
+                    "∉ [$sinceMs, $untilMs], n=$n) — the range filter did not apply, so its latency is " +
+                    "not a real filtered search (filter ignored or index not range-capable)"
                 Log.e(TAG, "scale=$n INTEGRITY FAIL: $msg")
                 return ScaleResult.failed(n, msg, storedCount = storedCount)
             }
@@ -325,7 +338,7 @@ class VectorStoreBenchmark(private val context: Context) {
                 search = Stats.of(searchMs),
                 recallAtK = recall,
                 filtered = Stats.of(filteredMs),
-                filteredReturned = filteredReturned,
+                filteredReturned = filteredHits.size,
                 deleteMs = deleteMs,
                 coldLoadMs = coldMs,
                 storedCount = storedCount,

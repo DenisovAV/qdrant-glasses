@@ -75,11 +75,20 @@ class ChromaStore(context: Context, dim: Int, namespace: String) : VectorStore {
 
     /** create-then-get: [Collection] creation throws if the name is already persisted on disk
      *  (a REOPEN of an existing store, e.g. the benchmark's cold-load step) — there is no
-     *  "create if absent" call in this beta API. */
+     *  "create if absent" call in this beta API. The catch is deliberately broad because the beta
+     *  API doesn't type an "already exists" exception, but a create failure is NOT assumed benign:
+     *  it's logged, and if the get ALSO fails the ORIGINAL create error is chained in — so a real
+     *  JNI/storage fault surfaces instead of being masked as a routine reopen. */
     private fun openOrCreateCollection(): Collection = try {
         client.createCollection(COLLECTION)
-    } catch (t: Throwable) {
-        client.getCollection(COLLECTION)
+    } catch (createEx: Throwable) {
+        Log.w(TAG, "createCollection($COLLECTION) failed; assuming reopen, trying getCollection", createEx)
+        try {
+            client.getCollection(COLLECTION)
+        } catch (getEx: Throwable) {
+            getEx.addSuppressed(createEx)
+            throw IllegalStateException("Chroma collection $COLLECTION could not be created or opened", getEx)
+        }
     }
 
     override fun upsert(vector: FloatArray, payload: ObjectPayload): String =
