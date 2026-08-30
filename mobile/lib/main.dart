@@ -97,6 +97,11 @@ class _AppRootState extends State<AppRoot> {
   // Held for dispose(): both native sessions must be released like the shard.
   GemmaEmbeddingsSiglipText? _embedder;
   InferenceModel? _gemma;
+  // Set the instant dispose() runs. The model loads are async and can finish
+  // AFTER a dispose during startup — dispose() only closes what exists at that
+  // instant, so each loader re-checks this after its load and closes the just-
+  // loaded native resource itself if the widget is already gone (Codex #2).
+  bool _disposed = false;
   bool _ready = false;
   bool _bannerDismissed = false;
   PullResult? _pullResult;
@@ -109,6 +114,7 @@ class _AppRootState extends State<AppRoot> {
 
   @override
   void dispose() {
+    _disposed = true;
     // Fix I (architect + codex): EdgeClient.close() releases the native
     // shard's WAL lock — the AAR's GC finalizer only frees the Dart-side
     // pointer, never calls the native unload() (see EdgeClient.close's own
@@ -156,12 +162,18 @@ class _AppRootState extends State<AppRoot> {
       // corpus isn't loaded, here's why" is the right message either way).
       if (mounted) setState(() => _pullResult = PullUnreachable('$e'));
     } finally {
-      // Assemble the agent now that we know which models came up. A null
-      // embedder keeps search on the pure-time branch; a null Gemma (no model,
-      // load failure, or the pullOverride test path) uses FakeQueryParser (raw
-      // phrase, no LLM filter) + StubAnswerer (no conversational answer) — the
-      // node still parses/retrieves and shows cards, just degraded.
-      if (mounted) {
+      if (_disposed) {
+        // Disposed mid-startup: the fleet pull may have loaded a shard into
+        // _edgeClient AFTER dispose()'s close() already ran. Close it here
+        // (idempotent) so the WAL lock never leaks. The embedder/Gemma are
+        // handled by their loaders' own _disposed guards above.
+        unawaited(_edgeClient.close());
+      } else if (mounted) {
+        // Assemble the agent now that we know which models came up. A null
+        // embedder keeps search on the pure-time branch; a null Gemma (no model,
+        // load failure, or the pullOverride test path) uses FakeQueryParser (raw
+        // phrase, no LLM filter) + StubAnswerer (no conversational answer) — the
+        // node still parses/retrieves and shows cards, just degraded.
         final gemma = _gemma;
         final repository =
             MemoryRepository(edgeClient: _edgeClient, embedder: embedder);
@@ -207,6 +219,10 @@ class _AppRootState extends State<AppRoot> {
         maxTokens: 4096,
         supportImage: true,
       );
+      if (_disposed) {
+        await model.close(); // disposed mid-load — release, don't retain.
+        return null;
+      }
       _gemma = model;
       developer.log('AppRoot: Gemma 4 loaded — agentic RAG on', name: 'fleet');
       return model;
@@ -244,6 +260,10 @@ class _AppRootState extends State<AppRoot> {
         tokenizerPath: tokenizerPath,
       );
       await embedder.load();
+      if (_disposed) {
+        await embedder.close(); // disposed mid-load — release, don't retain.
+        return null;
+      }
       _embedder = embedder;
       developer.log('AppRoot: SigLIP embedder loaded — semantic search on',
           name: 'fleet');

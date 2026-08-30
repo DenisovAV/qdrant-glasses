@@ -56,13 +56,16 @@ class GemmaQueryParser implements QueryParser {
   @override
   Future<ParsedQuery> parse(String nl, {DateTime? now}) async {
     final today = now ?? DateTime.now();
+    // Tool-calling surfaces through the CHAT path: generateChatResponse()
+    // returns a structured ModelResponse — a FunctionCallResponse when the
+    // model calls a tool — whereas the low-level session.getResponse() only
+    // yields text. createChat(supportsFunctionCalls: true) is the documented
+    // way to get Gemma 4's native function-call. The chat owns a native session
+    // that MUST be closed on every path (a leak-per-turn otherwise) — hence the
+    // finally, mirroring GemmaAnswerer's session close.
+    InferenceChat? chat;
     try {
-      // Tool-calling surfaces through the CHAT path: generateChatResponse()
-      // returns a structured ModelResponse — a FunctionCallResponse when the
-      // model calls a tool — whereas the low-level session.getResponse() only
-      // yields text. createChat(supportsFunctionCalls: true) is the documented
-      // way to get Gemma 4's native function-call.
-      final chat = await _model.createChat(
+      chat = await _model.createChat(
         temperature: 0,
         tools: const [_searchMemoryTool],
         supportsFunctionCalls: true,
@@ -89,6 +92,8 @@ class GemmaQueryParser implements QueryParser {
         level: 900,
       );
       return ParsedQuery(phrase: nl);
+    } finally {
+      await chat?.close();
     }
   }
 
