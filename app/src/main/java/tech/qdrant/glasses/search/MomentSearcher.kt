@@ -5,6 +5,7 @@ import tech.qdrant.glasses.Config
 import tech.qdrant.glasses.embedding.BgeTextEncoder
 import tech.qdrant.glasses.embedding.CropEncoder
 import tech.qdrant.glasses.embedding.CropEncoderFactory
+import tech.qdrant.glasses.fleet.FleetSource
 import tech.qdrant.glasses.storage.MemoryFrame
 import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentStore
@@ -47,6 +48,13 @@ class MomentSearcher(
     // different encoder instance would still work (it's a fixed pretrained model, not fine-tuned
     // per-session) but there is exactly one instance in the app either way (GlassesComponents.bgeEncoder).
     private val bgeEncoder: BgeTextEncoder? = null,
+    // Fleet-sync Task 5 (Spec §3/§5): the pulled fleet corpus, behind the FleetSource seam so this
+    // class stays testable in a plain JVM/Robolectric test (no native EdgeShard) — see FleetSource's
+    // KDoc. Null (the default, same nullable-optional-feature contract as bgeEncoder above) means
+    // "no fleet configured" and the merge step below is a no-op, byte-for-byte today's local-only
+    // search — GlassesComponents only passes non-null when Config.FLEET_URL is set AND a pull
+    // succeeded (Task 6).
+    private val fleet: FleetSource? = null,
 ) {
     companion object {
         private const val TAG = "GlassesVM"
@@ -199,6 +207,34 @@ class MomentSearcher(
         Log.i(TAG, "onVoiceResult(moments): encode=${encMs}ms search=${searchMs}ms " +
             "hits=${hits.size}/${allHits.size} gate=$gate tagAccepted=${tagAcceptedIds.size} " +
             "ocrAccepted=${ocrAcceptedIds.size} top=${allHits.firstOrNull()?.score}")
+        // Fleet-sync Task 5 (Spec §3/§5): query the SAME qvec/window against the pulled fleet corpus
+        // (already tagged source="fleet" by FleetShardStore), gate it with the SAME per-backend gate
+        // local hits just cleared, then dedup by id keeping the LOCAL copy on a collision ("local
+        // wins", Spec §5's two-shard merge) — see `merged` below for how that content-precedence is
+        // kept separate from ranking. Double-gated on BOTH `Config.FLEET_URL.isNotBlank()` AND
+        // `fleet != null` per the plan's documented offline/config gate (Spec §7): GlassesComponents
+        // (Task 6) only ever constructs/passes a non-null `fleet` when the URL is set and a pull
+        // succeeded, so in production the two conditions move together — but re-checking the sysprop
+        // here is still the belt to `fleet != null`'s suspenders (defense in depth against a future
+        // caller wiring `fleet` while the sysprop is unset/cleared at runtime), and it costs nothing:
+        // a test that injects `fleet` directly (MomentSearcherFleetTest) just also has to flip the
+        // sysprop, same as any other Config-gated behavior. Wrapped like every other fleet op (Spec
+        // §7): a runtime failure (unreachable server, native shard error) falls back to local-only,
+        // never fails the voice query.
+        val fleetHits = if (Config.FLEET_URL.isNotBlank() && fleet != null)
+            try { fleet.searchFrames(qvec, fetchK, pq.window?.sinceMs, pq.window?.untilMs).filter { it.score >= gate } }
+            catch (e: Throwable) { Log.w(TAG, "fleet search failed (non-fatal): ${e.message}"); emptyList() }
+        else emptyList()
+        // Dedup by id keeping the FIRST occurrence — hits is concatenated before fleetHits, so a
+        // local hit always wins its own id over a fleet duplicate (content AND score: the surviving
+        // entry is the local one, not whichever scored higher) — but that precedence must NOT also
+        // decide ranking position for non-duplicate ids, or a handful of low-scoring local hits can
+        // crowd a genuinely higher-scoring fleet hit out of the top-5 truncation below purely because
+        // "local" was listed first. So re-sort the deduped union by score before any truncation —
+        // this is a no-op for the recall-intent/recency branches below (both re-sort `merged` again
+        // by their own criteria) and is what actually matters for the plain `else` branch, which
+        // trims `merged` AS-IS with no further sort.
+        val merged = (hits + fleetHits).distinctBy { it.id }.sortedByDescending { it.score }
         // "Where did I leave/put X" wants the MOST RECENT moment, not the best cosine match — same
         // pragmatic widen-then-sort-then-trim as ObjectSearcher (see its KDoc for the caveat).
         // All branches keep the established top-5 contract:
@@ -208,10 +244,14 @@ class MomentSearcher(
         //   • otherwise → the raw score order (inherited from allHits above), trimmed to the top-5 cap
         //     (a two-channel fetchK=5+5 can otherwise surface ~10 distinct moments after fuseAndCollapse).
         val ordered = when {
-            pq.recallIntent -> hits.sortedByDescending { it.timestampMs }.take(5)
-            Config.RECENCY_TAU_MS > 0L -> recencyRank(hits, nowMs, Config.RECENCY_TAU_MS).take(5)
-            else -> hits.take(5)
+            pq.recallIntent -> merged.sortedByDescending { it.timestampMs }.take(5)
+            Config.RECENCY_TAU_MS > 0L -> recencyRank(merged, nowMs, Config.RECENCY_TAU_MS).take(5)
+            else -> merged.take(5)
         }
+        // Fleet-sync (Spec §5): result provenance — each shown card's source (local|fleet), score, label.
+        // The on-device signal that a pulled fleet corpus actually surfaced in the merged top-5.
+        Log.i(TAG, "results(${ordered.size}): " +
+            ordered.joinToString { "${it.source}[${"%.3f".format(it.score)}]${it.label}" })
         val resultItems = ordered.map { h ->
             val key = java.io.File(h.thumbPath).nameWithoutExtension
             hud.registerThumb(key, h.thumbPath)

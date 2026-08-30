@@ -23,6 +23,7 @@ import io.qdrant.edge.PointId
 import io.qdrant.edge.Query
 import io.qdrant.edge.QueryRequest
 import io.qdrant.edge.RangeFloat
+import io.qdrant.edge.Record
 import io.qdrant.edge.ScoredPoint
 import io.qdrant.edge.ScoringQuery
 import io.qdrant.edge.ScrollRequest
@@ -30,8 +31,106 @@ import io.qdrant.edge.ValueVariants
 import io.qdrant.edge.Vector
 import io.qdrant.edge.WithPayload
 import io.qdrant.edge.WithVector
+import org.json.JSONObject
+import tech.qdrant.glasses.fleet.FleetPoint
 import java.io.File
 import java.util.UUID
+
+/**
+ * Pure `Record` -> [FleetPoint] mapping behind [QdrantEdgeMomentStore.scrollUnsyncedFrames] (Spec
+ * §5/§6) — factored to file scope, not a private class member, so it's unit-testable (see
+ * `QdrantEdgeMomentStoreFleetMappingTest`) without a live native `EdgeShard`: every step here is
+ * plain JSON/string parsing over [Record]'s own already-pure-Kotlin fields, no native call involved.
+ * `internal`, not `private`: visible to the test above, not part of this module's public API.
+ *
+ * Three independent reasons a [rec] is skipped (returns null) rather than turned into a degraded
+ * [FleetPoint] — every one of them, patched over with a placeholder instead, would let a
+ * "successful" upsert flip the point's local `synced` flag despite its real data never reaching the
+ * fleet hub (Spec §5/§6's crash-safe invariant is confirmed-implies-UPLOADED, not
+ * confirmed-implies-something-uploaded — [FleetQdrantClient.upsertPoints] enforces the exact same
+ * thing on the send side; this is its read-side mirror):
+ *  1. no [PointId.Uuid] id (this store only ever writes UUID ids on frame points — defensive, not
+ *     expected in practice).
+ *  2. no parseable `clip` vector (ditto).
+ *  3. **null or unparseable payload** (review fix: [stripSyncedPayload] used to coerce a null or
+ *     malformed payload into `"{}"` — syntactically valid JSON, so the send-side guard in
+ *     [FleetQdrantClient.upsertPoints] couldn't catch it; it just isn't the point's real
+ *     [MomentPayload]). Skipping here instead means the point stays `synced=false` and is retried
+ *     next idle pass — no data loss, just a delay, exactly like case 1 and 2 already behaved.
+ */
+internal fun recordToFleetPoint(rec: Record, clipField: String, tag: String): FleetPoint? {
+    val id = (rec.id as? PointId.Uuid)?.value
+    if (id == null) {
+        Log.w(tag, "scrollUnsyncedFrames: skipping a point with no PointId.Uuid (unexpected — this store only writes UUID ids)")
+        return null
+    }
+    val vec = parseClipVectorJson(rec.vector, clipField)
+    if (vec == null) {
+        // Include a truncated raw string: the shape here is FFI-serialization-dependent (see
+        // parseClipVectorJson) and doc-rot-prone, so a future re-break is diagnosable from the log
+        // alone instead of costing another device round trip.
+        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, missing/unparseable '$clipField' vector (raw=${rec.vector?.take(80)})")
+        return null
+    }
+    val payload = stripSyncedPayload(rec.payload)
+    if (payload == null) {
+        Log.w(tag, "scrollUnsyncedFrames: skipping id=$id, null/unparseable payload (staying synced=false for retry)")
+        return null
+    }
+    return FleetPoint(id = id, vector = vec, payload = payload)
+}
+
+/**
+ * Extracts the `clip` dense vector from a scrolled [Record]'s `vector` JSON string.
+ *
+ * **On-device shape (verified against the Rust FFI, NOT the old `{"clip":[...]}` guess):** the FFI's
+ * `vector_struct_internal_to_json` serializes a NAMED vector as `serde_json::to_string` of a
+ * `HashMap<String, VectorInternal>`, and `VectorInternal` derives a PLAIN `Serialize` (no
+ * `#[serde(untagged)]`, no `rename_all`) — so its `Dense` variant is EXTERNALLY TAGGED. A frame
+ * point (always written via `Vector.Named(mapOf("clip" to NamedVector.Dense(..)))`) therefore reads
+ * back as `{"clip":{"Dense":[..]}}`, where the value under `clip` is an OBJECT, not an array. The
+ * earlier bare-array assumption only ever holds for a `Single`/default-named vector (the Rust
+ * `From<NamedVectors>` collapse needs `DEFAULT_VECTOR_NAME`), which this store never writes — so it
+ * silently skipped every frame on-device (`optJSONArray` → null), and no moment ever synced upstream.
+ *
+ * Accepts BOTH shapes defensively: the tagged `{"Dense":[..]}` object (real), or a bare array
+ * (future-proofing / a `Single` vector), so a later Edge-serialization change can't re-break this
+ * the same silent way.
+ */
+private fun parseClipVectorJson(vectorJson: String?, clipField: String): FloatArray? {
+    if (vectorJson == null) return null
+    return try {
+        val obj = JSONObject(vectorJson)
+        val arr = obj.optJSONArray(clipField)
+            ?: obj.optJSONObject(clipField)?.optJSONArray("Dense")
+            ?: return null
+        // A zero-length (dimensionless) vector must be SKIPPED, not turned into an empty FleetPoint:
+        // it can never be a real CLIP/SigLIP embed, and uploading it would fail the hub's dim check
+        // (throwing the whole batch) — the point stays synced=false and is retried, same fail-soft as
+        // the null-vector case. (review: caught as a would-be degraded upload.)
+        if (arr.length() == 0) return null
+        FloatArray(arr.length()) { i -> arr.getDouble(i).toFloat() }
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+/**
+ * Strips the LOCAL-only `synced` bookkeeping key (Spec §6) out of a stored payload before it travels
+ * to the fleet hub. Returns null — NEVER a placeholder — when [payloadJson] is null or fails to
+ * parse, so [recordToFleetPoint] can skip the record instead of silently upserting a degraded/empty
+ * payload as though it were the point's real data (review fix, see [recordToFleetPoint]'s KDoc case 3).
+ */
+internal fun stripSyncedPayload(payloadJson: String?): String? {
+    if (payloadJson == null) return null
+    val o = try {
+        JSONObject(payloadJson)
+    } catch (_: Throwable) {
+        return null
+    }
+    o.remove("synced")
+    return o.toString()
+}
 
 /**
  * Moment memory: one Qdrant Edge collection holding two point channels distinguished by
@@ -76,6 +175,22 @@ class QdrantEdgeMomentStore(
         // native scroll() round trips low at demo scale (low hundreds of frames) while capping how
         // much payload JSON is materialized per call.
         private const val SCROLL_PAGE_SIZE = 256UL
+        // scrollUnsyncedFrames bounds how many records it will page through past a "poison window"
+        // (unmappable records) before giving up this pass — keeps the store lock held for a bounded
+        // time even in the pathological all-poison case. Far above demo scale (low hundreds of frames),
+        // so the normal path (first page is all mappable) never approaches it.
+        //
+        // KNOWN LIMIT (deliberate PoC tradeoff, spec §1 "no production hardening"): a run of MORE than
+        // this many CONSECUTIVE unmappable records at the head of the scroll would stall healthy frames
+        // behind it — each pass restarts at offset=null and re-scans the same prefix. This is a genuine
+        // bound-vs-completeness tension: a hard lock-hold bound and unbounded poison traversal can't
+        // both hold in one lock-held call without persistent cursor state (which then delays
+        // newly-captured frames sorting before the cursor). Accepted because the trigger — >1000
+        // corrupted frames — is NOT producible by the validated store path (storeMoment requires a
+        // clipDim vector + writes valid JSON), and IF it ever happened the poison-only branch logs at
+        // ERROR every pass (loud, not silent). The product-path fix is to quarantine a poison record
+        // with a dedicated payload flag added to unsyncedFrameFilter's mustNot, so it stops matching.
+        private const val UNSYNCED_MAX_SCAN = 1000
     }
 
     // The `clip` named-vector's dim, promoted from the constructor param to a property so every
@@ -113,7 +228,7 @@ class QdrantEdgeMomentStore(
     init {
         shard = EdgeShard.load(dir, config)
         ensurePayloadIndexes()
-        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))} (payload indexes: timestamp_ms, type)")
+        Log.i(TAG, "moments shard opened, count=${shard.count(CountRequest(filter = null, exact = false))} (payload indexes: timestamp_ms, type, synced)")
     }
 
     /**
@@ -136,6 +251,10 @@ class QdrantEdgeMomentStore(
         }.onFailure { Log.d(TAG, "payload index 'timestamp_ms' not (re)created: ${it.message}") }
         runCatching { shard.update(UpdateOperation.createFieldIndex("type", PayloadSchemaType.KEYWORD)) }
             .onFailure { Log.d(TAG, "payload index 'type' not (re)created: ${it.message}") }
+        // Fleet-sync upstream flag (Spec §5/§6): accelerates scrollUnsyncedFrames's `synced != true`
+        // filter, same reasoning as the `type` KEYWORD index just above.
+        runCatching { shard.update(UpdateOperation.createFieldIndex("synced", PayloadSchemaType.BOOL)) }
+            .onFailure { Log.d(TAG, "payload index 'synced' not (re)created: ${it.message}") }
         shard.flush()
     }
 
@@ -295,6 +414,102 @@ class QdrantEdgeMomentStore(
     // second `Filter.must` list, same as [searchFrames]/[searchRegions] already do via [channelSearch].
     override fun frameCount(): Long = synchronized(lock) {
         shard.count(CountRequest(filter = typeAndTimeFilter(MomentType.FRAME, null, null), exact = true)).toLong()
+    }
+
+    /**
+     * The upload backlog for the fleet-sync flag-on-store design (Spec §5): up to [limit] `type=frame`
+     * points whose payload's `synced` is not `true` (`Filter.mustNot` on `synced == true`, so a point
+     * that never had the key set — pre-fleet-sync capture — matches too, same as the KDoc on
+     * [MomentStore.scrollUnsyncedFrames] promises). Unlike every other read here, vectors ARE
+     * requested (`withVector = WithVector.Bool(true)`) — the upload needs them.
+     *
+     * Per-record mapping is [recordToFleetPoint] (file-scope, unit-tested independently) — see its
+     * KDoc for the three skip cases (missing UUID id / unparseable vector / null-or-malformed
+     * payload). A skipped record is simply left out of this batch: nothing calls [markSynced] for an
+     * id that was never returned, so it stays `synced=false` and is retried next idle pass.
+     *
+     * **Pages PAST a poison window (review fix).** A single scroll from `offset=null` re-fetches the
+     * SAME leading page every pass; if the first [limit] unsynced frames all fail to map (corruption —
+     * the validated store can't create one, but the defensive skips exist because it *can* happen), the
+     * mapped batch is empty forever and healthy frames BEHIND them never sync — a silent head-of-line
+     * stall. So this advances the scroll cursor ([io.qdrant.edge.ScrollResponse.nextOffset]) past
+     * skipped records until it has [limit] mappable points, the scroll is exhausted, or
+     * [UNSYNCED_MAX_SCAN] records have been examined (bounds lock-hold time even if the whole unsynced
+     * set is poison). A poison-only window (records returned, none mappable) is logged at ERROR —
+     * distinct and loud, so a stuck backlog is observable instead of masquerading as "all caught up".
+     *
+     * Returns an empty list when [closed] (a teardown can free the native shard while this runs on the
+     * fleet lane — see [markSynced]); the fleet lane just treats it as "nothing to sync this pass".
+     */
+    override fun scrollUnsyncedFrames(limit: Int): List<FleetPoint> = synchronized(lock) {
+        if (closed) return@synchronized emptyList()
+        val out = ArrayList<FleetPoint>(limit)
+        var offset: PointId? = null
+        var examined = 0
+        var skipped = 0
+        while (out.size < limit && examined < UNSYNCED_MAX_SCAN) {
+            val resp = shard.scroll(ScrollRequest(
+                offset = offset, limit = (limit - out.size).toULong(),
+                filter = unsyncedFrameFilter(),
+                withPayload = WithPayload.Bool(true), withVector = WithVector.Bool(true),
+                orderBy = null,
+            ))
+            if (resp.records.isEmpty()) break
+            for (rec in resp.records) {
+                examined++
+                recordToFleetPoint(rec, CLIP_FIELD, TAG)?.let { out.add(it) } ?: skipped++
+            }
+            offset = resp.nextOffset ?: break   // null cursor => scroll exhausted
+        }
+        if (skipped > 0 && out.isEmpty()) {
+            Log.e(TAG, "scrollUnsyncedFrames: examined $examined record(s), ALL skipped as unmappable " +
+                "(poison window) — upstream STALLED with no valid frame to sync")
+        }
+        Log.i(TAG, "scrollUnsyncedFrames: limit=$limit examined=$examined skipped=$skipped returned=${out.size}")
+        out
+    }
+
+    // `type == frame` AND NOT (`synced == true`) — Filter.must/mustNot both AND into the overall
+    // filter (must = AND, mustNot = AND-of-NOT, standard Qdrant semantics), so this reads as
+    // "frame points whose synced flag is not true", including points with no `synced` key at all.
+    private fun unsyncedFrameFilter(): Filter = Filter(
+        must = listOf(Condition.Field(FieldCondition(
+            key = "type", match = Match.Value(ValueVariants.String(MomentType.FRAME)),
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+        ))),
+        should = null,
+        mustNot = listOf(Condition.Field(FieldCondition(
+            key = "synced", match = Match.Value(ValueVariants.Bool(true)),
+            range = null, geoBoundingBox = null, geoRadius = null, geoPolygon = null, valuesCount = null,
+        ))),
+    )
+
+    // Record -> FleetPoint mapping ([recordToFleetPoint], file-scope above the class) parses the
+    // Edge FFI's JSON-string `vector`/`payload` fields itself: `vector` comes back keyed by
+    // named-vector field with the value EXTERNALLY TAGGED — `{"clip":{"Dense":[...]}}`, NOT a bare
+    // array (see [parseClipVectorJson]'s KDoc for the FFI serde chain that produces this) — and
+    // `synced` is stripped from `payload` before it travels — LOCAL-only bookkeeping (Spec §6),
+    // never uploaded ([FleetPoint.payload]'s KDoc documents the caller doing exactly this).
+
+    /**
+     * Flips `synced=true` for exactly [ids] via a payload MERGE patch (`UpdateOperation.setPayload`,
+     * NOT `overwritePayload` — every other key on each point's payload is left untouched), called only
+     * after [tech.qdrant.glasses.fleet.FleetSync] has a CONFIRMED upsert of those points to the fleet
+     * hub (Spec §5's crash-safe invariant). A no-op for an empty [ids] — mirrors
+     * [tech.qdrant.glasses.fleet.FleetQdrantClient.upsertPoints]'s same empty-batch guard, so an idle
+     * pass that found nothing to sync touches neither the network nor the shard.
+     */
+    override fun markSynced(ids: List<String>): Unit = synchronized(lock) {
+        // A native call on a closed shard is a SIGSEGV, not a catchable exception (see the `closed`
+        // guard in deleteAll and QdrantEdgeStore's reasoning). This runs on the fleet lane AFTER a
+        // blocking upsert that can outlive the ViewModel teardown's short drain window, so `close()`
+        // may have freed the shard by the time we get here — guard exactly as deleteAll does. A skipped
+        // flag flip at shutdown just means a benign re-upload next session (idempotent by point id).
+        if (closed) return@synchronized
+        if (ids.isEmpty()) return@synchronized
+        shard.update(UpdateOperation.setPayload(ids.map { PointId.Uuid(it) }, "{\"synced\":true}"))
+        shard.flush()
+        Log.i(TAG, "markSynced: flipped synced=true for ${ids.size} point(s)")
     }
 
     override fun deleteAll(): Unit = synchronized(lock) {

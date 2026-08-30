@@ -2,6 +2,7 @@ package tech.qdrant.glasses.pipeline
 
 import android.graphics.Bitmap
 import android.graphics.RectF
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -15,6 +16,7 @@ import tech.qdrant.glasses.storage.MomentHit
 import tech.qdrant.glasses.storage.MomentPayload
 import tech.qdrant.glasses.storage.MomentStore
 import tech.qdrant.glasses.storage.MomentType
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -202,6 +204,14 @@ class MomentCapture(
         // downscale would already have blurred that detail away.
         private const val PIXEL_SCALE_SIDE = 160
         private const val THUMB_QUALITY = 85
+        // Phase 4 fleet thumbnail (thumb_b64 payload field): a tiny image that travels upstream so a
+        // phone can render the frame offline. Downscale the keyframe to THUMB_B64_PX on its long edge,
+        // JPEG at THUMB_B64_QUALITY, base64. Dropped (left "") if it would exceed THUMB_B64_MAX_BYTES —
+        // the payload must stay small (it rides in the vector upsert), and a missing thumb just falls
+        // back to the card's text, never a capture failure.
+        private const val THUMB_B64_PX = 64
+        private const val THUMB_B64_QUALITY = 55
+        private const val THUMB_B64_MAX_BYTES = 6144  // ~6 KB of base64 text
         // Region layer (Task 2.2, Spec §2): at most this many confirmed tracker boxes get a region
         // embedding per stored moment, highest yolo_conf first — a bound on the extra NPU/store work
         // one keyframe can trigger, not a quality signal (a scene with more objects just loses the
@@ -481,6 +491,11 @@ class MomentCapture(
             }
             if (!thumbOk) thumbFile.delete()
 
+            // Phase 4: a tiny base64 thumb that travels upstream with the payload (thumbPath is a
+            // device-local path, useless on the phone). Fail-soft — "" on any error/oversize, never
+            // blocks the store.
+            val thumbB64 = encodeThumbB64(bitmap)
+
             val storeT0 = System.currentTimeMillis()
             // storeMoment (native shard/flush) is the ONLY failure that may still delete thumbFile:
             // nothing durable references it yet, so an orphan here is a real leak. Once storeMoment
@@ -508,6 +523,7 @@ class MomentCapture(
                     yoloConf = 0f,
                     verifyCos = 0f,
                     text = "",
+                    thumbB64 = thumbB64,
                 ))
             } catch (e: Throwable) {
                 // Nothing persisted — thumbFile is a genuine orphan. lastStoredGrid/Vec/Ms are
@@ -687,6 +703,42 @@ class MomentCapture(
             return downscaleLuma(pixels, PIXEL_SCALE_SIDE, PIXEL_SCALE_SIDE, GRID_SIDE)
         } finally {
             if (scaled !== bitmap) scaled.recycle()
+        }
+    }
+
+    /**
+     * A tiny base64 JPEG of [bitmap] for the payload's `thumb_b64` (Phase 4) — long edge downscaled to
+     * [THUMB_B64_PX], JPEG at [THUMB_B64_QUALITY], `Base64.NO_WRAP`. Returns "" (never throws) on any
+     * failure OR if the encoded string exceeds [THUMB_B64_MAX_BYTES]: a missing fleet thumb just falls
+     * back to the card's text on the phone, so it must never cost a capture. The [bitmap] itself is
+     * NOT recycled here (the caller still owns it).
+     */
+    private fun encodeThumbB64(bitmap: Bitmap): String {
+        return try {
+            val w = bitmap.width
+            val h = bitmap.height
+            if (w <= 0 || h <= 0) return ""
+            val scale = THUMB_B64_PX.toFloat() / maxOf(w, h)
+            // Only downscale — never upscale a keyframe that is already smaller than the thumb size.
+            val tw = if (scale < 1f) maxOf(1, (w * scale).toInt()) else w
+            val th = if (scale < 1f) maxOf(1, (h * scale).toInt()) else h
+            val small = if (tw != w || th != h) Bitmap.createScaledBitmap(bitmap, tw, th, true) else bitmap
+            try {
+                val baos = ByteArrayOutputStream()
+                if (!small.compress(Bitmap.CompressFormat.JPEG, THUMB_B64_QUALITY, baos)) return ""
+                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                if (b64.length > THUMB_B64_MAX_BYTES) {
+                    Log.w(TAG, "thumb_b64 dropped: ${b64.length}B > ${THUMB_B64_MAX_BYTES}B budget")
+                    ""
+                } else {
+                    b64
+                }
+            } finally {
+                if (small !== bitmap) small.recycle()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "thumb_b64 encode failed: ${e.message}")
+            ""
         }
     }
 }

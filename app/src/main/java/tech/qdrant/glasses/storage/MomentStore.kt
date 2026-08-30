@@ -1,6 +1,7 @@
 package tech.qdrant.glasses.storage
 
 import org.json.JSONObject
+import tech.qdrant.glasses.fleet.FleetPoint
 
 /**
  * The two [MomentPayload.type] wire values, shared so "frame"/"region" stop drifting as independent
@@ -39,6 +40,9 @@ data class MomentHit(
     // Stage 3 (OCR read channel): the recognized line's text, non-empty only on a `type=ocr` hit.
     // Defaults to "" so every pre-Stage-3 named-arg MomentHit construction site keeps compiling.
     val text: String = "",
+    // Provenance of a search hit: "local" (this device's own memory) or "fleet" (pulled shared corpus).
+    // Defaults to "local" so every existing construction site is unchanged (fleet-sync PoC).
+    val source: String = "local",
 )
 
 /**
@@ -53,6 +57,13 @@ data class MomentHit(
  *
  * Engine-independent — the [MomentStore] contract is expressed in terms of this and [MomentHit],
  * so every backend stores and returns the same payload shape (mirrors [VectorStore]/[ObjectPayload]).
+ *
+ * [synced] is the fleet-sync upstream flag (flag-on-store design, Spec §5/§6): defaults `false` on
+ * every freshly-captured point ([MomentCapture] is otherwise UNCHANGED by fleet sync) and is flipped
+ * `true` on the LOCAL store only, via [MomentStore.markSynced], after a CONFIRMED upsert to the fleet
+ * hub — never uploaded itself ("LOCAL-only bookkeeping", Spec §6). The durable local store IS the
+ * upload backlog: [MomentStore.scrollUnsyncedFrames] is how the idle-pass sync loop finds what still
+ * needs to go up.
  */
 data class MomentPayload(
     val type: String,
@@ -66,6 +77,13 @@ data class MomentPayload(
     val yoloConf: Float,
     val verifyCos: Float,
     val text: String,
+    // Stage 4 (Phase 4, mobile fleet node): a small base64 JPEG thumbnail (~64px, ≤~5 KB) that
+    // travels WITH the synced payload, so a phone pulling the fleet corpus can render the actual
+    // frame image offline — [thumbPath] is a device-LOCAL file path that means nothing on another
+    // device. Non-indexed, empty ("") on every point that doesn't carry one (regions, OCR, and any
+    // pre-Phase-4 frame): [fromJson]'s `optString` default keeps old payloads reading back unchanged.
+    val thumbB64: String = "",
+    val synced: Boolean = false,
 ) {
     fun toJson(): String = JSONObject()
         .put("type", type)
@@ -79,6 +97,8 @@ data class MomentPayload(
         .put("yolo_conf", yoloConf.toDouble())
         .put("verify_cos", verifyCos.toDouble())
         .put("text", text)
+        .put("thumb_b64", thumbB64)
+        .put("synced", synced)
         .toString()
 
     companion object {
@@ -96,6 +116,8 @@ data class MomentPayload(
                 yoloConf = o.optDouble("yolo_conf", 0.0).toFloat(),
                 verifyCos = o.optDouble("verify_cos", 0.0).toFloat(),
                 text = o.optString("text"),
+                thumbB64 = o.optString("thumb_b64"),
+                synced = o.optBoolean("synced", false),
             )
         }
     }
@@ -166,4 +188,24 @@ interface MomentStore : AutoCloseable {
 
     /** Clear the whole collection in-process (the demo wipe gesture — see `wipe-demo-memory.sh`). */
     fun deleteAll()
+
+    /**
+     * Up to [limit] `type=frame` points whose payload's [MomentPayload.synced] is not `true` — the
+     * upload backlog for the fleet-sync flag-on-store design (Spec §5): the durable local store IS
+     * the queue, and this scroll is how [tech.qdrant.glasses.fleet.FleetSync]'s idle-pass "up" loop
+     * finds what to upload next. Unlike every other read path on this interface, vectors ARE
+     * included — [tech.qdrant.glasses.fleet.FleetPoint.vector] needs them for the upsert. A point
+     * whose own [MomentPayload.synced] was never explicitly set (pre-fleet-sync capture) still
+     * matches — `!= true`, not `== false` — so old points get swept up too.
+     */
+    fun scrollUnsyncedFrames(limit: Int = 100): List<FleetPoint>
+
+    /**
+     * Flips [MomentPayload.synced] to `true` on the local store for exactly these point [ids], via a
+     * payload MERGE patch (existing keys untouched, same discipline as every other field this store
+     * doesn't own end-to-end) — call ONLY after a CONFIRMED upsert of those points to the fleet hub
+     * (Spec §5's crash-safe invariant: confirmed-implies-flag-flipped, never flipped first). A no-op
+     * for an empty [ids].
+     */
+    fun markSynced(ids: List<String>)
 }

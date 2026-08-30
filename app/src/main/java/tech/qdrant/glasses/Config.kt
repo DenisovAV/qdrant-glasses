@@ -85,6 +85,16 @@ object Config {
         sysprop("qdrant.recency_tau_s").toLongOrNull()?.takeIf { it > 0 }?.times(1000L) ?: 0L
 
     /**
+     * Private-Qdrant base URL for the OPTIONAL fleet tier (Sovereign Fleet Memory PoC). BLANK = the
+     * app is pure on-device/offline, exactly as before. When set, the glasses pull a curated fleet
+     * corpus and (P2) push their moments up. Reachable from the glasses via `adb reverse tcp:6333`.
+     *
+     *   adb shell setprop debug.qdrant.fleet_url http://localhost:6333   → fleet tier on
+     *   (unset)                                                          → off (local-only)
+     */
+    val FLEET_URL: String = sysprop("qdrant.fleet_url")
+
+    /**
      * Reads `debug.<name>` (volatile, wins) then `persist.<name>` (survives reboots).
      * persist.* matters because a glasses reboot silently reverted the app to compiled-in defaults
      * mid-rehearsal — twice. Read once at startup; an app restart applies a change.

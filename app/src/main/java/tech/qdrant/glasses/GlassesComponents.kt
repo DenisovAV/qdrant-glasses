@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import tech.qdrant.glasses.detect.DetectorFactory
 import tech.qdrant.glasses.detect.ObjectDetector
 import tech.qdrant.glasses.detect.ObjectTracker
@@ -60,6 +61,13 @@ class GlassesComponents(
     // Stage 3 NPU recognizer: ViTSTR (W8A16), used by [ocrEngine]'s NPU path. Owned here (not by
     // OcrEngine) and closed in [close]; null → OcrEngine reads on the CPU. Guarded independently.
     val vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer?,
+    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): the pulled fleet corpus, or null when Config.FLEET_URL
+    // is blank OR the pull failed (FleetSync.pull already logs+swallows every Throwable) — same
+    // nullable-optional-feature contract as momentStore/momentCapture above. GlassesViewModel passes
+    // this straight through as MomentSearcher's `fleet` argument; a null here just means "no fleet
+    // tier this session", byte-for-byte today's local-only search (Global Constraint). Owned here so
+    // [close] can release its native EdgeShard alongside [momentStore]'s.
+    val fleetStore: tech.qdrant.glasses.fleet.FleetShardStore?,
 ) : AutoCloseable {
 
     companion object {
@@ -81,7 +89,7 @@ class GlassesComponents(
          * `PerceptionPipeline`/`MomentSearcher` directly (see the "moment-timeline backfill" comment
          * below for why `hud` itself isn't owned here).
          */
-        fun load(
+        suspend fun load(
             app: Application,
             mode: AppMode,
             scope: CoroutineScope,
@@ -125,6 +133,7 @@ class GlassesComponents(
             var ocrEngine: OcrEngine? = null
             var dbnetDetector: tech.qdrant.glasses.ocr.QnnDbnetDetector? = null
             var vitstrRec: tech.qdrant.glasses.ocr.QnnVitstrRecognizer? = null
+            var fleetStore: tech.qdrant.glasses.fleet.FleetShardStore? = null
             if (mode == AppMode.OBJECTS) {
                 detector = DetectorFactory.create(app)
                 // Stage 3 live text detector (NPU) — guarded like ocrEngine: a missing
@@ -231,6 +240,43 @@ class GlassesComponents(
                         }
                     }
                     Log.i(TAG, "moment mode ready (namespace=${CropEncoderFactory.namespace}), moments=${ms.count()}")
+                    // Fleet-sync Task 6 (Spec §3/§7/§9 P1): OPTIONAL cloud tier, gated purely on
+                    // Config.FLEET_URL (Global Constraint — blank URL means byte-for-byte today's
+                    // offline behavior, so this whole block is skipped, not just no-op'd). Runs on
+                    // THIS coroutine (load() is suspend precisely so this pull() can happen here,
+                    // off-main like every other blocking call in this function — see GlassesViewModel's
+                    // `viewModelScope.launch(Dispatchers.IO) { GlassesComponents.load(...) }`).
+                    // FleetSync.pull() itself never throws (wraps create-snapshot/download/unpack/load
+                    // in one try/catch, Spec §7) — a null result here just means no fleet this session.
+                    if (Config.FLEET_URL.isNotBlank()) {
+                        val fleetSync = tech.qdrant.glasses.fleet.FleetSync(
+                            tech.qdrant.glasses.fleet.FleetQdrantClient(Config.FLEET_URL),
+                            app.filesDir, cropEncoder.dim,
+                            momentStore = ms, isRecording = isRecording,
+                        )
+                        fleetStore = fleetSync.pull()
+                        Log.i(TAG, "load: fleet pull ${if (fleetStore != null) "OK" else "unavailable (local-only)"}")
+                        // Task 4: launch the UP half's background loop on its OWN dedicated lane — a
+                        // single-thread dispatcher separate from embedLane/ocrLane, so a slow or
+                        // unreachable hub (network I/O in FleetQdrantClient.upsertPoints) never
+                        // competes with moment capture's NPU work. It draws from Dispatchers.IO (the
+                        // elastic blocking-I/O pool), NOT Dispatchers.Default: upsertPoints is a
+                        // SYNCHRONOUS blocking OkHttp call (up to a 30s callTimeout on a hung hub), and
+                        // a limitedParallelism view of Default would park one of the ~4 shared CPU-pool
+                        // threads on this 4-core SoC — starving the detector/OCR lanes that are also
+                        // Default-derived. embedLane already sets this precedent (IO.limitedParallelism).
+                        // `scope.launch` (fire-and-forget,
+                        // NOT `withContext`/`.join()`) so this call returns immediately — syncLoop
+                        // itself never returns while the app runs (see its KDoc) — and does NOT
+                        // block the rest of `load()`'s boot sequence. `scope` here is the same
+                        // viewModelScope MomentCapture was built with above, so this loop is a
+                        // structured child of it and is cancelled automatically on ViewModel clear —
+                        // no separate Job/close() bookkeeping needed, same lifecycle shape as
+                        // AppStateHolder's recording ticker (see FleetSync.syncLoop's KDoc).
+                        val fleetLane = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(1)
+                        scope.launch(fleetLane) { fleetSync.syncLoop() }
+                        Log.i(TAG, "load: fleet syncLoop launched on dedicated lane")
+                    }
                 }
                 // Optional in-app vector-DB benchmark, gated + off the main thread. This file
                 // compiles into both flavors, so the actual sysprop-check + launch is indirected
@@ -265,6 +311,7 @@ class GlassesComponents(
                 ocrEngine = ocrEngine,
                 dbnetDetector = dbnetDetector,
                 vitstrRec = vitstrRec,
+                fleetStore = fleetStore,
             )
         }
     }
@@ -283,6 +330,7 @@ class GlassesComponents(
         dbnetDetector?.close()
         cropEncoder?.close()
         momentStore?.close()
+        fleetStore?.close()
         ocrEngine?.close()          // NPU-mode OcrEngine doesn't own dbnet/vitstr (shared) — close them after
         vitstrRec?.close()
     }
