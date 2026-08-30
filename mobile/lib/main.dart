@@ -3,9 +3,14 @@ import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:flutter_gemma_litertlm/flutter_gemma_litertlm.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'chat/answerer.dart';
+import 'chat/chat_agent.dart';
+import 'chat/gemma_answerer.dart';
 import 'data/edge_client.dart';
 import 'data/fleet_http.dart';
 import 'data/fleet_pull.dart';
@@ -13,6 +18,8 @@ import 'data/memory_repository.dart';
 import 'data/pull_result.dart';
 import 'embed/gemma_embeddings_siglip_text.dart';
 import 'embed/siglip_text.dart';
+import 'query/gemma_query_parser.dart';
+import 'query/query_parser.dart';
 import 'ui/chat_screen.dart';
 
 void main() {
@@ -82,13 +89,14 @@ class AppRoot extends StatefulWidget {
 class _AppRootState extends State<AppRoot> {
   final EdgeClient _edgeClient = EdgeClient();
   // Built once the startup pull resolves (in _pullOnStart's finally): the
-  // embedder load is async + filesystem-dependent, so the repository can only
-  // be assembled after we know whether a real SigLIP embedder came up (→
-  // semantic search) or not (→ pure-time). Null only during the initial
-  // spinner, before _ready.
-  MemoryRepository? _repository;
-  // Held for dispose(): the ONNX session must be released like the shard.
+  // embedder + Gemma loads are async + filesystem-dependent, so the agent can
+  // only be assembled after we know which models came up — full agentic RAG
+  // (SigLIP + Gemma 4), or a degraded path (FakeQueryParser + StubAnswerer:
+  // still searches + shows cards). Null only during the initial spinner.
+  ChatAgent? _agent;
+  // Held for dispose(): both native sessions must be released like the shard.
   GemmaEmbeddingsSiglipText? _embedder;
+  InferenceModel? _gemma;
   bool _ready = false;
   bool _bannerDismissed = false;
   PullResult? _pullResult;
@@ -108,8 +116,10 @@ class _AppRootState extends State<AppRoot> {
     // close() is async; fire-and-forget is correct in a synchronous
     // dispose() (there is no "after" to await into once the widget is gone).
     unawaited(_edgeClient.close());
-    // The SigLIP ONNX session is the same kind of native resource — release it.
+    // The SigLIP ONNX session + the Gemma LiteRT-LM model are the same kind of
+    // native resource — release them.
     unawaited(_embedder?.close());
+    unawaited(_gemma?.close());
     super.dispose();
   }
 
@@ -122,10 +132,12 @@ class _AppRootState extends State<AppRoot> {
         result = await override(_edgeClient);
       } else {
         final appDir = await getApplicationSupportDirectory();
-        // Bring up the semantic embedder BEFORE the pull so the chat is fully
-        // ready when _ready flips. Fail-soft: a missing model or a load error
-        // leaves `embedder` null and the repository on the pure-time path.
+        // Bring up the models BEFORE the pull so the chat is fully ready when
+        // _ready flips. Both fail-soft: a missing/broken SigLIP model leaves
+        // search on the pure-time path; a missing/broken Gemma leaves the chat
+        // on the degraded (search + cards + stub) path.
         embedder = await _loadEmbedder(appDir.path);
+        await _loadGemma(appDir.path);
         result = await runFleetPull(edgeClient: _edgeClient, workDir: appDir.path);
       }
       if (mounted) setState(() => _pullResult = result);
@@ -144,15 +156,67 @@ class _AppRootState extends State<AppRoot> {
       // corpus isn't loaded, here's why" is the right message either way).
       if (mounted) setState(() => _pullResult = PullUnreachable('$e'));
     } finally {
-      // Assemble the repository now that we know the embedder outcome. A null
-      // embedder (no model, load failure, or the pullOverride test path) keeps
-      // search on the pure-time branch — same behaviour as before Phase 2.
+      // Assemble the agent now that we know which models came up. A null
+      // embedder keeps search on the pure-time branch; a null Gemma (no model,
+      // load failure, or the pullOverride test path) uses FakeQueryParser (raw
+      // phrase, no LLM filter) + StubAnswerer (no conversational answer) — the
+      // node still parses/retrieves and shows cards, just degraded.
       if (mounted) {
+        final gemma = _gemma;
+        final repository =
+            MemoryRepository(edgeClient: _edgeClient, embedder: embedder);
+        final QueryParser parser =
+            gemma != null ? GemmaQueryParser(gemma) : const FakeQueryParser();
+        final Answerer answerer =
+            gemma != null ? GemmaAnswerer(gemma) : const StubAnswerer();
         setState(() {
-          _repository = MemoryRepository(edgeClient: _edgeClient, embedder: embedder);
+          _agent = ChatAgent(
+            parser: parser,
+            repository: repository,
+            answerer: answerer,
+          );
           _ready = true;
         });
       }
+    }
+  }
+
+  /// Bring up Gemma 4 E2B (LiteRT-LM) from app storage, fail-soft. Null (→ the
+  /// degraded FakeQueryParser + StubAnswerer path) when the model isn't present
+  /// or won't load. The `.litertlm` lives under `<appSupport>/models/`
+  /// (first-run-download in production; dev-pushed — see the mobile-fleet-node
+  /// plan). Vision is enabled so the answer can be grounded in thumbnails.
+  Future<InferenceModel?> _loadGemma(String appDir) async {
+    final modelPath = '$appDir/models/gemma-4-E2B-it.litertlm';
+    if (!File(modelPath).existsSync()) {
+      developer.log(
+        'AppRoot: Gemma model not found at $modelPath — agentic RAG off '
+        '(search + cards only)',
+        name: 'fleet',
+        level: 900,
+      );
+      return null;
+    }
+    try {
+      await FlutterGemma.initialize(inferenceEngines: const [LiteRtLmEngine()]);
+      await FlutterGemma.installModel(
+        modelType: ModelType.gemma4,
+        fileType: ModelFileType.litertlm,
+      ).fromFile(modelPath).install();
+      final model = await FlutterGemma.getActiveModel(
+        maxTokens: 4096,
+        supportImage: true,
+      );
+      _gemma = model;
+      developer.log('AppRoot: Gemma 4 loaded — agentic RAG on', name: 'fleet');
+      return model;
+    } catch (e) {
+      developer.log(
+        'AppRoot: Gemma failed to load, falling back to search-only: $e',
+        name: 'fleet',
+        level: 900,
+      );
+      return null;
     }
   }
 
@@ -209,8 +273,8 @@ class _AppRootState extends State<AppRoot> {
 
   @override
   Widget build(BuildContext context) {
-    final repository = _repository;
-    if (!_ready || repository == null) {
+    final agent = _agent;
+    if (!_ready || agent == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     final message = _bannerMessage;
@@ -228,7 +292,7 @@ class _AppRootState extends State<AppRoot> {
               ),
             ],
           ),
-        Expanded(child: ChatScreen(repository: repository)),
+        Expanded(child: ChatScreen(agent: agent)),
       ],
     );
   }

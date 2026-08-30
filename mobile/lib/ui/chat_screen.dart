@@ -1,20 +1,19 @@
 import 'package:flutter/material.dart';
 
-import '../data/memory_repository.dart';
-import '../query/parsed_query.dart';
+import '../chat/chat_agent.dart';
 import 'chat_message.dart';
 import 'message_bubble.dart';
 
-/// The mobile fleet node's chat: a message thread plus an input box. Phase 1:
-/// a send appends the user turn, calls [MemoryRepository.search] directly
-/// with the raw phrase (no filter, no embedder yet), and appends an
-/// assistant turn carrying a stub summary + the retrieved hits as inline
-/// cards. Phase 3 (Task 10) inserts a `ChatAgent` between the input and the
-/// repository without touching this widget's send-button wiring.
+/// The mobile fleet node's chat: a message thread plus an input box. A send
+/// appends the user turn and drives one [ChatAgent.ask] turn — the agent
+/// parses the filter, retrieves, and streams a conversational answer. The
+/// assistant turn is appended once and then replaced in place as the stream
+/// grows (its text fills in, its retrieved [ChatMessage.hits] render as inline
+/// cards throughout). [ChatAgent.ask] is fail-soft and never throws.
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.repository});
+  const ChatScreen({super.key, required this.agent});
 
-  final MemoryRepository repository;
+  final ChatAgent agent;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -43,23 +42,26 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _scrollToBottom();
 
-    // Fail-soft by construction: MemoryRepository/EdgeClient never throw —
-    // an unreachable hub or an empty corpus just means zero hits below, not
-    // a crashed chat turn.
-    final hits = await widget.repository.search(ParsedQuery(phrase: raw));
-
-    if (!mounted) return;
-    setState(() {
-      _isSearching = false;
-      _messages.add(
-        ChatMessage(
-          role: ChatRole.assistant,
-          text: hits.isEmpty ? 'Ничего не нашёл.' : 'Нашёл ${hits.length}.',
-          hits: hits,
-        ),
-      );
-    });
-    _scrollToBottom();
+    // One RAG turn, streamed. The agent is fail-soft (never throws); the first
+    // emission appends the assistant turn, later emissions replace it in place
+    // as the answer grows.
+    int? assistantIndex;
+    try {
+      await for (final turn in widget.agent.ask(raw)) {
+        if (!mounted) return;
+        setState(() {
+          if (assistantIndex == null) {
+            _messages.add(turn);
+            assistantIndex = _messages.length - 1;
+          } else {
+            _messages[assistantIndex!] = turn;
+          }
+        });
+        _scrollToBottom();
+      }
+    } finally {
+      if (mounted) setState(() => _isSearching = false);
+    }
   }
 
   /// Fix H (code-reviewer): `_scrollController` was wired to the `ListView`
