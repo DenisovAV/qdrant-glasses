@@ -77,6 +77,12 @@ data class MomentPayload(
     val yoloConf: Float,
     val verifyCos: Float,
     val text: String,
+    // Stage 4 (Phase 4, mobile fleet node): a small base64 JPEG thumbnail (~64px, ≤~5 KB) that
+    // travels WITH the synced payload, so a phone pulling the fleet corpus can render the actual
+    // frame image offline — [thumbPath] is a device-LOCAL file path that means nothing on another
+    // device. Non-indexed, empty ("") on every point that doesn't carry one (regions, OCR, and any
+    // pre-Phase-4 frame): [fromJson]'s `optString` default keeps old payloads reading back unchanged.
+    val thumbB64: String = "",
     val synced: Boolean = false,
 ) {
     fun toJson(): String = JSONObject()
@@ -91,6 +97,7 @@ data class MomentPayload(
         .put("yolo_conf", yoloConf.toDouble())
         .put("verify_cos", verifyCos.toDouble())
         .put("text", text)
+        .put("thumb_b64", thumbB64)
         .put("synced", synced)
         .toString()
 
@@ -109,6 +116,7 @@ data class MomentPayload(
                 yoloConf = o.optDouble("yolo_conf", 0.0).toFloat(),
                 verifyCos = o.optDouble("verify_cos", 0.0).toFloat(),
                 text = o.optString("text"),
+                thumbB64 = o.optString("thumb_b64"),
                 synced = o.optBoolean("synced", false),
             )
         }
