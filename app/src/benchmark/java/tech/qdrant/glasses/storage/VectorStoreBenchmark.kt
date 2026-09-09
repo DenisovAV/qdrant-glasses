@@ -74,8 +74,11 @@ class VectorStoreBenchmark(private val context: Context) {
         // not a fixed time cap, so linear-ingest engines still reach 1M (a fixed cap would wrongly
         // DNF a slow-but-healthy 500k/1M load). Below the floor for 2 consecutive chunks → DNF that
         // scale + all larger ones (never a silent cap). LOAD_BUDGET_MS is only a runaway safety net.
-        private const val MIN_INGEST_RATE = 150.0     // pts/s
-        private const val LOAD_BUDGET_MS = 1_800_000.0 // 30 min hard safety cap per scale
+        // Both overridable per run (research sweeps) so we can test the TRUE ceiling without a recompile:
+        //   setprop debug.qdrant.dbbench.minrate 1        # ~disable the DNF rate floor (grind on)
+        //   setprop debug.qdrant.dbbench.budgetms 2700000 # raise the per-scale safety cap (here 45 min)
+        private val MIN_INGEST_RATE = Config.sysprop("qdrant.dbbench.minrate").toDoubleOrNull() ?: 150.0     // pts/s
+        private val LOAD_BUDGET_MS = Config.sysprop("qdrant.dbbench.budgetms").toDoubleOrNull() ?: 1_800_000.0 // 30 min hard safety cap per scale
 
         // 1k → 10k → 100k → 500k → 1M. Anything above the sysprop cap is LOGGED as skipped, never
         // silently dropped.
